@@ -1,0 +1,28 @@
+# Sample Qwenodyssey config. Copy to <your-project>/.qwenodyssey/config.toml
+# (or run `qwenodyssey init`) and adjust.
+
+[model]
+provider = "ollama"            # ollama | lmstudio | openai | vllm | llamacpp
+model = "qwen2.5-coder:7b"
+base_url = "http://localhost:11434"
+api_key = ""                    # or set env QWENODYSSEY_API_KEY
+temperature = 0.2
+top_p = 0.9
+max_tokens = 4096
+context_tokens = 8192           # total context window of the model
+
+[agent]
+max_retries = 4
+auto_apply = false              # apply edits without asking (use with care)
+auto_test = true
+review_before_apply = true
+small_model_mode = true         # default to --safe, terse prompts, tight context
+
+[tools]
+allow_shell = true
+confirm_destructive = true
+sandbox = true
+
+[memory]
+enabled = true
+path = ".qwenodyssey/memory"
