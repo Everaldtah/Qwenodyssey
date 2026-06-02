@@ -45,7 +45,7 @@ program
 
 program
   .command("config")
-  .description("Get/set/list configuration (config set model.model qwen2.5-coder:7b)")
+  .description("Get/set/list configuration (config set model.model qwen2.5:7b)")
   .argument("[action]", "get | set | list | path")
   .argument("[key]", "dotted key, e.g. model.provider")
   .argument("[value]", "value (for set)")
@@ -102,6 +102,10 @@ program
   .command("chat")
   .description("Interactive pair-coding chat (streaming)")
   .action((_o, cmd) => chatCommand(globals(cmd)));
+
+// Bare `qwenodyssey` (no subcommand) drops straight into interactive chat,
+// the same as `qwenodyssey chat`.
+program.action((_o, cmd) => chatCommand(globals(cmd)));
 
 program.parseAsync(process.argv).catch((err) => {
   console.error(chalk.red("Fatal: " + (err as Error).message));

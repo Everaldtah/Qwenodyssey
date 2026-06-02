@@ -4,9 +4,29 @@
 
 export type Role = "system" | "user" | "assistant" | "tool";
 
+/** A model's request to invoke a tool (OpenAI-style function call). */
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, any>;
+}
+
 export interface Message {
   role: Role;
   content: string;
+  /** Present on assistant messages that requested tool calls. */
+  tool_calls?: ToolCall[];
+  /** Present on tool-result messages: which call this answers. */
+  tool_call_id?: string;
+  /** Tool name, for tool-result messages. */
+  name?: string;
+}
+
+/** OpenAI-style tool/function schema advertised to the model. */
+export interface ToolSpec {
+  name: string;
+  description: string;
+  parameters: Record<string, any>;
 }
 
 export interface ModelOptions {
@@ -16,10 +36,14 @@ export interface ModelOptions {
   stop?: string[];
   /** Hint that the response should be valid JSON. */
   json?: boolean;
+  /** Tools the model may call this turn. */
+  tools?: ToolSpec[];
 }
 
 export interface GenerateResult {
   text: string;
+  /** Tool calls the model requested, if any. */
+  toolCalls?: ToolCall[];
   /** Best-effort token accounting; may be approximate for some providers. */
   promptTokens?: number;
   completionTokens?: number;
@@ -29,6 +53,12 @@ export interface GenerateResult {
 /**
  * Uniform interface every model backend implements.
  */
+export interface ModelInfo {
+  name: string;
+  /** Human-readable size, e.g. "4.7 GB", when the backend reports it. */
+  size?: string;
+}
+
 export interface Provider {
   readonly name: string;
   readonly model: string;
@@ -40,6 +70,10 @@ export interface Provider {
   ): Promise<GenerateResult>;
   countTokens(text: string): number;
   healthCheck(): Promise<{ ok: boolean; detail?: string }>;
+  /** List models the backend currently has available, if it can. */
+  listModels?(): Promise<ModelInfo[]>;
+  /** Switch the active model for the rest of the session. */
+  setModel?(model: string): void;
 }
 
 /* ── Agent pipeline ── */

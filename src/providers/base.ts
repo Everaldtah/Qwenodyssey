@@ -6,8 +6,10 @@
 import type {
   GenerateResult,
   Message,
+  ModelInfo,
   ModelOptions,
   Provider,
+  ToolCall,
 } from "../types";
 
 export interface ProviderConfig {
@@ -28,6 +30,20 @@ export abstract class OpenAICompatibleProvider implements Provider {
     return this.cfg.model;
   }
 
+  /** Switch the active model for subsequent requests. */
+  setModel(model: string): void {
+    this.cfg.model = model;
+  }
+
+  /** List models via the OpenAI-style /models endpoint. */
+  async listModels(): Promise<ModelInfo[]> {
+    const res = await fetch(`${this.apiBase()}/models`, { headers: this.headers() });
+    if (!res.ok) throw new Error(`${this.name} HTTP ${res.status}`);
+    const json: any = await res.json();
+    const data: any[] = json?.data ?? json?.models ?? [];
+    return data.map((m) => ({ name: m.id ?? m.name })).filter((m) => m.name);
+  }
+
   /** OpenAI-style base; concrete providers append /v1 when needed. */
   protected apiBase(): string {
     const b = this.cfg.baseUrl.replace(/\/+$/, "");
@@ -40,10 +56,31 @@ export abstract class OpenAICompatibleProvider implements Provider {
     return h;
   }
 
+  /** Map our internal Message[] to OpenAI wire format (incl. tool fields). */
+  protected wireMessages(messages: Message[]): Record<string, unknown>[] {
+    return messages.map((m) => {
+      if (m.role === "tool") {
+        return { role: "tool", content: m.content, tool_call_id: m.tool_call_id, name: m.name };
+      }
+      if (m.role === "assistant" && m.tool_calls?.length) {
+        return {
+          role: "assistant",
+          content: m.content || "",
+          tool_calls: m.tool_calls.map((tc) => ({
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: JSON.stringify(tc.arguments ?? {}) },
+          })),
+        };
+      }
+      return { role: m.role, content: m.content };
+    });
+  }
+
   protected body(messages: Message[], options: ModelOptions, stream: boolean) {
     const body: Record<string, unknown> = {
       model: this.cfg.model,
-      messages,
+      messages: this.wireMessages(messages),
       temperature: options.temperature ?? this.cfg.temperature,
       top_p: options.top_p ?? this.cfg.topP,
       max_tokens: options.max_tokens ?? this.cfg.maxTokens,
@@ -51,6 +88,12 @@ export abstract class OpenAICompatibleProvider implements Provider {
     };
     if (options.stop) body.stop = options.stop;
     if (options.json) body.response_format = { type: "json_object" };
+    if (options.tools?.length) {
+      body.tools = options.tools.map((t) => ({
+        type: "function",
+        function: { name: t.name, description: t.description, parameters: t.parameters },
+      }));
+    }
     return body;
   }
 
@@ -68,9 +111,12 @@ export abstract class OpenAICompatibleProvider implements Provider {
       throw new Error(`${this.name} HTTP ${res.status}: ${detail}`);
     }
     const json: any = await res.json();
-    const text: string = json?.choices?.[0]?.message?.content ?? "";
+    const msg: any = json?.choices?.[0]?.message ?? {};
+    const text: string = msg?.content ?? "";
+    const toolCalls = parseToolCalls(msg?.tool_calls);
     return {
       text,
+      toolCalls,
       model: this.cfg.model,
       promptTokens: json?.usage?.prompt_tokens,
       completionTokens: json?.usage?.completion_tokens,
@@ -134,6 +180,24 @@ export abstract class OpenAICompatibleProvider implements Provider {
       return { ok: false, detail: (err as Error).message };
     }
   }
+}
+
+/** Normalize OpenAI-style tool_calls into our ToolCall[]. */
+function parseToolCalls(raw: any): ToolCall[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const calls: ToolCall[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const fn = raw[i]?.function;
+    if (!fn?.name) continue;
+    let args: Record<string, any> = {};
+    try {
+      args = typeof fn.arguments === "string" ? JSON.parse(fn.arguments || "{}") : fn.arguments ?? {};
+    } catch {
+      args = { _raw: fn.arguments };
+    }
+    calls.push({ id: raw[i].id || `call_${i}`, name: fn.name, arguments: args });
+  }
+  return calls.length ? calls : undefined;
 }
 
 async function safeText(res: Response): Promise<string> {

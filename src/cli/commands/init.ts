@@ -36,6 +36,6 @@ export async function initCommand(opts: GlobalOpts & { force?: boolean }): Promi
   console.log(`  Config: ${chalk.cyan(cfgFile)}`);
   console.log("\nNext steps:");
   console.log(chalk.gray("  qwenodyssey config set model.provider ollama"));
-  console.log(chalk.gray("  qwenodyssey config set model.model qwen2.5-coder:7b"));
+  console.log(chalk.gray("  qwenodyssey config set model.model qwen2.5:7b"));
   console.log(chalk.gray('  qwenodyssey code "your first task"'));
 }

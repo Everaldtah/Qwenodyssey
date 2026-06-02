@@ -3,6 +3,45 @@
  */
 import chalk from "chalk";
 
+export interface BannerInfo {
+  version: string;
+  model: string;
+  provider: string;
+  mode: string;
+  cwd: string;
+}
+
+/**
+ * Claude-Code-style launch banner: a small block-glyph mark on the left with
+ * version / model / cwd lines on the right, followed by an input hint divider.
+ */
+export function banner(info: BannerInfo): string {
+  const mark = chalk.cyanBright;
+  const dim = chalk.gray;
+  const width = Math.min((process.stdout.columns || 100) - 2, 120);
+  const rule = dim("─".repeat(Math.max(width, 40)));
+
+  const rows = [
+    `${mark(" ▟█▜▛█▙ ")}  ${chalk.bold("Qwenodyssey")} ${dim("v" + info.version)}`,
+    `${mark(" ▜█▟▙█▛ ")}  ${info.model} ${dim("· " + info.provider)}`,
+    `${mark("  ▀▘▝▀  ")}  ${dim(info.cwd)}`,
+  ];
+
+  const hint =
+    `${chalk.cyan("❯")} ${dim('Type your message. @path inlines a file. /models to switch · /help · /exit')}`;
+
+  return [
+    "",
+    ...rows,
+    dim(`\n   ${info.mode} mode · ${info.provider}:${info.model} · /exit to quit`),
+    "",
+    rule,
+    hint,
+    rule,
+    "",
+  ].join("\n");
+}
+
 export function colorizeDiff(diff: string): string {
   return diff
     .split("\n")

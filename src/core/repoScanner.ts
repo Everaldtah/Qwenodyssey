@@ -85,7 +85,7 @@ const DETECTORS: Detector[] = [
   },
   {
     language: "C#",
-    marker: (c) => fg.sync("**/*.csproj", { cwd: c, ignore: IGNORE }).length > 0,
+    marker: (c) => fg.sync("**/*.csproj", { cwd: c, ignore: IGNORE, suppressErrors: true }).length > 0,
     pm: () => "dotnet",
     testCommand: "dotnet test",
     buildCommand: "dotnet build",
@@ -159,6 +159,9 @@ export async function scanRepo(cwd: string): Promise<RepoInfo> {
     ignore: IGNORE,
     onlyFiles: true,
     followSymbolicLinks: false,
+    // Skip directories we can't read (e.g. Windows' protected
+    // "Application Data" junction) instead of throwing EPERM.
+    suppressErrors: true,
   });
 
   const entrypoints = allFiles.filter((f) =>

@@ -12,7 +12,7 @@ const ModelConfig = z.object({
   provider: z
     .enum(["ollama", "lmstudio", "openai", "vllm", "llamacpp"])
     .default("ollama"),
-  model: z.string().default("qwen2.5-coder:7b"),
+  model: z.string().default("qwen2.5:7b"),
   base_url: z.string().default("http://localhost:11434"),
   api_key: z.string().default(""),
   temperature: z.number().default(0.2),
