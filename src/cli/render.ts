@@ -18,28 +18,25 @@ export interface BannerInfo {
 export function banner(info: BannerInfo): string {
   const mark = chalk.cyanBright;
   const dim = chalk.gray;
-  const width = Math.min((process.stdout.columns || 100) - 2, 120);
-  const rule = dim("─".repeat(Math.max(width, 40)));
-
   const rows = [
     `${mark(" ▟█▜▛█▙ ")}  ${chalk.bold("Qwenodyssey")} ${dim("v" + info.version)}`,
     `${mark(" ▜█▟▙█▛ ")}  ${info.model} ${dim("· " + info.provider)}`,
     `${mark("  ▀▘▝▀  ")}  ${dim(info.cwd)}`,
   ];
 
-  const hint =
-    `${chalk.cyan("❯")} ${dim('Type your message. @path inlines a file. /models to switch · /help · /exit')}`;
-
   return [
     "",
     ...rows,
-    dim(`\n   ${info.mode} mode · ${info.provider}:${info.model} · /exit to quit`),
-    "",
-    rule,
-    hint,
-    rule,
+    dim(`\n   ${info.mode} mode · ${info.provider}:${info.model}`),
+    dim(`   Type a message · @path inlines a file · /models · /help · /exit`),
     "",
   ].join("\n");
+}
+
+/** A full-width horizontal rule sized to the current terminal. */
+export function hrule(): string {
+  const width = Math.min((process.stdout.columns || 100) - 2, 120);
+  return chalk.gray("─".repeat(Math.max(width, 40)));
 }
 
 export function colorizeDiff(diff: string): string {

@@ -7,7 +7,7 @@ import { scanRepo, summarizeRepo } from "../../core/repoScanner";
 import { resolveInside } from "../../tools/fileTools";
 import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
-import { banner } from "../render";
+import { banner, hrule } from "../render";
 import { CHAT_TOOL_SPECS } from "../chatTools";
 import type { Message, ModelInfo, ToolCall, ToolContext } from "../../types";
 import type { Session } from "../session";
@@ -75,11 +75,17 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   rl.on("close", () => {
     closed = true;
   });
+  // Draw a box around the input: a rule above, the `❯` prompt line (where the
+  // cursor sits and the user types), and a rule below once they hit Enter.
   // Resolve to /exit if stdin closes (Ctrl-D / EOF) so we quit cleanly.
   const ask = () =>
     new Promise<string>((resolve) => {
       if (closed) return resolve("/exit");
-      rl.question(chalk.cyan("you › "), resolve);
+      process.stdout.write(hrule() + "\n");
+      rl.question(chalk.cyan("❯ "), (answer) => {
+        process.stdout.write(hrule() + "\n\n");
+        resolve(answer);
+      });
     });
 
   // Dedicated tool registry for chat. autoConfirm is true here because we run
