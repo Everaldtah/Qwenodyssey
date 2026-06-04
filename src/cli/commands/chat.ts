@@ -12,7 +12,7 @@ import { createPrompt, SlashCommand } from "../prompt";
 import { KnowledgeBase } from "../../core/knowledge";
 import { createKnowledgeTools } from "../../tools/knowledgeTools";
 import { createWebTools } from "../../tools/webTools";
-import type { GenerateResult, Message, ModelInfo, ToolCall, ToolContext, ToolSpec } from "../../types";
+import type { GenerateResult, Message, ModelInfo, ModelOptions, ToolCall, ToolContext, ToolSpec } from "../../types";
 import type { Session } from "../session";
 
 /** Hard cap on tool calls per user turn, to stop runaway loops. */
@@ -89,6 +89,9 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     process.exitCode = 1;
     return;
   }
+
+  // If the configured model isn't installed, fall back to fallback_model.
+  await resolveStartupModel(s);
 
   const repo = await scanRepo(s.cwd);
 
@@ -256,7 +259,7 @@ async function runAssistantTurn(
     spinner.begin();
     let res: GenerateResult;
     try {
-      res = await s.provider.generate(history, {
+      res = await generateWithFallback(s, history, {
         temperature: reasoning ? REASONING_TEMP : TOOL_TEMP,
         tools: toolSpecs,
       });
@@ -328,6 +331,78 @@ async function runAssistantTurn(
 }
 
 /**
+ * At launch, make sure the configured model is actually installed. If it isn't
+ * but `fallback_model` is, switch to the fallback so the session still works
+ * (e.g. primary still downloading). Best-effort: stays on the configured model
+ * if we can't list models or neither is found.
+ */
+async function resolveStartupModel(s: Session): Promise<void> {
+  const fallback = s.config.model.fallback_model?.trim();
+  if (!fallback || fallback === s.provider.model || !s.provider.listModels || !s.provider.setModel) {
+    return;
+  }
+  let installed: ModelInfo[];
+  try {
+    installed = await s.provider.listModels();
+  } catch {
+    return; // can't tell — leave the configured model in place
+  }
+  const has = (name: string) => installed.some((m) => m.name === name || m.name.startsWith(name));
+  if (has(s.provider.model)) return; // primary is available, nothing to do
+
+  if (has(fallback)) {
+    s.provider.setModel(fallback);
+    console.log(
+      chalk.yellow(`⚠ model "${s.config.model.model}" not installed — using fallback "${fallback}".`)
+    );
+  } else {
+    console.log(
+      chalk.yellow(
+        `⚠ neither "${s.config.model.model}" nor fallback "${fallback}" is installed. ` +
+          `Pull one with \`ollama pull <name>\` or pick one with /models.`
+      )
+    );
+  }
+}
+
+/** Heuristic: does this provider error mean the requested model is unavailable? */
+function looksUnavailable(err: Error): boolean {
+  return /not found|no such model|unknown model|failed to load|404|model .* does not exist|try pulling/i.test(
+    err.message
+  );
+}
+
+/**
+ * Generate, falling back to `fallback_model` once if the request fails because
+ * the active model is unavailable. The switch is sticky for the rest of the
+ * session (so we don't keep hitting the same error).
+ */
+async function generateWithFallback(
+  s: Session,
+  history: Message[],
+  options: ModelOptions
+): Promise<GenerateResult> {
+  try {
+    return await s.provider.generate(history, options);
+  } catch (err) {
+    const fallback = s.config.model.fallback_model?.trim();
+    if (
+      !fallback ||
+      fallback === s.provider.model ||
+      !s.provider.setModel ||
+      !looksUnavailable(err as Error)
+    ) {
+      throw err;
+    }
+    console.log(
+      chalk.yellow(`\n⚠ "${s.provider.model}" unavailable — falling back to "${fallback}".`)
+    );
+    s.provider.setModel(fallback);
+    return s.provider.generate(history, options);
+  }
+}
+
+/**
  * Estimate the input ("↑") tokens for the next request: the whole conversation
  * plus the advertised tool schemas, scored with the provider's tokenizer
  * heuristic. Shown live in the spinner so the user can see context size grow.
@@ -388,8 +463,10 @@ function renderSettings(s: Session, kb: KnowledgeBase, memoryEnabled: boolean): 
       : kb.embeddingsActive() === false
       ? "keyword (embed model not pulled)"
       : `semantic if available (${s.config.knowledge.embed_model})`;
+  const fb = m.fallback_model?.trim();
   const rows: [string, string][] = [
     ["model", `${s.provider.model}  (${s.provider.name} @ ${m.base_url})`],
+    ["fallback model", fb ? (fb === s.provider.model ? `${fb}  (active)` : fb) : "—"],
     ["thinking", reasoning ? "deep · native reasoning model" : "step-by-step scaffold"],
     ["temperature", `${reasoning ? REASONING_TEMP : TOOL_TEMP} active · ${m.temperature} base`],
     ["max output tokens", String(m.max_tokens)],
