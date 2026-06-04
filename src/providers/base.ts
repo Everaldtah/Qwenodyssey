@@ -19,6 +19,7 @@ export interface ProviderConfig {
   temperature: number;
   topP: number;
   maxTokens: number;
+  contextTokens?: number;
 }
 
 export abstract class OpenAICompatibleProvider implements Provider {

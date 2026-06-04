@@ -25,6 +25,7 @@ export function createProvider(config: Config): Provider {
     temperature: m.temperature,
     topP: m.top_p,
     maxTokens: m.max_tokens,
+    contextTokens: m.context_tokens,
   };
   switch (m.provider) {
     case "ollama":
