@@ -1,5 +1,4 @@
 import * as fs from "fs";
-import * as readline from "readline";
 import chalk from "chalk";
 import { createSession, GlobalOpts } from "../session";
 import { loadPrompt } from "../../core/promptLoader";
@@ -8,8 +7,12 @@ import { resolveInside } from "../../tools/fileTools";
 import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule } from "../render";
-import { CHAT_TOOL_SPECS } from "../chatTools";
-import type { Message, ModelInfo, ToolCall, ToolContext } from "../../types";
+import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS } from "../chatTools";
+import { createPrompt, SlashCommand } from "../prompt";
+import { KnowledgeBase } from "../../core/knowledge";
+import { createKnowledgeTools } from "../../tools/knowledgeTools";
+import { createWebTools } from "../../tools/webTools";
+import type { Message, ModelInfo, ToolCall, ToolContext, ToolSpec } from "../../types";
 import type { Session } from "../session";
 
 /** Hard cap on tool calls per user turn, to stop runaway loops. */
@@ -17,6 +20,26 @@ const MAX_TOOL_STEPS = 8;
 
 /** Tool turns run deterministically; temp 0 markedly improves tool adherence. */
 const TOOL_TEMP = 0;
+
+/** Reasoning models (R1/QwQ) need a little heat or they loop; ~0.6 is recommended. */
+const REASONING_TEMP = 0.6;
+
+/** Models trained to deliberate with an internal chain-of-thought. */
+function isReasoningModel(model: string): boolean {
+  return /(^|[-_/:.])(r1|qwq|o1|o3|thinking|reason)/i.test(model) || /deepseek-r1/i.test(model);
+}
+
+/**
+ * Encourages deliberate, step-by-step reasoning before answering or acting.
+ * Compatible with tool use (reason first, then call a tool) and harmless for
+ * native reasoning models, which already think on their own.
+ */
+const DEEP_THINK = `
+THINK DEEPLY before you answer or act. Reason carefully about what the user
+actually needs, consider edge cases and alternatives, and check your logic for
+mistakes. For any non-trivial request, work through it step by step instead of
+guessing, and prefer verifying with a tool over assuming. Only give your final
+answer once you are confident it is correct and complete.`;
 
 /** Appended to the base system prompt so the model knows it can really act. */
 const TOOL_SYSTEM = `
@@ -39,6 +62,21 @@ Example — user: "what OS am I on?"  ✓ correct: call run_shell {command:"syst
 This machine runs Windows; the shell for run_shell is PowerShell/cmd, so prefer Windows
 commands (e.g. 'netsh wlan show interfaces' for wifi, 'dir', 'Get-Process').`;
 
+/** Teaches the model to use its long-term memory + the internet. */
+const MEMORY_SYSTEM = `
+You have LONG-TERM MEMORY (a personal knowledge vault) and INTERNET ACCESS.
+
+Workflow for anything you're unsure about:
+1. First call knowledge_search to recall what you already learned (it's also auto-recalled
+   for you below when relevant).
+2. If memory lacks it, use web_search then web_fetch to read the best source.
+3. DISTILL what you learned and call knowledge_save to store it permanently — reuse an
+   existing title to UPDATE/improve a note rather than duplicating. Cite source URLs.
+
+Build deep, durable understanding: when you study a codebase, an API, an error, or a
+concept, save the key facts so future sessions start smarter. Prefer your saved knowledge
+over guessing, and correct/extend notes when you discover something better.`;
+
 /**
  * Interactive pair-coding chat. Streams responses. Type @path to inline a
  * file's contents, /reset to clear history, /exit to quit.
@@ -53,12 +91,19 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   }
 
   const repo = await scanRepo(s.cwd);
-  const history: Message[] = [
-    {
-      role: "system",
-      content: loadPrompt("system") + "\n" + TOOL_SYSTEM + "\n\nPROJECT:\n" + summarizeRepo(repo),
-    },
-  ];
+
+  // Long-term knowledge vault (RAG memory). Created on first use.
+  const kb = new KnowledgeBase(s.config.knowledge.path, {
+    baseUrl: s.config.model.base_url,
+    embedModel: s.config.knowledge.embed_model,
+  });
+  const memoryEnabled = s.config.knowledge.enabled;
+  if (memoryEnabled) kb.ensure();
+
+  let sys = loadPrompt("system") + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK;
+  if (memoryEnabled || s.config.web.enabled) sys += "\n" + MEMORY_SYSTEM;
+  sys += "\n\nPROJECT:\n" + summarizeRepo(repo);
+  const history: Message[] = [{ role: "system", content: sys }];
 
   console.log(
     banner({
@@ -70,19 +115,14 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     })
   );
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  let closed = false;
-  rl.on("close", () => {
-    closed = true;
-  });
-  // Draw a box around the input: a rule above, the `❯` prompt line (where the
-  // cursor sits and the user types), and a rule below once they hit Enter.
-  // Resolve to /exit if stdin closes (Ctrl-D / EOF) so we quit cleanly.
+  // Interactive prompt with the live slash-command palette (TTY); falls back to
+  // a plain line reader when stdin is piped. Wrapped in a rule "box": a rule
+  // above, the `❯` input line (palette floats beneath it), a rule below on Enter.
+  const prompt = createPrompt(chalk.cyan("❯ "), SLASH_COMMANDS);
   const ask = () =>
     new Promise<string>((resolve) => {
-      if (closed) return resolve("/exit");
       process.stdout.write(hrule() + "\n");
-      rl.question(chalk.cyan("❯ "), (answer) => {
+      prompt.ask().then((answer) => {
         process.stdout.write(hrule() + "\n\n");
         resolve(answer);
       });
@@ -101,6 +141,24 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   };
   const chatTools = new ToolRegistry(toolCtx);
 
+  // Compose the tool set advertised to the model: shell/file/git always, plus
+  // internet and long-term memory when enabled in config.
+  const toolSpecs: ToolSpec[] = [...CHAT_TOOL_SPECS];
+  if (s.config.web.enabled) {
+    createWebTools({
+      provider: s.config.web.provider,
+      apiKey: s.config.web.api_key,
+      searxngUrl: s.config.web.searxng_url,
+      maxResults: s.config.web.max_results,
+      fetchChars: s.config.web.fetch_chars,
+    }).forEach((t) => chatTools.register(t));
+    toolSpecs.push(...WEB_TOOL_SPECS);
+  }
+  if (memoryEnabled) {
+    createKnowledgeTools(kb).forEach((t) => chatTools.register(t));
+    toolSpecs.push(...KNOWLEDGE_TOOL_SPECS);
+  }
+
   // Cached result of the last /models listing, so /model <#> can resolve indexes.
   let lastModels: ModelInfo[] = [];
 
@@ -113,19 +171,16 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
       console.log(chalk.gray("(history cleared)\n"));
       continue;
     }
-    if (line === "/help" || line === "/?") {
-      console.log(
-        chalk.gray(
-          "Qwenodyssey can run real shell/file/git commands to answer you.\n" +
-            "Tools: run_shell, read_file, write_file, list_files, tree, grep, git_status, git_diff\n\n" +
-            "Commands:\n" +
-            "  /models           list installed models\n" +
-            "  /model <name|#>   switch the active model\n" +
-            "  @path             inline a file's contents\n" +
-            "  /reset            clear conversation history\n" +
-            "  /exit             quit\n"
-        )
-      );
+    if (line === "/help" || line === "/?" || line === "/commands" || line === "/") {
+      console.log(renderCommandMenu());
+      continue;
+    }
+    if (line === "/settings" || line === "/config") {
+      console.log(renderSettings(s, kb, memoryEnabled));
+      continue;
+    }
+    if (line === "/memory" || line === "/knowledge") {
+      console.log(renderMemory(kb, s, memoryEnabled));
       continue;
     }
     if (line === "/models" || line.startsWith("/model ") || line.startsWith("/models ")) {
@@ -134,15 +189,45 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     }
 
     const expanded = expandFileRefs(line, s.cwd);
+
+    // Auto-recall: pull relevant notes from long-term memory into context.
+    if (memoryEnabled && s.config.knowledge.auto_recall) {
+      const recalled = await recallKnowledge(kb, line, s.config.knowledge.recall_k);
+      if (recalled) history.push({ role: "system", content: recalled });
+    }
+
     history.push({ role: "user", content: expanded });
 
     try {
-      await runAssistantTurn(s, chatTools, history, ask);
+      await runAssistantTurn(s, chatTools, toolSpecs, history, ask);
     } catch (err) {
       console.log(chalk.red(`\n[error: ${(err as Error).message}]`));
     }
   }
-  rl.close();
+  prompt.close();
+}
+
+/** Retrieve top notes for the message and format them as a context block. */
+async function recallKnowledge(
+  kb: KnowledgeBase,
+  query: string,
+  k: number
+): Promise<string | null> {
+  let hits;
+  try {
+    hits = await kb.search(query, k);
+  } catch {
+    return null;
+  }
+  if (!hits.length) return null;
+  const blocks = hits.map(
+    (h) => `### ${h.meta.title} [[${h.meta.slug}]]\n${h.snippet}`
+  );
+  return (
+    "RELEVANT KNOWLEDGE recalled from your long-term memory (use it; read full notes " +
+    "with knowledge_read; update them with knowledge_save if you learn more):\n\n" +
+    blocks.join("\n\n")
+  );
 }
 
 /**
@@ -158,15 +243,17 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
 async function runAssistantTurn(
   s: Session,
   tools: ToolRegistry,
+  toolSpecs: ToolSpec[],
   history: Message[],
   ask: () => Promise<string>
 ): Promise<void> {
   let nudged = false;
+  const reasoning = isReasoningModel(s.provider.model);
 
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
     const res = await s.provider.generate(history, {
-      temperature: TOOL_TEMP,
-      tools: CHAT_TOOL_SPECS,
+      temperature: reasoning ? REASONING_TEMP : TOOL_TEMP,
+      tools: toolSpecs,
     });
     const calls = res.toolCalls ?? [];
 
@@ -180,13 +267,21 @@ async function runAssistantTurn(
       continue;
     }
 
-    // No tool call. Did it instead describe a runnable shell command in a fence?
-    const fencedCmds = extractShellCommands(res.text);
+    // Separate any <think> reasoning from the final answer. Fence detection runs
+    // on the answer only, so commands the model merely pondered aren't auto-run.
+    const { thinking, answer } = splitThinking(res.text);
+    const fencedCmds = extractShellCommands(answer);
 
     if (fencedCmds.length === 0) {
       // Genuine final answer.
-      console.log(chalk.green("qwen › ") + (res.text.trim() || "(no response)") + "\n");
-      history.push({ role: "assistant", content: res.text });
+      if (thinking) {
+        console.log(chalk.magenta("qwen ⟂ thinking"));
+        console.log(chalk.gray(indent(thinking)) + "\n");
+      }
+      console.log(chalk.green("qwen › ") + (answer || "(no response)") + "\n");
+      // Don't feed the verbose <think> back into context (saves tokens, and
+      // reasoning models are trained to see only prior answers).
+      history.push({ role: "assistant", content: answer || res.text });
       return;
     }
 
@@ -222,6 +317,128 @@ async function runAssistantTurn(
     role: "assistant",
     content: `Reached the ${MAX_TOOL_STEPS}-step tool limit for this turn.`,
   });
+}
+
+/**
+ * Slash commands — shared by the live `/` palette (prompt.ts) and the static
+ * /help menu. Each entry's name/aliases drive the palette's letter filtering.
+ */
+const SLASH_COMMANDS: SlashCommand[] = [
+  { name: "/help", aliases: ["/commands", "/?"], desc: "Show this list of commands" },
+  { name: "/settings", aliases: ["/config"], desc: "Show the current model & runtime settings" },
+  { name: "/models", desc: "List installed models (sizes shown, current marked ●)" },
+  { name: "/model", args: "<name|#>", desc: "Switch the active model for this session" },
+  { name: "/memory", aliases: ["/knowledge"], desc: "Show the long-term knowledge vault (notes & path)" },
+  { name: "/reset", desc: "Clear the conversation history" },
+  { name: "/exit", aliases: ["/quit"], desc: "Quit Qwenodyssey" },
+];
+
+const CHAT_TOOLS_LINE =
+  "run_shell, read/write_file, grep, git, web_search, web_fetch, knowledge_search/save";
+
+/** Render slash commands as an aligned two-column menu, boxed in rules. */
+function renderCommandMenu(): string {
+  const invocation = (c: SlashCommand) =>
+    [c.name, ...(c.aliases ?? [])].join("  ") + (c.args ? " " + c.args : "");
+  const pad = Math.max(...SLASH_COMMANDS.map((c) => invocation(c).length)) + 3;
+  const rows = SLASH_COMMANDS.map(
+    (c) => "  " + chalk.cyan(invocation(c).padEnd(pad)) + chalk.gray(c.desc)
+  );
+  return [
+    hrule(),
+    chalk.bold("  Commands"),
+    ...rows,
+    "  " + chalk.cyan("@path".padEnd(pad)) + chalk.gray("Inline a file's contents into your message"),
+    "",
+    chalk.gray("  Tip: type ") + chalk.cyan("/") + chalk.gray(" to filter commands as you type."),
+    chalk.gray("  The model can also call tools on its own: ") + chalk.dim(CHAT_TOOLS_LINE),
+    hrule() + "\n",
+  ].join("\n");
+}
+
+/** Render the current model + runtime settings as an aligned table. */
+function renderSettings(s: Session, kb: KnowledgeBase, memoryEnabled: boolean): string {
+  const m = s.config.model;
+  const reasoning = isReasoningModel(s.provider.model);
+  const embed =
+    kb.embeddingsActive() === true
+      ? `semantic (${s.config.knowledge.embed_model})`
+      : kb.embeddingsActive() === false
+      ? "keyword (embed model not pulled)"
+      : `semantic if available (${s.config.knowledge.embed_model})`;
+  const rows: [string, string][] = [
+    ["model", `${s.provider.model}  (${s.provider.name} @ ${m.base_url})`],
+    ["thinking", reasoning ? "deep · native reasoning model" : "step-by-step scaffold"],
+    ["temperature", `${reasoning ? REASONING_TEMP : TOOL_TEMP} active · ${m.temperature} base`],
+    ["max output tokens", String(m.max_tokens)],
+    ["context budget", String(m.context_tokens)],
+    ["agent mode", s.mode],
+    ["shell tools", s.config.tools.allow_shell ? "enabled" : "disabled"],
+    ["confirm destructive", s.config.tools.confirm_destructive ? "on (asks before risky cmds)" : "off"],
+    ["internet", s.config.web.enabled ? `enabled (${s.config.web.provider})` : "disabled"],
+    ["long-term memory", memoryEnabled ? `on · ${kb.list().length} notes` : "disabled"],
+    ["memory retrieval", memoryEnabled ? embed : "—"],
+    ["vault", memoryEnabled ? kb.dir : "—"],
+    ["project dir", s.cwd],
+  ];
+  const pad = Math.max(...rows.map(([k]) => k.length)) + 2;
+  const lines = rows.map(([k, v]) => "  " + chalk.gray(k.padEnd(pad)) + v);
+  return [
+    hrule(),
+    chalk.bold("  Settings"),
+    ...lines,
+    "",
+    chalk.gray("  Change with /model, or edit ") + chalk.dim(".qwenodyssey/config.toml") +
+      chalk.gray(" (qwenodyssey config set …)"),
+    hrule() + "\n",
+  ].join("\n");
+}
+
+/** Render the knowledge vault contents and status. */
+function renderMemory(kb: KnowledgeBase, s: Session, memoryEnabled: boolean): string {
+  if (!memoryEnabled) {
+    return hrule() + "\n  " + chalk.gray("Long-term memory is disabled (knowledge.enabled=false).") + "\n" + hrule() + "\n";
+  }
+  const notes = kb.list();
+  const head = [
+    hrule(),
+    chalk.bold("  Long-term memory"),
+    "  " + chalk.gray("vault    ") + kb.dir,
+    "  " + chalk.gray("notes    ") + String(notes.length),
+    "  " + chalk.gray("retrieval ") +
+      (kb.embeddingsActive() === false ? "keyword" : `semantic (${s.config.knowledge.embed_model})`),
+    "",
+  ];
+  const body = notes.length
+    ? notes
+        .slice(0, 30)
+        .map(
+          (n) =>
+            "  " + chalk.cyan("[[" + n.slug + "]]") + " " + n.title +
+            (n.tags.length ? chalk.dim("  #" + n.tags.join(" #")) : "")
+        )
+    : ["  " + chalk.gray("(empty — the model saves notes as it learns)")];
+  return [...head, ...body, hrule() + "\n"].join("\n");
+}
+
+/**
+ * Split a reply into its chain-of-thought and final answer. Reasoning models
+ * (DeepSeek-R1, QwQ) wrap deliberation in <think>…</think>. We surface that
+ * dimmed and keep the answer clean. Handles an unterminated <think> (truncated
+ * output) by treating the remainder as thinking.
+ */
+function splitThinking(text: string): { thinking: string; answer: string } {
+  const closed = text.match(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/i);
+  if (closed) {
+    const thinking = closed[1].trim();
+    const answer = text.replace(closed[0], "").trim();
+    return { thinking, answer };
+  }
+  const open = text.match(/<think(?:ing)?>([\s\S]*)$/i);
+  if (open) {
+    return { thinking: open[1].trim(), answer: "" };
+  }
+  return { thinking: "", answer: text.trim() };
 }
 
 /** Languages whose fenced blocks we treat as runnable shell commands. */

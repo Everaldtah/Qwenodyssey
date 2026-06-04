@@ -87,4 +87,73 @@ export const CHAT_TOOL_SPECS: ToolSpec[] = [
   },
 ];
 
+/** Internet tools — included when web.enabled. */
+export const WEB_TOOL_SPECS: ToolSpec[] = [
+  {
+    name: "web_search",
+    description:
+      "Search the internet for information you don't already know or that may be current " +
+      "(library docs, APIs, error messages, recent facts). Returns titles, URLs and snippets.",
+    parameters: {
+      type: "object",
+      properties: { query: str("What to search for.") },
+      required: ["query"],
+    },
+  },
+  {
+    name: "web_fetch",
+    description: "Fetch a URL and return its readable text (HTML stripped). Use to read a search result or a known docs page.",
+    parameters: {
+      type: "object",
+      properties: { url: str("The http(s) URL to fetch.") },
+      required: ["url"],
+    },
+  },
+];
+
+/** Long-term memory tools — included when knowledge.enabled. */
+export const KNOWLEDGE_TOOL_SPECS: ToolSpec[] = [
+  {
+    name: "knowledge_search",
+    description:
+      "Search your long-term memory for what you've already learned. Check here BEFORE the web.",
+    parameters: {
+      type: "object",
+      properties: { query: str("Topic, concept, codebase, or API to recall.") },
+      required: ["query"],
+    },
+  },
+  {
+    name: "knowledge_read",
+    description: "Read a full note from memory by its slug.",
+    parameters: {
+      type: "object",
+      properties: { slug: str("The note slug, e.g. from knowledge_search results.") },
+      required: ["slug"],
+    },
+  },
+  {
+    name: "knowledge_save",
+    description:
+      "Save or update a note in long-term memory so you remember it permanently. Use whenever " +
+      "you learn something durable (how code works, an API, a fix, a looked-up fact). Reusing a " +
+      "title updates that note. Cite source URLs when available.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: str("Short, specific note title (also the update key)."),
+        content: str("Distilled, durable knowledge in markdown. Use [[wikilinks]] to relate notes."),
+        tags: { type: "array", items: { type: "string" }, description: "Optional tags." },
+        sources: { type: "array", items: { type: "string" }, description: "Optional source URLs." },
+      },
+      required: ["title", "content"],
+    },
+  },
+  {
+    name: "knowledge_list",
+    description: "List the titles of everything in your knowledge vault.",
+    parameters: { type: "object", properties: {} },
+  },
+];
+
 export const CHAT_TOOL_NAMES = new Set(CHAT_TOOL_SPECS.map((t) => t.name));

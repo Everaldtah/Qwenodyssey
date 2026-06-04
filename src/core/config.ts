@@ -17,7 +17,8 @@ const ModelConfig = z.object({
   api_key: z.string().default(""),
   temperature: z.number().default(0.2),
   top_p: z.number().default(0.9),
-  max_tokens: z.number().default(4096),
+  // Generous output budget so deep reasoning / long <think> chains aren't cut off.
+  max_tokens: z.number().default(8192),
   context_tokens: z.number().default(8192),
 });
 
@@ -40,11 +41,35 @@ const MemoryConfig = z.object({
   path: z.string().default(".qwenodyssey/memory"),
 });
 
+/** Obsidian-style long-term knowledge vault + retrieval (RAG). */
+const KnowledgeConfig = z.object({
+  enabled: z.boolean().default(true),
+  // Empty => a global vault at ~/.qwenodyssey/knowledge (permanent, cross-project).
+  path: z.string().default(""),
+  // Pull relevant notes into context automatically before each turn.
+  auto_recall: z.boolean().default(true),
+  recall_k: z.number().default(4),
+  // Ollama embedding model for semantic search; falls back to keyword if absent.
+  embed_model: z.string().default("nomic-embed-text"),
+});
+
+/** Internet search + page fetch. */
+const WebConfig = z.object({
+  enabled: z.boolean().default(true),
+  provider: z.enum(["duckduckgo", "tavily", "brave", "searxng"]).default("duckduckgo"),
+  api_key: z.string().default(""),
+  searxng_url: z.string().default(""),
+  max_results: z.number().default(5),
+  fetch_chars: z.number().default(8000),
+});
+
 export const ConfigSchema = z.object({
   model: ModelConfig.default({}),
   agent: AgentConfig.default({}),
   tools: ToolsConfig.default({}),
   memory: MemoryConfig.default({}),
+  knowledge: KnowledgeConfig.default({}),
+  web: WebConfig.default({}),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
