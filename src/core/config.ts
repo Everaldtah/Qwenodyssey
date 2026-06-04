@@ -25,7 +25,10 @@ const ModelConfig = z.object({
   top_p: z.number().default(0.9),
   // Generous output budget so deep reasoning / long <think> chains aren't cut off.
   max_tokens: z.number().default(8192),
-  context_tokens: z.number().default(8192),
+  // Ollama context window (num_ctx). 16384 holds far more code/docs than the
+  // 4096 Ollama default; raise toward the model's max (qwen2.5 32K, deepseek-r1
+  // & gemma-12B ~128K) if you have the RAM/VRAM for the larger KV cache.
+  context_tokens: z.number().default(16384),
 });
 
 const AgentConfig = z.object({
