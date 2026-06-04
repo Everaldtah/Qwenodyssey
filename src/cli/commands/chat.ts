@@ -257,10 +257,9 @@ async function runAssistantTurn(
   const reasoning = isReasoningModel(s.provider.model);
 
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
-    // Live status: elapsed time + estimated input tokens sent up this request,
-    // calibrated against the model's real usage from prior turns.
-    const chars = promptChars(history, toolSpecs);
-    const spinner = new Spinner(thinkingWord(), meter.estimate(chars));
+    // Live status: elapsed time + the session's cumulative input tokens so far
+    // (real usage; starts at 0 and climbs as the conversation grows).
+    const spinner = new Spinner(thinkingWord(), meter.sessionIn);
     spinner.begin();
     let res: GenerateResult;
     try {
@@ -271,7 +270,7 @@ async function runAssistantTurn(
     } finally {
       spinner.stop();
     }
-    meter.record(chars, res); // exact counts from the model recalibrate the estimate
+    meter.record(res); // fold this request's exact usage into the session totals
     const calls = res.toolCalls ?? [];
 
     // Happy path: the model made real tool calls.
@@ -296,11 +295,13 @@ async function runAssistantTurn(
         console.log(chalk.gray(indent(thinking)) + "\n");
       }
       console.log(chalk.green("qwen › ") + (answer || "(no response)") + "\n");
-      // Exact token usage for this turn, straight from the model.
-      if (res.promptTokens || res.completionTokens) {
+      // Per-turn usage + the running session totals, all from the model's exact
+      // counts. (The spinner shows session input before this turn; this is after.)
+      if (meter.sessionIn || meter.sessionOut) {
         console.log(
           chalk.gray(
-            `  ↑ ${formatTokens(res.promptTokens ?? 0)} in · ↓ ${formatTokens(res.completionTokens ?? 0)} out tokens\n`
+            `  this turn: ↑ ${formatTokens(meter.lastIn)} ↓ ${formatTokens(meter.lastOut)}  ·  ` +
+              `session: ↑ ${formatTokens(meter.sessionIn)} ↓ ${formatTokens(meter.sessionOut)} tokens\n`
           )
         );
       }
@@ -426,46 +427,24 @@ async function generateWithFallback(
 }
 
 /**
- * Total characters we're about to send up: the whole conversation plus the
- * advertised tool schemas. Used as the raw input for token estimation.
- */
-function promptChars(history: Message[], toolSpecs: ToolSpec[]): number {
-  let chars = 0;
-  for (const m of history) chars += (m.content || "").length;
-  for (const t of toolSpecs) {
-    chars += t.name.length + (t.description || "").length + JSON.stringify(t.parameters || {}).length;
-  }
-  return chars;
-}
-
-/**
- * Tracks token usage and keeps the live "↑ tokens" estimate honest.
- *
- * Before a request we can only estimate (the backend hasn't tokenized yet), but
- * after each response the model reports EXACT `usage` counts. We use those to
- * (a) calibrate chars-per-token to the model's real tokenizer — which absorbs
- * the chat-template/role overhead a flat len/4 heuristic ignores — so later
- * estimates converge on reality, and (b) report the exact ↑/↓ counts per turn.
+ * Running tally of the tokens actually consumed this session, accumulated from
+ * the EXACT `usage` the model reports after each response (Ollama returns real
+ * prompt/completion counts). Starts at 0 and only grows — the spinner shows the
+ * cumulative input total, so you watch the session's real cost climb rather
+ * than a per-request estimate. Output is tracked too for the per-turn summary.
  */
 class TokenMeter {
-  // Start near a realistic mix of prose + code; recalibrated from real usage.
-  private charsPerToken = 3.6;
-  lastPrompt = 0;
-  lastCompletion = 0;
-  calibrated = false;
+  sessionIn = 0; // Σ prompt tokens across all requests this session
+  sessionOut = 0; // Σ completion tokens
+  lastIn = 0; // this turn's prompt tokens
+  lastOut = 0; // this turn's completion tokens
 
-  estimate(chars: number): number {
-    return Math.max(1, Math.round(chars / this.charsPerToken));
-  }
-
-  /** Feed exact usage + the chars we actually sent to refine the ratio. */
-  record(promptCharsSent: number, res: GenerateResult): void {
-    if (res.promptTokens && res.promptTokens > 0 && promptCharsSent > 0) {
-      this.charsPerToken = promptCharsSent / res.promptTokens;
-      this.calibrated = true;
-      this.lastPrompt = res.promptTokens;
-    }
-    if (typeof res.completionTokens === "number") this.lastCompletion = res.completionTokens;
+  /** Add a completed response's exact usage to the running totals. */
+  record(res: GenerateResult): void {
+    this.lastIn = res.promptTokens ?? 0;
+    this.lastOut = res.completionTokens ?? 0;
+    this.sessionIn += this.lastIn;
+    this.sessionOut += this.lastOut;
   }
 }
 
