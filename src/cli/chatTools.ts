@@ -25,10 +25,12 @@ export const CHAT_TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: "read_file",
-    description: "Read a file's contents (relative to the project directory).",
+    description:
+      "Read a file's contents. The path may be relative to the project dir OR an absolute path " +
+      'like "C:\\Projects\\Overstory\\README.md".',
     parameters: {
       type: "object",
-      properties: { path: str("Path to the file, relative to the project root.") },
+      properties: { path: str("File path — relative to the project, or absolute.") },
       required: ["path"],
     },
   },
@@ -46,27 +48,38 @@ export const CHAT_TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: "list_files",
-    description: "List files matching an optional glob pattern (default: everything).",
+    description:
+      "List files under a directory (recursively) matching an optional glob. Use `path` to target " +
+      "a specific directory, including an absolute one outside the project.",
     parameters: {
       type: "object",
-      properties: { pattern: str('Glob like "src/**/*.ts". Optional.') },
+      properties: {
+        path: str('Directory to list — relative or absolute (e.g. "C:\\Projects\\Overstory"). Optional; defaults to the project dir.'),
+        pattern: str('Glob like "src/**/*.ts". Optional.'),
+      },
     },
   },
   {
     name: "tree",
-    description: "Show a compact, depth-limited directory tree.",
+    description:
+      "Show a compact, depth-limited directory tree. Use `path` to point at any directory — " +
+      'including an absolute path the user names, e.g. "C:\\Projects\\Overstory".',
     parameters: {
       type: "object",
-      properties: { depth: { type: "integer", description: "Max depth (default 2)." } },
+      properties: {
+        path: str('Directory to show — relative or absolute. Optional; defaults to the project dir.'),
+        depth: { type: "integer", description: "Max depth (default 2)." },
+      },
     },
   },
   {
     name: "grep",
-    description: "Search file contents for a regex pattern across the project.",
+    description: "Search file contents for a regex pattern. Use `path` to search a specific (or absolute) directory.",
     parameters: {
       type: "object",
       properties: {
         pattern: str("Regular expression to search for."),
+        path: str("Directory to search — relative or absolute. Optional; defaults to the project dir."),
         glob: str('Optional glob to limit files, e.g. "**/*.ts".'),
       },
       required: ["pattern"],
