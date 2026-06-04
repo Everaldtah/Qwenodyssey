@@ -40,6 +40,9 @@ export class OllamaProvider extends OpenAICompatibleProvider {
       ...(this.cfg.keepAlive ? { keep_alive: this.cfg.keepAlive } : {}),
     };
     if (options.json) body.format = "json";
+    // Reasoning models (R1/QwQ): Ollama returns the chain-of-thought in a
+    // separate `thinking` field when asked, instead of inline <think> tags.
+    if (options.think) body.think = true;
     if (options.tools?.length) {
       body.tools = options.tools.map((t) => ({
         type: "function",
@@ -65,6 +68,7 @@ export class OllamaProvider extends OpenAICompatibleProvider {
     const msg: any = json?.message ?? {};
     return {
       text: msg?.content ?? "",
+      thinking: typeof msg?.thinking === "string" ? msg.thinking : undefined,
       toolCalls: parseNativeToolCalls(msg?.tool_calls),
       model: this.cfg.model,
       promptTokens: json?.prompt_eval_count,

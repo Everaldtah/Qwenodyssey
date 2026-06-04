@@ -38,12 +38,16 @@ export interface ModelOptions {
   json?: boolean;
   /** Tools the model may call this turn. */
   tools?: ToolSpec[];
+  /** Ask the model to expose its chain-of-thought (reasoning models via Ollama). */
+  think?: boolean;
 }
 
 export interface GenerateResult {
   text: string;
   /** Tool calls the model requested, if any. */
   toolCalls?: ToolCall[];
+  /** Separate chain-of-thought, when the backend returns it (Ollama `thinking`). */
+  thinking?: string;
   /** Best-effort token accounting; may be approximate for some providers. */
   promptTokens?: number;
   completionTokens?: number;

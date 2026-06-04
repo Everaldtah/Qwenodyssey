@@ -372,6 +372,7 @@ async function runAssistantTurn(
       res = await generateWithFallback(s, history, {
         temperature: reasoning ? REASONING_TEMP : TOOL_TEMP,
         tools: toolSpecs,
+        think: reasoning,
       });
     } finally {
       spinner.stop();
@@ -386,9 +387,12 @@ async function runAssistantTurn(
       continue;
     }
 
-    // Separate any <think> reasoning from the final answer. Fence detection runs
-    // on the answer only, so commands the model merely pondered aren't auto-run.
-    const { thinking, answer } = splitThinking(res.text);
+    // Reasoning: prefer the backend's separate `thinking` field (Ollama), else
+    // parse inline <think> tags. Fence detection runs on the answer only, so
+    // commands the model merely pondered aren't auto-run.
+    const inline = splitThinking(res.text);
+    const thinking = (res.thinking?.trim() || inline.thinking).trim();
+    const answer = inline.answer;
     const fencedCmds = extractShellCommands(answer);
 
     if (fencedCmds.length === 0) {
