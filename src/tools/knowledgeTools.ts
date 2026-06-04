@@ -86,7 +86,28 @@ export function createKnowledgeTools(kb: KnowledgeBase): Tool[] {
     },
   };
 
-  return [knowledgeSearch, knowledgeRead, knowledgeSave, knowledgeList];
+  const recordLesson: Tool = {
+    name: "record_lesson",
+    description:
+      "Record a durable LESSON learned from a mistake or correction so you don't repeat it (e.g. " +
+      "'use Get-WinEvent, not eventquery, for Windows logs'). Lessons are auto-recalled in future " +
+      "turns. Use whenever a tool/command failed and you found the right way, or the user corrects you.",
+    mutating: true,
+    async run(args, ctx) {
+      const lesson = String(args.lesson || args.content || "").trim();
+      if (!lesson) return { ok: false, output: "Provide the lesson text." };
+      const title = String(args.title || lesson.slice(0, 60)).trim();
+      const note = await kb.write({
+        title: `Lesson: ${title}`,
+        content: lesson,
+        tags: ["lesson", "evolution", ...toList(args.tags)],
+      });
+      ctx.log({ tool: "record_lesson", slug: note.slug });
+      return { ok: true, output: `Lesson saved: ${note.title}` };
+    },
+  };
+
+  return [knowledgeSearch, knowledgeRead, knowledgeSave, knowledgeList, recordLesson];
 }
 
 function toList(v: unknown): string[] {

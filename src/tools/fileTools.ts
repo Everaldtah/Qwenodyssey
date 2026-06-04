@@ -27,6 +27,21 @@ export function resolveReadable(cwd: string, p?: string): string {
   return path.resolve(cwd, p && String(p).trim() ? String(p) : ".");
 }
 
+/**
+ * Resolve a path for WRITES, allowing either the project root OR the agent's own
+ * source root (ctx.selfRoot) — so Qwenodyssey can modify itself. Anything else
+ * is rejected to avoid scribbling across the whole machine.
+ */
+export function resolveWritable(ctx: ToolContext, p: string): string {
+  const abs = path.resolve(ctx.cwd, p);
+  const roots = [path.resolve(ctx.cwd)];
+  if (ctx.selfRoot) roots.push(path.resolve(ctx.selfRoot));
+  for (const root of roots) {
+    if (abs === root || abs.startsWith(root + path.sep)) return abs;
+  }
+  throw new Error(`Path escapes the allowed roots (project or agent source): ${p}`);
+}
+
 export const readFileTool: Tool = {
   name: "read_file",
   description: "Read the contents of a file.",
@@ -47,7 +62,7 @@ export const writeFileTool: Tool = {
   description: "Overwrite (or create) a file with the given content.",
   mutating: true,
   async run(args, ctx): Promise<ToolResult> {
-    const abs = resolveInside(ctx.cwd, String(args.path));
+    const abs = resolveWritable(ctx, String(args.path));
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, String(args.content ?? ""), "utf-8");
     ctx.log({ tool: "write_file", path: args.path });
@@ -60,7 +75,7 @@ export const createFileTool: Tool = {
   description: "Create a new file. Fails if it already exists.",
   mutating: true,
   async run(args, ctx): Promise<ToolResult> {
-    const abs = resolveInside(ctx.cwd, String(args.path));
+    const abs = resolveWritable(ctx, String(args.path));
     if (fs.existsSync(abs)) return { ok: false, output: `Already exists: ${args.path}` };
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, String(args.content ?? ""), "utf-8");
@@ -74,7 +89,7 @@ export const deleteFileTool: Tool = {
   description: "Delete a file.",
   mutating: true,
   async run(args, ctx): Promise<ToolResult> {
-    const abs = resolveInside(ctx.cwd, String(args.path));
+    const abs = resolveWritable(ctx, String(args.path));
     if (!fs.existsSync(abs)) return { ok: false, output: `Not found: ${args.path}` };
     fs.rmSync(abs);
     ctx.log({ tool: "delete_file", path: args.path });

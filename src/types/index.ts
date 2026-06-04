@@ -154,6 +154,8 @@ export interface ToolContext {
   confirmDestructive: boolean;
   allowShell: boolean;
   sandbox: boolean;
+  /** Qwenodyssey's own install/source root — writable so the agent can self-modify. */
+  selfRoot?: string;
   log: (entry: Record<string, unknown>) => void;
 }
 

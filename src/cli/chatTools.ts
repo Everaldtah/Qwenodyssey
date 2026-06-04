@@ -200,6 +200,21 @@ export const KNOWLEDGE_TOOL_SPECS: ToolSpec[] = [
     description: "List the titles of everything in your knowledge vault.",
     parameters: { type: "object", properties: {} },
   },
+  {
+    name: "record_lesson",
+    description:
+      "Record a durable LESSON learned from a mistake or a user correction so you don't repeat it. " +
+      "Lessons are auto-recalled in future turns. Use after a tool/command failed and you found the " +
+      "right approach, or when the user corrects you.",
+    parameters: {
+      type: "object",
+      properties: {
+        lesson: str("The reusable rule/takeaway, 1-2 sentences (name the correct tool/command/approach)."),
+        title: str("Optional short title."),
+      },
+      required: ["lesson"],
+    },
+  },
 ];
 
 export const CHAT_TOOL_NAMES = new Set(CHAT_TOOL_SPECS.map((t) => t.name));

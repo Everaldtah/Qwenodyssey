@@ -25,7 +25,12 @@ export interface Session {
   provider: ReturnType<typeof createProvider>;
   autoConfirm: boolean;
   mode: AgentMode;
+  /** Qwenodyssey's own source/install root (this package), for self-inspection/modification. */
+  selfRoot: string;
 }
+
+/** This package's root: dist/cli/session.js → ../.. ; src/cli/session.ts → ../.. */
+export const SELF_ROOT = path.resolve(__dirname, "..", "..");
 
 export function createSession(opts: GlobalOpts): Session {
   const cwd = path.resolve(opts.cwd || process.cwd());
@@ -39,6 +44,7 @@ export function createSession(opts: GlobalOpts): Session {
     confirmDestructive: config.tools.confirm_destructive,
     allowShell: config.tools.allow_shell,
     sandbox: config.tools.sandbox,
+    selfRoot: SELF_ROOT,
     log: (entry) => logger.event(entry),
   };
 
@@ -55,5 +61,6 @@ export function createSession(opts: GlobalOpts): Session {
     provider,
     autoConfirm,
     mode: opts.mode || (config.agent.small_model_mode ? "safe" : "deep"),
+    selfRoot: SELF_ROOT,
   };
 }

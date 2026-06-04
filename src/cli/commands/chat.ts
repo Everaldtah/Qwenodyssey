@@ -10,6 +10,7 @@ import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
 import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS } from "../chatTools";
 import { createPrompt, SlashCommand } from "../prompt";
 import { KnowledgeBase } from "../../core/knowledge";
+import { EvolutionEngine, TurnSignals } from "../../core/evolution";
 import { createKnowledgeTools } from "../../tools/knowledgeTools";
 import { createWebTools } from "../../tools/webTools";
 import type { GenerateResult, Message, ModelInfo, ModelOptions, ToolCall, ToolContext, ToolSpec } from "../../types";
@@ -111,6 +112,49 @@ knowledge_save durable facts (reuse a title to update a note; cite source URLs).
 durable understanding so future sessions start smarter, and prefer saved knowledge over guessing.`;
 
 /**
+ * Tells the model the concrete truth about itself: where its persistent memory
+ * lives, that its own source code is on disk and editable, and that it learns
+ * from mistakes. Paths are real so it can answer "do you remember / where?"
+ * truthfully and actually modify itself.
+ */
+function selfAwareness(
+  s: Session,
+  kb: KnowledgeBase,
+  memoryEnabled: boolean,
+  evolutionOn: boolean
+): string {
+  const lines = [
+    `SELF-AWARENESS — you are "Qwenodyssey", a local AI coding agent running on the user's PC. ` +
+      `You have persistent memory AND your own source code on this machine, and you can change both. ` +
+      `Never claim you "have no memory", "don't store anything", or "can't modify yourself" — you can.`,
+  ];
+  if (memoryEnabled) {
+    lines.push(
+      `• MEMORY (persists across sessions): your knowledge vault is markdown files at "${kb.dir}". ` +
+        `You DO store information on disk. Save with knowledge_save, recall with knowledge_search / ` +
+        `knowledge_list / knowledge_read. If asked whether you remember something or where it's kept, ` +
+        `answer truthfully and give this path.`
+    );
+  }
+  lines.push(
+    `• SOURCE CODE (you can modify yourself): your program lives at "${s.selfRoot}". Read it with ` +
+      `tree/read_file/grep and improve it with write_file (absolute paths under that root are allowed). ` +
+      `After editing your source, rebuild with run_shell: \`npm --prefix "${s.selfRoot}" run build\` ` +
+      `(and \`npm --prefix "${s.selfRoot}" test\`); changes take effect next launch. Edit yourself ` +
+      `carefully, keep changes small, and explain what you changed.`
+  );
+  if (evolutionOn) {
+    lines.push(
+      `• EVOLUTION (learn from mistakes): when a tool/command fails or you get something wrong, after ` +
+        `resolving it call record_lesson with the durable takeaway so you don't repeat it. Your past ` +
+        `lessons are recalled to you automatically — apply them. You also reflect automatically after ` +
+        `rough turns. Over time these lessons make you smarter.`
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
  * Interactive pair-coding chat. Streams responses. Type @path to inline a
  * file's contents, /reset to clear history, /exit to quit.
  */
@@ -136,8 +180,18 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   const memoryEnabled = s.config.knowledge.enabled;
   if (memoryEnabled) kb.ensure();
 
+  // Self-improvement: reflect on failed turns and bank lessons in the vault.
+  const evolution =
+    memoryEnabled && s.config.evolution.enabled
+      ? new EvolutionEngine(kb, (m, o) => s.provider.generate(m, o), {
+          enabled: true,
+          reflectOnFailure: s.config.evolution.reflect_on_failure,
+        })
+      : null;
+
   let sys = loadPrompt("system") + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK;
   if (memoryEnabled || s.config.web.enabled) sys += "\n" + MEMORY_SYSTEM;
+  sys += "\n" + selfAwareness(s, kb, memoryEnabled, !!evolution);
   sys += "\n\nPROJECT:\n" + summarizeRepo(repo);
   const history: Message[] = [{ role: "system", content: sys }];
 
@@ -173,6 +227,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     confirmDestructive: false,
     allowShell: s.config.tools.allow_shell,
     sandbox: s.config.tools.sandbox,
+    selfRoot: s.selfRoot,
     log: (entry) => s.logger.event(entry),
   };
   const chatTools = new ToolRegistry(toolCtx);
@@ -221,6 +276,10 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
       console.log(renderMemory(kb, s, memoryEnabled));
       continue;
     }
+    if (line === "/lessons" || line === "/evolution") {
+      console.log(renderLessons(evolution));
+      continue;
+    }
     if (line === "/models" || line.startsWith("/model ") || line.startsWith("/models ")) {
       lastModels = await handleModels(s, line, lastModels);
       continue;
@@ -237,7 +296,12 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     history.push({ role: "user", content: expanded });
 
     try {
-      await runAssistantTurn(s, chatTools, toolSpecs, history, meter, ask);
+      const signals = await runAssistantTurn(s, chatTools, toolSpecs, history, meter, ask);
+      // Evolution: reflect on rough turns and bank a lesson for next time.
+      if (evolution) {
+        const learned = await evolution.reflect({ ...signals, userMessage: line });
+        if (learned) console.log(chalk.magenta(`  ✦ learned a lesson: ${learned}\n`));
+      }
     } catch (err) {
       console.log(chalk.red(`\n[error: ${(err as Error).message}]`));
     }
@@ -285,9 +349,18 @@ async function runAssistantTurn(
   history: Message[],
   meter: TokenMeter,
   ask: () => Promise<string>
-): Promise<void> {
+): Promise<TurnSignals> {
   let nudged = false;
   const reasoning = isReasoningModel(s.provider.model);
+  const failures: string[] = [];
+  const runCall = async (call: ToolCall): Promise<void> => {
+    const r = await executeToolCall(s, tools, call, ask);
+    if (!r.ok) {
+      const a = JSON.stringify(call.arguments ?? {}).slice(0, 120);
+      failures.push(`${call.name} ${a} → ${r.content.slice(0, 200)}`);
+    }
+    history.push({ role: "tool", tool_call_id: call.id, name: call.name, content: r.content });
+  };
 
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
     // Live status: elapsed time + the session's cumulative input tokens so far
@@ -309,10 +382,7 @@ async function runAssistantTurn(
     // Happy path: the model made real tool calls.
     if (calls.length > 0) {
       history.push({ role: "assistant", content: res.text || "", tool_calls: calls });
-      for (const call of calls) {
-        const result = await executeToolCall(s, tools, call, ask);
-        history.push({ role: "tool", tool_call_id: call.id, name: call.name, content: result });
-      }
+      for (const call of calls) await runCall(call);
       continue;
     }
 
@@ -341,12 +411,13 @@ async function runAssistantTurn(
       // Don't feed the verbose <think> back into context (saves tokens, and
       // reasoning models are trained to see only prior answers).
       history.push({ role: "assistant", content: answer || res.text });
-      return;
+      return { userMessage: "", failures, finalAnswer: answer || res.text, stepLimitHit: false };
     }
 
     if (!nudged) {
       // First regression: correct it without running anything yet.
       nudged = true;
+      failures.push("printed a command in a ``` fence instead of calling the run_shell tool");
       history.push({
         role: "user",
         content:
@@ -365,10 +436,7 @@ async function runAssistantTurn(
       arguments: { command },
     }));
     history.push({ role: "assistant", content: "", tool_calls: synthetic });
-    for (const call of synthetic) {
-      const result = await executeToolCall(s, tools, call, ask);
-      history.push({ role: "tool", tool_call_id: call.id, name: call.name, content: result });
-    }
+    for (const call of synthetic) await runCall(call);
   }
 
   console.log(chalk.yellow(`[stopped after ${MAX_TOOL_STEPS} tool steps]`) + "\n");
@@ -376,6 +444,7 @@ async function runAssistantTurn(
     role: "assistant",
     content: `Reached the ${MAX_TOOL_STEPS}-step tool limit for this turn.`,
   });
+  return { userMessage: "", failures, finalAnswer: "", stepLimitHit: true };
 }
 
 /** Configured fallback chain, trimmed and de-duped against the active model. */
@@ -491,6 +560,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/models", desc: "List installed models (sizes shown, current marked ●)" },
   { name: "/model", args: "<name|#>", desc: "Switch the active model for this session" },
   { name: "/memory", aliases: ["/knowledge"], desc: "Show the long-term knowledge vault (notes & path)" },
+  { name: "/lessons", aliases: ["/evolution"], desc: "Show lessons the agent learned from past mistakes" },
   { name: "/reset", desc: "Clear the conversation history" },
   { name: "/exit", aliases: ["/quit"], desc: "Quit Qwenodyssey" },
 ];
@@ -601,6 +671,19 @@ function renderMemory(kb: KnowledgeBase, s: Session, memoryEnabled: boolean): st
   return [...head, ...body, hrule() + "\n"].join("\n");
 }
 
+/** Render the evolution lessons the agent has learned from past mistakes. */
+function renderLessons(evolution: EvolutionEngine | null): string {
+  if (!evolution) {
+    return hrule() + "\n  " + chalk.gray("Evolution is off (needs knowledge + evolution enabled).") + "\n" + hrule() + "\n";
+  }
+  const lessons = evolution.lessons();
+  const head = [hrule(), chalk.bold(`  Lessons learned  (${lessons.length})`), ""];
+  const body = lessons.length
+    ? lessons.slice(0, 40).map((n) => "  " + chalk.magenta("✦ ") + n.title.replace(/^Lesson:\s*/i, "") + "\n    " + chalk.gray(n.body.replace(/\s+/g, " ").slice(0, 160)))
+    : ["  " + chalk.gray("(none yet — the agent banks a lesson when a turn goes wrong)")];
+  return [...head, ...body, "", chalk.gray("  These are auto-recalled in future turns so mistakes aren't repeated."), hrule() + "\n"].join("\n");
+}
+
 /**
  * Split a reply into its chain-of-thought and final answer. Reasoning models
  * (DeepSeek-R1, QwQ) wrap deliberation in <think>…</think>. We surface that
@@ -657,7 +740,7 @@ async function executeToolCall(
   tools: ToolRegistry,
   call: ToolCall,
   ask: () => Promise<string>
-): Promise<string> {
+): Promise<{ content: string; ok: boolean }> {
   const args = call.arguments ?? {};
 
   // Show what the model is doing.
@@ -671,7 +754,7 @@ async function executeToolCall(
       const reply = (await ask()).trim().toLowerCase();
       if (!/^(y|yes)$/.test(reply)) {
         console.log(chalk.gray("  (declined)\n"));
-        return "Declined by user.";
+        return { content: "Declined by user.", ok: false };
       }
     }
   } else {
@@ -687,7 +770,10 @@ async function executeToolCall(
   if (shown.trim()) {
     console.log(chalk.gray(indent(shown)) + "\n");
   }
-  return out.slice(0, 8000) || (result.ok ? "(ok, no output)" : "(failed, no output)");
+  return {
+    content: out.slice(0, 8000) || (result.ok ? "(ok, no output)" : "(failed, no output)"),
+    ok: result.ok,
+  };
 }
 
 function indent(text: string): string {

@@ -71,6 +71,14 @@ const KnowledgeConfig = z.object({
   embed_model: z.string().default("nomic-embed-text"),
 });
 
+/** Self-improvement: reflect on mistakes and save lessons to the knowledge vault. */
+const EvolutionConfig = z.object({
+  enabled: z.boolean().default(true),
+  // Only reflect when a turn had failures / hit the step limit (cheap). If false,
+  // it could reflect on every turn (more thorough, more tokens).
+  reflect_on_failure: z.boolean().default(true),
+});
+
 /** Internet search + page fetch. */
 const WebConfig = z.object({
   enabled: z.boolean().default(true),
@@ -88,6 +96,7 @@ export const ConfigSchema = z.object({
   memory: MemoryConfig.default({}),
   knowledge: KnowledgeConfig.default({}),
   web: WebConfig.default({}),
+  evolution: EvolutionConfig.default({}),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
