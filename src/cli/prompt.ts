@@ -174,3 +174,74 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
     },
   };
 }
+
+export interface SelectItem {
+  label: string;
+  hint?: string;
+  current?: boolean;
+}
+
+/**
+ * Interactive arrow-key list picker (Claude-Code style): ↑/↓ to move, Enter to
+ * choose, Esc/Ctrl-C to cancel. Redraws in place. Returns the chosen index, or
+ * -1 if cancelled / not a TTY. Runs only between prompt turns, so it has stdin
+ * to itself (no clash with the main input reader).
+ */
+export function selectFromList(title: string, items: SelectItem[], initialIndex = 0): Promise<number> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY || items.length === 0) return Promise.resolve(-1);
+  readline.emitKeypressEvents(stdin);
+
+  return new Promise<number>((resolve) => {
+    let sel = Math.max(0, Math.min(initialIndex, items.length - 1));
+    let drawn = 0;
+
+    stdin.setRawMode(true);
+    stdin.resume();
+
+    const render = () => {
+      const lines: string[] = [chalk.bold(title)];
+      items.forEach((it, i) => {
+        const dot = it.current ? chalk.green("●") : chalk.gray("○");
+        const text = it.label + (it.hint ? chalk.gray("  " + it.hint) : "");
+        lines.push(
+          i === sel ? `${chalk.cyan("❯")} ${dot} ${chalk.bold(text)}` : `  ${dot} ${text}`
+        );
+      });
+      lines.push(chalk.gray("  ↑/↓ move · Enter switch · Esc cancel"));
+      const up = drawn > 0 ? `\x1b[${drawn - 1}A` : "";
+      process.stdout.write(up + "\r\x1b[0J" + lines.join("\n"));
+      drawn = lines.length;
+    };
+
+    const cleanup = () => {
+      stdin.setRawMode(false);
+      stdin.removeListener("keypress", onKey);
+      stdin.pause();
+      process.stdout.write("\n");
+    };
+
+    const onKey = (_str: string | undefined, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === "up" || (key.ctrl && key.name === "p")) {
+        sel = (sel - 1 + items.length) % items.length;
+        return render();
+      }
+      if (key.name === "down" || (key.ctrl && key.name === "n")) {
+        sel = (sel + 1) % items.length;
+        return render();
+      }
+      if (key.name === "return" || key.name === "enter") {
+        cleanup();
+        return resolve(sel);
+      }
+      if (key.name === "escape" || (key.ctrl && key.name === "c") || key.name === "q") {
+        cleanup();
+        return resolve(-1);
+      }
+    };
+
+    stdin.on("keypress", onKey);
+    render();
+  });
+}

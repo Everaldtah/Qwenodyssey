@@ -8,7 +8,7 @@ import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
 import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS } from "../chatTools";
-import { createPrompt, SlashCommand } from "../prompt";
+import { createPrompt, selectFromList, SlashCommand, SelectItem } from "../prompt";
 import { KnowledgeBase } from "../../core/knowledge";
 import { EvolutionEngine, TurnSignals } from "../../core/evolution";
 import { createKnowledgeTools } from "../../tools/knowledgeTools";
@@ -280,7 +280,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
       console.log(renderLessons(evolution));
       continue;
     }
-    if (line === "/models" || line.startsWith("/model ") || line.startsWith("/models ")) {
+    if (line === "/model" || line === "/models" || line.startsWith("/model ") || line.startsWith("/models ")) {
       lastModels = await handleModels(s, line, lastModels);
       continue;
     }
@@ -557,8 +557,8 @@ class TokenMeter {
 const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/help", aliases: ["/commands", "/?"], desc: "Show this list of commands" },
   { name: "/settings", aliases: ["/config"], desc: "Show the current model & runtime settings" },
-  { name: "/models", desc: "List installed models (sizes shown, current marked ●)" },
-  { name: "/model", args: "<name|#>", desc: "Switch the active model for this session" },
+  { name: "/models", desc: "Pick a model with ↑/↓ + Enter (or list when piped)" },
+  { name: "/model", args: "[name|#]", desc: "Open the model picker, or switch directly to name/number" },
   { name: "/memory", aliases: ["/knowledge"], desc: "Show the long-term knowledge vault (notes & path)" },
   { name: "/lessons", aliases: ["/evolution"], desc: "Show lessons the agent learned from past mistakes" },
   { name: "/reset", desc: "Clear the conversation history" },
@@ -809,12 +809,35 @@ async function handleModels(
     return cached;
   }
 
-  // No argument → just print the list.
+  // No argument → interactive picker (TTY) or a plain numbered list (piped).
   if (!arg) {
     if (!models.length) {
       console.log(chalk.gray("(no models installed — pull one with `ollama pull <name>`)\n"));
       return models;
     }
+    if (process.stdin.isTTY) {
+      const currentIdx = models.findIndex((m) => m.name === s.provider.model);
+      const items: SelectItem[] = models.map((m) => ({
+        label: m.name,
+        hint: m.size,
+        current: m.name === s.provider.model,
+      }));
+      const picked = await selectFromList(
+        `Select a model  (${s.provider.name}, current ● = ${s.provider.model})`,
+        items,
+        currentIdx >= 0 ? currentIdx : 0
+      );
+      if (picked < 0) {
+        console.log(chalk.gray("(model unchanged)\n"));
+      } else if (models[picked].name === s.provider.model) {
+        console.log(chalk.gray(`(already on ${models[picked].name})\n`));
+      } else {
+        s.provider.setModel(models[picked].name);
+        console.log(chalk.green(`✓ switched to ${models[picked].name}`) + chalk.gray(` (${s.provider.name})\n`));
+      }
+      return models;
+    }
+    // Non-TTY fallback: numbered list.
     console.log(chalk.bold(`Installed models (${s.provider.name}):`));
     models.forEach((m, i) => {
       const current = m.name === s.provider.model;
