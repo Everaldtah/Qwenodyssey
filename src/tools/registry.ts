@@ -11,6 +11,7 @@ import {
   treeTool,
 } from "./fileTools";
 import { runShellTool } from "./shellTools";
+import { shellHelpTool } from "./shellEncyclopedia";
 import { gitStatusTool, gitDiffTool } from "./gitTools";
 import { grepTool, searchDocsTool } from "./searchTools";
 
@@ -30,6 +31,7 @@ export class ToolRegistry {
       listFilesTool,
       treeTool,
       runShellTool,
+      shellHelpTool,
       gitStatusTool,
       gitDiffTool,
       grepTool,

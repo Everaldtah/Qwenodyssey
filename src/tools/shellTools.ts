@@ -40,13 +40,21 @@ export function classifyCommand(cmd: string): "blocked" | "destructive" | "safe"
 }
 
 async function execute(cmd: string, ctx: ToolContext): Promise<ToolResult> {
-  const result = await execa(cmd, {
-    cwd: ctx.cwd,
-    shell: true,
-    timeout: 120_000,
-    reject: false,
-    all: true,
-  });
+  const common = { cwd: ctx.cwd, timeout: 120_000, reject: false, all: true } as const;
+  // On Windows, run through PowerShell (not cmd.exe) so real cmdlets like
+  // Get-WinEvent / Get-Process / Get-Service work. We pass the command as a
+  // single -Command argument (execa escapes it) rather than -EncodedCommand:
+  // base64-encoded commands are flagged/stalled by some antivirus products.
+  // `-InputFormat None` + ignoring stdin stops PowerShell hanging when launched
+  // without a console.
+  const result =
+    process.platform === "win32"
+      ? await execa(
+          "powershell.exe",
+          ["-NoProfile", "-NonInteractive", "-InputFormat", "None", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+          { ...common, stdin: "ignore", windowsVerbatimArguments: false }
+        )
+      : await execa(cmd, { ...common, shell: true });
   const out = (result.all ?? result.stdout ?? "").toString();
   ctx.log({
     tool: "run_shell",

@@ -24,6 +24,18 @@ export const CHAT_TOOL_SPECS: ToolSpec[] = [
     },
   },
   {
+    name: "shell_help",
+    description:
+      "Look up the EXACT verified Windows PowerShell command for a task BEFORE running it when " +
+      "you're unsure (login/event logs, processes, services, network, users, disk, files, hardware, " +
+      "performance, firewall, scheduled tasks, installed software). Returns ready-to-run commands; " +
+      "then call run_shell with one. Saves you from guessing cmdlet names/flags.",
+    parameters: {
+      type: "object",
+      properties: { query: str('Task or topic, e.g. "login logs last week", "top memory processes", "wifi".') },
+    },
+  },
+  {
     name: "read_file",
     description:
       "Read a file's contents. The path may be relative to the project dir OR an absolute path " +
