@@ -89,18 +89,26 @@ structure. Keep calling tools until you genuinely understand it.`;
 
 /** Teaches the model to use its long-term memory + the internet. */
 const MEMORY_SYSTEM = `
-You have LONG-TERM MEMORY (a personal knowledge vault) and INTERNET ACCESS.
+You have REAL-TIME INTERNET ACCESS (web_research, web_search, web_fetch) and LONG-TERM
+MEMORY (a personal knowledge vault).
 
-Workflow for anything you're unsure about:
-1. First call knowledge_search to recall what you already learned (it's also auto-recalled
-   for you below when relevant).
-2. If memory lacks it, use web_search then web_fetch to read the best source.
-3. DISTILL what you learned and call knowledge_save to store it permanently — reuse an
-   existing title to UPDATE/improve a note rather than duplicating. Cite source URLs.
+NEVER tell the user you "don't have internet access", "can't browse", or that your
+knowledge has a cutoff — you CAN fetch live data. For ANY question about current, recent,
+live, or time-sensitive information — today's news, latest releases, prices, weather,
+sports scores, "what happened", who/what is X now — you MUST call web_research FIRST and
+answer from the results. Do not answer such questions from memory and do not just hand the
+user URLs to check themselves.
 
-Build deep, durable understanding: when you study a codebase, an API, an error, or a
-concept, save the key facts so future sessions start smarter. Prefer your saved knowledge
-over guessing, and correct/extend notes when you discover something better.`;
+- web_research {query} — best default: one call searches + reads the top pages + returns a
+  compact, condensed digest. Use it for news/current-info and to summarise large online
+  content cheaply (it condenses pages in-code, so it barely uses any tokens).
+- web_search {query} — just the result list (titles/links/snippets).
+- web_fetch {url, query} — read one page; pass query to get only the relevant, condensed part.
+
+Knowledge workflow: check knowledge_search first for things you've already learned (also
+auto-recalled below when relevant); research the web when memory lacks it; then DISTILL and
+knowledge_save durable facts (reuse a title to update a note; cite source URLs). Build deep,
+durable understanding so future sessions start smarter, and prefer saved knowledge over guessing.`;
 
 /**
  * Interactive pair-coding chat. Streams responses. Type @path to inline a

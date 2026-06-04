@@ -127,11 +127,32 @@ export const WEB_TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: "web_fetch",
-    description: "Fetch a URL and return its readable text (HTML stripped). Use to read a search result or a known docs page.",
+    description:
+      "Fetch a URL and return its readable text (HTML stripped). Pass `query` to get only the most " +
+      "relevant sentences (condensed, token-cheap) instead of the whole page.",
     parameters: {
       type: "object",
-      properties: { url: str("The http(s) URL to fetch.") },
+      properties: {
+        url: str("The http(s) URL to fetch."),
+        query: str("Optional: condense the page to sentences relevant to this, to save tokens."),
+      },
       required: ["url"],
+    },
+  },
+  {
+    name: "web_research",
+    description:
+      "Answer a question from the LIVE web in one call: searches, reads the top results, and returns a " +
+      "compact query-focused digest (key sentences + sources) instead of raw pages. Use for anything " +
+      "current/online — today's news, latest releases, prices, recent facts. Summarises large pages " +
+      "cheaply so it won't overflow the context.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: str("What to research, e.g. \"today's top news headlines\"."),
+        pages: { type: "integer", description: "How many top results to read & condense (default 3, max 5)." },
+      },
+      required: ["query"],
     },
   },
 ];
