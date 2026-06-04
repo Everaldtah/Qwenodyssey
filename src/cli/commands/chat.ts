@@ -6,7 +6,7 @@ import { scanRepo, summarizeRepo } from "../../core/repoScanner";
 import { resolveInside } from "../../tools/fileTools";
 import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
-import { banner, hrule, Spinner, thinkingWord } from "../render";
+import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
 import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS } from "../chatTools";
 import { createPrompt, SlashCommand } from "../prompt";
 import { KnowledgeBase } from "../../core/knowledge";
@@ -164,6 +164,8 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
 
   // Cached result of the last /models listing, so /model <#> can resolve indexes.
   let lastModels: ModelInfo[] = [];
+  // Tracks real token usage and self-calibrates the live "↑ tokens" estimate.
+  const meter = new TokenMeter();
 
   for (;;) {
     const line = (await ask()).trim();
@@ -202,7 +204,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     history.push({ role: "user", content: expanded });
 
     try {
-      await runAssistantTurn(s, chatTools, toolSpecs, history, ask);
+      await runAssistantTurn(s, chatTools, toolSpecs, history, meter, ask);
     } catch (err) {
       console.log(chalk.red(`\n[error: ${(err as Error).message}]`));
     }
@@ -248,14 +250,17 @@ async function runAssistantTurn(
   tools: ToolRegistry,
   toolSpecs: ToolSpec[],
   history: Message[],
+  meter: TokenMeter,
   ask: () => Promise<string>
 ): Promise<void> {
   let nudged = false;
   const reasoning = isReasoningModel(s.provider.model);
 
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
-    // Live status: elapsed time + estimated input tokens sent up this request.
-    const spinner = new Spinner(thinkingWord(), estimateUploadTokens(s, history, toolSpecs));
+    // Live status: elapsed time + estimated input tokens sent up this request,
+    // calibrated against the model's real usage from prior turns.
+    const chars = promptChars(history, toolSpecs);
+    const spinner = new Spinner(thinkingWord(), meter.estimate(chars));
     spinner.begin();
     let res: GenerateResult;
     try {
@@ -266,6 +271,7 @@ async function runAssistantTurn(
     } finally {
       spinner.stop();
     }
+    meter.record(chars, res); // exact counts from the model recalibrate the estimate
     const calls = res.toolCalls ?? [];
 
     // Happy path: the model made real tool calls.
@@ -290,6 +296,14 @@ async function runAssistantTurn(
         console.log(chalk.gray(indent(thinking)) + "\n");
       }
       console.log(chalk.green("qwen › ") + (answer || "(no response)") + "\n");
+      // Exact token usage for this turn, straight from the model.
+      if (res.promptTokens || res.completionTokens) {
+        console.log(
+          chalk.gray(
+            `  ↑ ${formatTokens(res.promptTokens ?? 0)} in · ↓ ${formatTokens(res.completionTokens ?? 0)} out tokens\n`
+          )
+        );
+      }
       // Don't feed the verbose <think> back into context (saves tokens, and
       // reasoning models are trained to see only prior answers).
       history.push({ role: "assistant", content: answer || res.text });
@@ -330,35 +344,47 @@ async function runAssistantTurn(
   });
 }
 
+/** Configured fallback chain, trimmed and de-duped against the active model. */
+function fallbackChain(s: Session): string[] {
+  const seen = new Set<string>();
+  return (s.config.model.fallback_models ?? [])
+    .map((m) => m.trim())
+    .filter((m) => m && m.toLowerCase() !== s.provider.model.toLowerCase() && !seen.has(m) && seen.add(m));
+}
+
 /**
- * At launch, make sure the configured model is actually installed. If it isn't
- * but `fallback_model` is, switch to the fallback so the session still works
- * (e.g. primary still downloading). Best-effort: stays on the configured model
- * if we can't list models or neither is found.
+ * At launch, make sure the configured model is actually installed. If it isn't,
+ * switch to the first installed model in the fallback chain so the session still
+ * works (e.g. primary still downloading). Best-effort: stays on the configured
+ * model if we can't list models, and warns if nothing in the chain is installed.
  */
 async function resolveStartupModel(s: Session): Promise<void> {
-  const fallback = s.config.model.fallback_model?.trim();
-  if (!fallback || fallback === s.provider.model || !s.provider.listModels || !s.provider.setModel) {
-    return;
-  }
+  const chain = fallbackChain(s);
+  if (!chain.length || !s.provider.listModels || !s.provider.setModel) return;
+
   let installed: ModelInfo[];
   try {
     installed = await s.provider.listModels();
   } catch {
     return; // can't tell — leave the configured model in place
   }
-  const has = (name: string) => installed.some((m) => m.name === name || m.name.startsWith(name));
+  // Ollama may normalize namespaced/cased tags, so match case-insensitively.
+  const has = (name: string) => {
+    const n = name.toLowerCase();
+    return installed.some((m) => m.name.toLowerCase() === n || m.name.toLowerCase().startsWith(n));
+  };
   if (has(s.provider.model)) return; // primary is available, nothing to do
 
-  if (has(fallback)) {
-    s.provider.setModel(fallback);
+  const pick = chain.find(has);
+  if (pick) {
+    s.provider.setModel(pick);
     console.log(
-      chalk.yellow(`⚠ model "${s.config.model.model}" not installed — using fallback "${fallback}".`)
+      chalk.yellow(`⚠ model "${s.config.model.model}" not installed — using fallback "${pick}".`)
     );
   } else {
     console.log(
       chalk.yellow(
-        `⚠ neither "${s.config.model.model}" nor fallback "${fallback}" is installed. ` +
+        `⚠ "${s.config.model.model}" and all fallbacks (${chain.join(", ")}) are uninstalled. ` +
           `Pull one with \`ollama pull <name>\` or pick one with /models.`
       )
     );
@@ -373,9 +399,9 @@ function looksUnavailable(err: Error): boolean {
 }
 
 /**
- * Generate, falling back to `fallback_model` once if the request fails because
- * the active model is unavailable. The switch is sticky for the rest of the
- * session (so we don't keep hitting the same error).
+ * Generate, walking the fallback chain if the request fails because the active
+ * model is unavailable. Each switch is sticky for the rest of the session (so we
+ * don't keep retrying a model that's missing).
  */
 async function generateWithFallback(
   s: Session,
@@ -385,35 +411,62 @@ async function generateWithFallback(
   try {
     return await s.provider.generate(history, options);
   } catch (err) {
-    const fallback = s.config.model.fallback_model?.trim();
-    if (
-      !fallback ||
-      fallback === s.provider.model ||
-      !s.provider.setModel ||
-      !looksUnavailable(err as Error)
-    ) {
-      throw err;
+    if (!s.provider.setModel || !looksUnavailable(err as Error)) throw err;
+    for (const fb of fallbackChain(s)) {
+      console.log(chalk.yellow(`\n⚠ "${s.provider.model}" unavailable — falling back to "${fb}".`));
+      s.provider.setModel(fb);
+      try {
+        return await s.provider.generate(history, options);
+      } catch (e2) {
+        if (!looksUnavailable(e2 as Error)) throw e2; // a real error, not just a missing model
+      }
     }
-    console.log(
-      chalk.yellow(`\n⚠ "${s.provider.model}" unavailable — falling back to "${fallback}".`)
-    );
-    s.provider.setModel(fallback);
-    return s.provider.generate(history, options);
+    throw err; // nothing in the chain worked
   }
 }
 
 /**
- * Estimate the input ("↑") tokens for the next request: the whole conversation
- * plus the advertised tool schemas, scored with the provider's tokenizer
- * heuristic. Shown live in the spinner so the user can see context size grow.
+ * Total characters we're about to send up: the whole conversation plus the
+ * advertised tool schemas. Used as the raw input for token estimation.
  */
-function estimateUploadTokens(s: Session, history: Message[], toolSpecs: ToolSpec[]): number {
-  let tokens = 0;
-  for (const m of history) tokens += s.provider.countTokens(m.content || "");
+function promptChars(history: Message[], toolSpecs: ToolSpec[]): number {
+  let chars = 0;
+  for (const m of history) chars += (m.content || "").length;
   for (const t of toolSpecs) {
-    tokens += s.provider.countTokens(t.name + (t.description || "") + JSON.stringify(t.parameters || {}));
+    chars += t.name.length + (t.description || "").length + JSON.stringify(t.parameters || {}).length;
   }
-  return tokens;
+  return chars;
+}
+
+/**
+ * Tracks token usage and keeps the live "↑ tokens" estimate honest.
+ *
+ * Before a request we can only estimate (the backend hasn't tokenized yet), but
+ * after each response the model reports EXACT `usage` counts. We use those to
+ * (a) calibrate chars-per-token to the model's real tokenizer — which absorbs
+ * the chat-template/role overhead a flat len/4 heuristic ignores — so later
+ * estimates converge on reality, and (b) report the exact ↑/↓ counts per turn.
+ */
+class TokenMeter {
+  // Start near a realistic mix of prose + code; recalibrated from real usage.
+  private charsPerToken = 3.6;
+  lastPrompt = 0;
+  lastCompletion = 0;
+  calibrated = false;
+
+  estimate(chars: number): number {
+    return Math.max(1, Math.round(chars / this.charsPerToken));
+  }
+
+  /** Feed exact usage + the chars we actually sent to refine the ratio. */
+  record(promptCharsSent: number, res: GenerateResult): void {
+    if (res.promptTokens && res.promptTokens > 0 && promptCharsSent > 0) {
+      this.charsPerToken = promptCharsSent / res.promptTokens;
+      this.calibrated = true;
+      this.lastPrompt = res.promptTokens;
+    }
+    if (typeof res.completionTokens === "number") this.lastCompletion = res.completionTokens;
+  }
 }
 
 /**
@@ -463,10 +516,15 @@ function renderSettings(s: Session, kb: KnowledgeBase, memoryEnabled: boolean): 
       : kb.embeddingsActive() === false
       ? "keyword (embed model not pulled)"
       : `semantic if available (${s.config.knowledge.embed_model})`;
-  const fb = m.fallback_model?.trim();
+  const fbList = (m.fallback_models ?? []).map((x) => x.trim()).filter(Boolean);
+  const fbDisplay = fbList.length
+    ? fbList
+        .map((f) => (f.toLowerCase() === s.provider.model.toLowerCase() ? `${f} (active)` : f))
+        .join(" → ")
+    : "—";
   const rows: [string, string][] = [
     ["model", `${s.provider.model}  (${s.provider.name} @ ${m.base_url})`],
-    ["fallback model", fb ? (fb === s.provider.model ? `${fb}  (active)` : fb) : "—"],
+    ["fallback chain", fbDisplay],
     ["thinking", reasoning ? "deep · native reasoning model" : "step-by-step scaffold"],
     ["temperature", `${reasoning ? REASONING_TEMP : TOOL_TEMP} active · ${m.temperature} base`],
     ["max output tokens", String(m.max_tokens)],

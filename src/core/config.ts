@@ -13,9 +13,12 @@ const ModelConfig = z.object({
     .enum(["ollama", "lmstudio", "openai", "vllm", "llamacpp"])
     .default("ollama"),
   model: z.string().default("qwen2.5:7b"),
-  // Used automatically if `model` isn't installed at launch, or if a request
-  // fails because the model is unavailable. Empty disables fallback.
-  fallback_model: z.string().default("deepseek-r1:7b"),
+  // Ordered fallback chain: tried in turn if `model` isn't installed at launch,
+  // or when a request fails because the active model is unavailable. The first
+  // installed/working one wins. Empty list disables fallback.
+  fallback_models: z
+    .array(z.string())
+    .default(["deepseek-r1:7b", "igorls/gemma-4-12B-it-heretic-GGUF"]),
   base_url: z.string().default("http://localhost:11434"),
   api_key: z.string().default(""),
   temperature: z.number().default(0.2),
