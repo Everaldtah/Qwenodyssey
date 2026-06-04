@@ -524,6 +524,7 @@ function renderSettings(s: Session, kb: KnowledgeBase, memoryEnabled: boolean): 
     ["temperature", `${reasoning ? REASONING_TEMP : TOOL_TEMP} active · ${m.temperature} base`],
     ["max output tokens", String(m.max_tokens)],
     ["context budget", String(m.context_tokens)],
+    ["gpu", gpuPolicy(s)],
     ["agent mode", s.mode],
     ["shell tools", s.config.tools.allow_shell ? "enabled" : "disabled"],
     ["confirm destructive", s.config.tools.confirm_destructive ? "on (asks before risky cmds)" : "off"],
@@ -544,6 +545,16 @@ function renderSettings(s: Session, kb: KnowledgeBase, memoryEnabled: boolean): 
       chalk.gray(" (qwenodyssey config set …)"),
     hrule() + "\n",
   ].join("\n");
+}
+
+/** Human-readable summary of the GPU offload policy (Ollama num_gpu). */
+function gpuPolicy(s: Session): string {
+  if (s.provider.name !== "ollama") return "managed by " + s.provider.name;
+  const n = s.config.model.gpu_layers;
+  const lv = s.config.model.low_vram ? " · low-vram" : "";
+  if (n < 0) return "auto · max layers on GPU, overflow → CPU/RAM" + lv;
+  if (n === 0) return "CPU only" + lv;
+  return `${n} layers forced on GPU` + lv;
 }
 
 /** Render the knowledge vault contents and status. */

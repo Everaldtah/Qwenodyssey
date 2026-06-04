@@ -20,6 +20,9 @@ export interface ProviderConfig {
   topP: number;
   maxTokens: number;
   contextTokens?: number;
+  gpuLayers?: number;
+  lowVram?: boolean;
+  keepAlive?: string;
 }
 
 export abstract class OpenAICompatibleProvider implements Provider {

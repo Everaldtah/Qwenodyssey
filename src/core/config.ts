@@ -23,6 +23,15 @@ const ModelConfig = z.object({
   api_key: z.string().default(""),
   temperature: z.number().default(0.2),
   top_p: z.number().default(0.9),
+  // GPU acceleration (Ollama). -1 = AUTO: load as many layers onto the GPU as
+  // fit in VRAM and run the overflow on CPU/RAM — i.e. automatic offload when
+  // the model + context/KV cache is too large for VRAM. Set a positive number
+  // to force a layer count; 0 = CPU only.
+  gpu_layers: z.number().default(-1),
+  // Shrink GPU working buffers so bigger models/contexts still fit (Ollama low_vram).
+  low_vram: z.boolean().default(false),
+  // How long Ollama keeps the model resident in VRAM between turns.
+  keep_alive: z.string().default("30m"),
   // Generous output budget so deep reasoning / long <think> chains aren't cut off.
   max_tokens: z.number().default(8192),
   // Ollama context window (num_ctx). 16384 holds far more code/docs than the

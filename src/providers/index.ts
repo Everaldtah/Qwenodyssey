@@ -26,6 +26,9 @@ export function createProvider(config: Config): Provider {
     topP: m.top_p,
     maxTokens: m.max_tokens,
     contextTokens: m.context_tokens,
+    gpuLayers: m.gpu_layers,
+    lowVram: m.low_vram,
+    keepAlive: m.keep_alive,
   };
   switch (m.provider) {
     case "ollama":

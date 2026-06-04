@@ -17,17 +17,27 @@ export class OllamaProvider extends OpenAICompatibleProvider {
    * can use the model's real context window (config: model.context_tokens).
    */
   async generate(messages: Message[], options: ModelOptions = {}): Promise<GenerateResult> {
+    const opts: Record<string, unknown> = {
+      temperature: options.temperature ?? this.cfg.temperature,
+      top_p: options.top_p ?? this.cfg.topP,
+      num_predict: options.max_tokens ?? this.cfg.maxTokens,
+      num_ctx: this.cfg.contextTokens ?? 8192,
+      ...(options.stop ? { stop: options.stop } : {}),
+    };
+    // GPU acceleration: only pin num_gpu when the user forces a layer count.
+    // Left unset (gpu_layers = -1), Ollama auto-loads as many layers as fit in
+    // VRAM and runs the rest on CPU/RAM — automatic offload for large contexts.
+    if (typeof this.cfg.gpuLayers === "number" && this.cfg.gpuLayers >= 0) {
+      opts.num_gpu = this.cfg.gpuLayers;
+    }
+    if (this.cfg.lowVram) opts.low_vram = true;
+
     const body: Record<string, unknown> = {
       model: this.cfg.model,
       messages: nativeMessages(messages),
       stream: false,
-      options: {
-        temperature: options.temperature ?? this.cfg.temperature,
-        top_p: options.top_p ?? this.cfg.topP,
-        num_predict: options.max_tokens ?? this.cfg.maxTokens,
-        num_ctx: this.cfg.contextTokens ?? 8192,
-        ...(options.stop ? { stop: options.stop } : {}),
-      },
+      options: opts,
+      ...(this.cfg.keepAlive ? { keep_alive: this.cfg.keepAlive } : {}),
     };
     if (options.json) body.format = "json";
     if (options.tools?.length) {
