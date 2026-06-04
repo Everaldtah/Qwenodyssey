@@ -6,13 +6,13 @@ import { scanRepo, summarizeRepo } from "../../core/repoScanner";
 import { resolveInside } from "../../tools/fileTools";
 import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
-import { banner, hrule } from "../render";
+import { banner, hrule, Spinner, thinkingWord } from "../render";
 import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS } from "../chatTools";
 import { createPrompt, SlashCommand } from "../prompt";
 import { KnowledgeBase } from "../../core/knowledge";
 import { createKnowledgeTools } from "../../tools/knowledgeTools";
 import { createWebTools } from "../../tools/webTools";
-import type { Message, ModelInfo, ToolCall, ToolContext, ToolSpec } from "../../types";
+import type { GenerateResult, Message, ModelInfo, ToolCall, ToolContext, ToolSpec } from "../../types";
 import type { Session } from "../session";
 
 /** Hard cap on tool calls per user turn, to stop runaway loops. */
@@ -251,10 +251,18 @@ async function runAssistantTurn(
   const reasoning = isReasoningModel(s.provider.model);
 
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
-    const res = await s.provider.generate(history, {
-      temperature: reasoning ? REASONING_TEMP : TOOL_TEMP,
-      tools: toolSpecs,
-    });
+    // Live status: elapsed time + estimated input tokens sent up this request.
+    const spinner = new Spinner(thinkingWord(), estimateUploadTokens(s, history, toolSpecs));
+    spinner.begin();
+    let res: GenerateResult;
+    try {
+      res = await s.provider.generate(history, {
+        temperature: reasoning ? REASONING_TEMP : TOOL_TEMP,
+        tools: toolSpecs,
+      });
+    } finally {
+      spinner.stop();
+    }
     const calls = res.toolCalls ?? [];
 
     // Happy path: the model made real tool calls.
@@ -317,6 +325,20 @@ async function runAssistantTurn(
     role: "assistant",
     content: `Reached the ${MAX_TOOL_STEPS}-step tool limit for this turn.`,
   });
+}
+
+/**
+ * Estimate the input ("↑") tokens for the next request: the whole conversation
+ * plus the advertised tool schemas, scored with the provider's tokenizer
+ * heuristic. Shown live in the spinner so the user can see context size grow.
+ */
+function estimateUploadTokens(s: Session, history: Message[], toolSpecs: ToolSpec[]): number {
+  let tokens = 0;
+  for (const m of history) tokens += s.provider.countTokens(m.content || "");
+  for (const t of toolSpecs) {
+    tokens += s.provider.countTokens(t.name + (t.description || "") + JSON.stringify(t.parameters || {}));
+  }
+  return tokens;
 }
 
 /**

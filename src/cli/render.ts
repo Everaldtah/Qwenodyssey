@@ -39,6 +39,69 @@ export function hrule(): string {
   return chalk.gray("─".repeat(Math.max(width, 40)));
 }
 
+/** Whimsical gerunds shown while the model is working (one per request). */
+const THINKING_WORDS = [
+  "Herding", "Pondering", "Noodling", "Conjuring", "Percolating", "Ruminating",
+  "Synthesizing", "Cogitating", "Tinkering", "Brewing", "Scheming", "Musing",
+  "Crunching", "Divining", "Untangling", "Marinating", "Spelunking", "Wrangling",
+];
+
+export function thinkingWord(): string {
+  return THINKING_WORDS[Math.floor(Math.random() * THINKING_WORDS.length)];
+}
+
+/** "9601" → "9.6k", "512" → "512", "12000" → "12k". */
+export function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+}
+
+/** "85" → "1m 25s", "42" → "42s". */
+export function formatElapsed(seconds: number): string {
+  return seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds}s`;
+}
+
+/**
+ * A single-line live status shown while the model generates, e.g.
+ *   · Herding… (5m 25s · ↑ 9.6k tokens)
+ * The leading glyph pulses and the elapsed time ticks; the token count is the
+ * estimated input/context size sent up for this request. No-ops when stdout is
+ * not a TTY (piped output / tests), so it never pollutes captured streams.
+ */
+export class Spinner {
+  private timer?: ReturnType<typeof setInterval>;
+  private startedAt = 0;
+  private frame = 0;
+  private static FRAMES = ["·", "∘", "○", "◌", "○", "∘"];
+
+  constructor(private word: string, private upTokens: number) {}
+
+  begin(): void {
+    if (!process.stdout.isTTY) return;
+    this.startedAt = Date.now();
+    this.draw();
+    this.timer = setInterval(() => this.draw(), 140);
+    this.timer.unref?.();
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    if (process.stdout.isTTY) process.stdout.write("\r\x1b[2K");
+  }
+
+  private draw(): void {
+    const secs = Math.floor((Date.now() - this.startedAt) / 1000);
+    const glyph = Spinner.FRAMES[this.frame++ % Spinner.FRAMES.length];
+    const line =
+      chalk.magenta(glyph) +
+      " " +
+      chalk.magenta(this.word) +
+      chalk.gray(`… (${formatElapsed(secs)} · ↑ ${formatTokens(this.upTokens)} tokens)`);
+    process.stdout.write("\r\x1b[2K" + line);
+  }
+}
+
 export function colorizeDiff(diff: string): string {
   return diff
     .split("\n")
