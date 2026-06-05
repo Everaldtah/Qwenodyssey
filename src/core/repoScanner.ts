@@ -85,7 +85,10 @@ const DETECTORS: Detector[] = [
   },
   {
     language: "C#",
-    marker: (c) => fg.sync("**/*.csproj", { cwd: c, ignore: IGNORE, suppressErrors: true }).length > 0,
+    // Bounded: only look a couple of levels deep so this never walks a huge tree
+    // (e.g. when launched from a home directory).
+    marker: (c) =>
+      fg.sync("**/*.csproj", { cwd: c, ignore: IGNORE, suppressErrors: true, deep: 2, onlyFiles: true }).length > 0,
     pm: () => "dotnet",
     testCommand: "dotnet test",
     buildCommand: "dotnet build",
@@ -154,15 +157,32 @@ export async function scanRepo(cwd: string): Promise<RepoInfo> {
     }
   }
 
-  const allFiles = await fg("**/*", {
-    cwd,
-    ignore: IGNORE,
-    onlyFiles: true,
-    followSymbolicLinks: false,
-    // Skip directories we can't read (e.g. Windows' protected
-    // "Application Data" junction) instead of throwing EPERM.
-    suppressErrors: true,
-  });
+  const hasGit = await isRepo(cwd);
+
+  // Only deep-scan when a real project MARKER is present (package.json, Cargo.toml,
+  // …). A bare git repo with no markers — e.g. a home directory the user happens
+  // to have `git init`-ed — is NOT deep-scanned, since walking it can take 20s+.
+  // The walk is also depth-bounded and hard-capped so a huge repo can't stall.
+  const FILE_CAP = 4000;
+  const allFiles: string[] = [];
+  if (languages.length > 0) {
+    try {
+      const stream = fg.stream("**/*", {
+        cwd,
+        ignore: SCAN_IGNORE,
+        onlyFiles: true,
+        followSymbolicLinks: false,
+        deep: 6,
+        suppressErrors: true, // skip unreadable dirs (Windows junctions) vs throwing
+      });
+      for await (const f of stream) {
+        allFiles.push(f as string);
+        if (allFiles.length >= FILE_CAP) break;
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
 
   const entrypoints = allFiles.filter((f) =>
     /(^|\/)(index|main|app|cli|server)\.(ts|js|py|go|rs)$/i.test(f)
@@ -184,10 +204,28 @@ export async function scanRepo(cwd: string): Promise<RepoInfo> {
     entrypoints: entrypoints.slice(0, 10),
     keyFiles,
     fileCount: allFiles.length,
-    hasGit: await isRepo(cwd),
-    dirty: await isDirty(cwd),
+    hasGit,
+    // `git status` can be slow on a huge tree (e.g. a git-init'ed home dir), so
+    // only check dirtiness for an actual project.
+    dirty: languages.length > 0 && hasGit ? await isDirty(cwd) : false,
   };
 }
+
+/** Extra ignores for the project scan: heavy/system dirs found under home. */
+const SCAN_IGNORE = [
+  ...IGNORE,
+  "**/AppData/**",
+  "**/Application Data/**",
+  "**/Downloads/**",
+  "**/OneDrive/**",
+  "**/.cache/**",
+  "**/.lmstudio/**",
+  "**/.ollama/**",
+  "**/.cargo/**",
+  "**/.rustup/**",
+  "**/.nuget/**",
+  "**/Library/**",
+];
 
 /** A compact text summary of the repo for prompt context. */
 export function summarizeRepo(info: RepoInfo): string {

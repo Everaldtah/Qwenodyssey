@@ -168,24 +168,6 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     return;
   }
 
-  // Headless LM Studio: start its server and cache its models (for the picker
-  // and the fallback chain) — no need to open the app.
-  if (s.config.lmstudio.enabled && s.lms.installed()) {
-    try {
-      if (s.config.lmstudio.start_server) {
-        await s.lms.ensureServer(lmsPort(s.config.lmstudio.base_url));
-      }
-      s.lmsModelKeys = (await s.lms.list()).map((m) => m.key);
-    } catch {
-      /* LM Studio optional — ignore if unavailable */
-    }
-  }
-
-  // If the configured model isn't installed, fall back through the chain.
-  await resolveStartupModel(s);
-
-  const repo = await scanRepo(s.cwd);
-
   // Long-term knowledge vault (RAG memory). Created on first use.
   const kb = new KnowledgeBase(s.config.knowledge.path, {
     baseUrl: s.config.model.base_url,
@@ -203,11 +185,42 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
         })
       : null;
 
+  // Base system prompt now; the PROJECT summary is appended once the repo scan
+  // finishes in the background (so a slow scan doesn't delay the prompt).
   let sys = loadPrompt("system") + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK;
   if (memoryEnabled || s.config.web.enabled) sys += "\n" + MEMORY_SYSTEM;
   sys += "\n" + selfAwareness(s, kb, memoryEnabled, !!evolution);
-  sys += "\n\nPROJECT:\n" + summarizeRepo(repo);
   const history: Message[] = [{ role: "system", content: sys }];
+
+  // Heavy startup work runs in the BACKGROUND so the banner/prompt appear
+  // instantly; we await it (usually already finished) before the first turn.
+  const ready = (async () => {
+    const jobs: Promise<unknown>[] = [];
+    if (s.config.lmstudio.enabled && s.lms.installed()) {
+      jobs.push(
+        (async () => {
+          try {
+            if (s.config.lmstudio.start_server) {
+              await s.lms.ensureServer(lmsPort(s.config.lmstudio.base_url), "0.0.0.0", s.config.lmstudio.base_url);
+            }
+            s.lmsModelKeys = (await s.lms.list()).map((m) => m.key);
+          } catch {
+            /* LM Studio optional */
+          }
+        })()
+      );
+    }
+    jobs.push(
+      scanRepo(s.cwd)
+        .then((repo) => {
+          const summary = summarizeRepo(repo);
+          if (summary.trim()) history[0].content += "\n\nPROJECT:\n" + summary;
+        })
+        .catch(() => {})
+    );
+    await Promise.all(jobs);
+    await resolveStartupModel(s); // may switch model; needs the LM Studio list first
+  })();
 
   console.log(
     banner({
@@ -299,6 +312,10 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
       continue;
     }
 
+    // Make sure background startup (project scan, model resolution, LM Studio)
+    // has finished before the first real turn. Instant once it's done.
+    await ready;
+
     const expanded = expandFileRefs(line, s.cwd);
 
     // Auto-recall: pull relevant notes from long-term memory into context.
@@ -321,6 +338,9 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     }
   }
   prompt.close();
+  // Exit promptly even if a best-effort background job (LM Studio start / model
+  // list) is still pending — there's nothing left to wait for.
+  process.exit(0);
 }
 
 /** Retrieve top notes for the message and format them as a context block. */

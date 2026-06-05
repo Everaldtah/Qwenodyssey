@@ -93,8 +93,19 @@ export class LmStudioControl {
     }
   }
 
-  /** Start the local server headless (idempotent). */
-  async ensureServer(port = 1234, bind = "0.0.0.0"): Promise<boolean> {
+  /**
+   * Ensure the local server is up. Fast path: an HTTP probe (≈100ms) — if it
+   * already answers (200 or 401 "needs key"), skip the slow `lms server start`
+   * (which spawns the CLI and can take ~10s). Only starts it when truly down.
+   */
+  async ensureServer(port = 1234, bind = "0.0.0.0", baseUrl?: string): Promise<boolean> {
+    const root = (baseUrl || `http://localhost:${port}`).replace(/\/+$/, "").replace(/\/v1$/, "");
+    try {
+      const res = await fetch(`${root}/v1/models`, { signal: AbortSignal.timeout(1500) });
+      if (res.status === 200 || res.status === 401) return true; // already running
+    } catch {
+      /* not up — start it below */
+    }
     const r = await this.run(["server", "start", "--port", String(port), "--bind", bind], 30_000);
     return r.exitCode === 0;
   }
