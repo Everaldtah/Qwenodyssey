@@ -387,6 +387,7 @@ async function runAssistantTurn(
   ask: () => Promise<string>
 ): Promise<TurnSignals> {
   let nudged = false;
+  let emptyNudges = 0;
   const reasoning = isReasoningModel(s.provider.model);
   const failures: string[] = [];
   const runCall = async (call: ToolCall): Promise<void> => {
@@ -434,6 +435,23 @@ async function runAssistantTurn(
     const fencedCmds = extractShellCommands(answer);
 
     if (fencedCmds.length === 0) {
+      // Reasoning model planned but produced NO tool call and NO answer (it
+      // "thought" about acting then stopped). Nudge it to follow through rather
+      // than ending the turn empty. Bounded so it can't loop forever.
+      if (!answer.trim() && thinking && emptyNudges < 2) {
+        emptyNudges++;
+        console.log(chalk.magenta("qwen ⟂ thinking"));
+        console.log(chalk.gray(indent(thinking)) + "\n");
+        failures.push("reasoned without acting (no tool call or answer)");
+        history.push({
+          role: "user",
+          content:
+            "[system] You reasoned but didn't act. Now DO it in this reply: make the actual tool " +
+            "call (e.g. shell_help then run_shell), or give your final answer. Don't just describe it.",
+        });
+        continue;
+      }
+
       // Genuine final answer.
       if (thinking) {
         console.log(chalk.magenta("qwen ⟂ thinking"));
