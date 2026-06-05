@@ -316,15 +316,17 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     // has finished before the first real turn. Instant once it's done.
     await ready;
 
-    const expanded = expandFileRefs(line, s.cwd);
+    let userContent = expandFileRefs(line, s.cwd);
 
-    // Auto-recall: pull relevant notes from long-term memory into context.
+    // Auto-recall: prepend relevant long-term-memory notes to the USER message
+    // (not as a separate system message — multiple system messages break some
+    // model prompt templates, e.g. LM Studio's qwen3.5: "No user query found").
     if (memoryEnabled && s.config.knowledge.auto_recall) {
       const recalled = await recallKnowledge(kb, line, s.config.knowledge.recall_k);
-      if (recalled) history.push({ role: "system", content: recalled });
+      if (recalled) userContent = `${recalled}\n\n———\n\n${userContent}`;
     }
 
-    history.push({ role: "user", content: expanded });
+    history.push({ role: "user", content: userContent });
 
     try {
       const signals = await runAssistantTurn(s, chatTools, toolSpecs, history, meter, ask);

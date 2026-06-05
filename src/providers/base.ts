@@ -62,7 +62,7 @@ export abstract class OpenAICompatibleProvider implements Provider {
 
   /** Map our internal Message[] to OpenAI wire format (incl. tool fields). */
   protected wireMessages(messages: Message[]): Record<string, unknown>[] {
-    return messages.map((m) => {
+    return mergeSystem(messages).map((m) => {
       if (m.role === "tool") {
         return { role: "tool", content: m.content, tool_call_id: m.tool_call_id, name: m.name };
       }
@@ -184,6 +184,32 @@ export abstract class OpenAICompatibleProvider implements Provider {
       return { ok: false, detail: (err as Error).message };
     }
   }
+}
+
+/**
+ * Collapse multiple `system` messages into one (at the first system's position).
+ * Some model chat templates (e.g. LM Studio's qwen3.5) error with "No user query
+ * found" when given more than one system message.
+ */
+function mergeSystem(messages: Message[]): Message[] {
+  if (messages.filter((m) => m.role === "system").length <= 1) return messages;
+  const merged = messages
+    .filter((m) => m.role === "system")
+    .map((m) => m.content)
+    .join("\n\n");
+  const out: Message[] = [];
+  let placed = false;
+  for (const m of messages) {
+    if (m.role === "system") {
+      if (!placed) {
+        out.push({ role: "system", content: merged });
+        placed = true;
+      }
+    } else {
+      out.push(m);
+    }
+  }
+  return out;
 }
 
 /** Normalize OpenAI-style tool_calls into our ToolCall[]. */
