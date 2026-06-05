@@ -7,6 +7,7 @@ import { loadConfig, Config } from "../core/config";
 import { Logger } from "../core/logger";
 import { ToolRegistry } from "../tools/registry";
 import { createProvider } from "../providers";
+import { LmStudioControl } from "../providers/lmstudioControl";
 import { MemoryStore } from "../agents/memory";
 
 export interface GlobalOpts {
@@ -27,6 +28,10 @@ export interface Session {
   mode: AgentMode;
   /** Qwenodyssey's own source/install root (this package), for self-inspection/modification. */
   selfRoot: string;
+  /** Headless LM Studio control (lms CLI). */
+  lms: LmStudioControl;
+  /** Cached LM Studio model keys (populated at chat startup), for fallback. */
+  lmsModelKeys: string[];
 }
 
 /** This package's root: dist/cli/session.js → ../.. ; src/cli/session.ts → ../.. */
@@ -62,5 +67,7 @@ export function createSession(opts: GlobalOpts): Session {
     autoConfirm,
     mode: opts.mode || (config.agent.small_model_mode ? "safe" : "deep"),
     selfRoot: SELF_ROOT,
+    lms: new LmStudioControl(config.lmstudio.cli_path || undefined),
+    lmsModelKeys: [],
   };
 }

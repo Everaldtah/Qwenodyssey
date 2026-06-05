@@ -9,6 +9,7 @@ import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
 import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS } from "../chatTools";
 import { createPrompt, selectFromList, SlashCommand, SelectItem } from "../prompt";
+import { createProvider, createLmStudioProvider } from "../../providers";
 import { KnowledgeBase } from "../../core/knowledge";
 import { EvolutionEngine, TurnSignals } from "../../core/evolution";
 import { createKnowledgeTools } from "../../tools/knowledgeTools";
@@ -167,7 +168,20 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     return;
   }
 
-  // If the configured model isn't installed, fall back to fallback_model.
+  // Headless LM Studio: start its server and cache its models (for the picker
+  // and the fallback chain) — no need to open the app.
+  if (s.config.lmstudio.enabled && s.lms.installed()) {
+    try {
+      if (s.config.lmstudio.start_server) {
+        await s.lms.ensureServer(lmsPort(s.config.lmstudio.base_url));
+      }
+      s.lmsModelKeys = (await s.lms.list()).map((m) => m.key);
+    } catch {
+      /* LM Studio optional — ignore if unavailable */
+    }
+  }
+
+  // If the configured model isn't installed, fall back through the chain.
   await resolveStartupModel(s);
 
   const repo = await scanRepo(s.cwd);
@@ -451,64 +465,115 @@ async function runAssistantTurn(
   return { userMessage: "", failures, finalAnswer: "", stepLimitHit: true };
 }
 
-/** Configured fallback chain, trimmed and de-duped against the active model. */
-function fallbackChain(s: Session): string[] {
-  const seen = new Set<string>();
-  return (s.config.model.fallback_models ?? [])
-    .map((m) => m.trim())
-    .filter((m) => m && m.toLowerCase() !== s.provider.model.toLowerCase() && !seen.has(m) && seen.add(m));
+/** Port out of an http(s)://host:port base URL (default 1234). */
+function lmsPort(baseUrl: string): number {
+  const m = baseUrl.match(/:(\d+)/);
+  return m ? Number(m[1]) : 1234;
+}
+
+/** A fallback/picker entry is "lmstudio:<key>" for LM Studio, else an Ollama tag. */
+function parseModelRef(ref: string): { kind: "ollama" | "lmstudio"; model: string } {
+  return ref.startsWith("lmstudio:")
+    ? { kind: "lmstudio", model: ref.slice("lmstudio:".length) }
+    : { kind: "ollama", model: ref };
 }
 
 /**
- * At launch, make sure the configured model is actually installed. If it isn't,
- * switch to the first installed model in the fallback chain so the session still
- * works (e.g. primary still downloading). Best-effort: stays on the configured
- * model if we can't list models, and warns if nothing in the chain is installed.
+ * Switch the active backend+model. For LM Studio we safe-load the model first
+ * (capped context / partial GPU for big ones) so it won't crash the machine,
+ * then point the provider at the /v1 server. For Ollama we (re)build the Ollama
+ * provider on the target tag.
+ */
+async function applyModelRef(s: Session, ref: string): Promise<void> {
+  const { kind, model } = parseModelRef(ref);
+  if (kind === "lmstudio") {
+    if (s.config.lmstudio.safe_load) {
+      try {
+        const m = (await s.lms.list()).find((x) => x.key === model);
+        if (m) {
+          const r = await s.lms.safeLoad(m, {
+            bigParamsB: s.config.lmstudio.big_params_b,
+            bigSizeGB: s.config.lmstudio.big_size_gb,
+            bigContext: s.config.lmstudio.big_context,
+            ttlSeconds: s.config.lmstudio.ttl_seconds,
+          });
+          if (r.big) console.log(chalk.gray(`  (safe-loaded big model: capped context${m.sizeGB >= 18 ? " + partial GPU" : ""})`));
+        }
+      } catch {
+        /* loading is best-effort; the server may JIT-load on first request */
+      }
+    }
+    s.provider = createLmStudioProvider(s.config, model);
+  } else {
+    if (s.provider.name !== "ollama") s.provider = createProvider(s.config);
+    s.provider.setModel?.(model);
+  }
+}
+
+/**
+ * Ordered fallback chain (refs), de-duped against the active model: the
+ * configured Ollama fallbacks plus every installed LM Studio model (tool-capable
+ * first) when include_as_fallback is on.
+ */
+function fallbackChain(s: Session): string[] {
+  const seen = new Set<string>();
+  const refs = [...(s.config.model.fallback_models ?? []).map((m) => m.trim())];
+  if (s.config.lmstudio.enabled && s.config.lmstudio.include_as_fallback) {
+    refs.push(...s.lmsModelKeys.map((k) => `lmstudio:${k}`));
+  }
+  return refs.filter(
+    (m) => m && m.toLowerCase() !== s.provider.model.toLowerCase() && !seen.has(m) && seen.add(m)
+  );
+}
+
+/**
+ * At launch, make sure the active model is actually available. If not, switch to
+ * the first available model in the fallback chain (Ollama tag installed, or an
+ * LM Studio model present). Best-effort.
  */
 async function resolveStartupModel(s: Session): Promise<void> {
   const chain = fallbackChain(s);
-  if (!chain.length || !s.provider.listModels || !s.provider.setModel) return;
+  if (!chain.length) return;
 
-  let installed: ModelInfo[];
+  let installed: ModelInfo[] = [];
   try {
-    installed = await s.provider.listModels();
+    if (s.provider.listModels) installed = await s.provider.listModels();
   } catch {
-    return; // can't tell — leave the configured model in place
+    /* keep going — we can still consider LM Studio fallbacks */
   }
-  // Ollama may normalize namespaced/cased tags, so match case-insensitively.
-  const has = (name: string) => {
+  const ollamaHas = (name: string) => {
     const n = name.toLowerCase();
     return installed.some((m) => m.name.toLowerCase() === n || m.name.toLowerCase().startsWith(n));
   };
-  if (has(s.provider.model)) return; // primary is available, nothing to do
+  const available = (ref: string) => {
+    const { kind, model } = parseModelRef(ref);
+    return kind === "lmstudio" ? s.lmsModelKeys.includes(model) : ollamaHas(model);
+  };
 
-  const pick = chain.find(has);
+  if (s.provider.name === "ollama" && ollamaHas(s.provider.model)) return; // primary ok
+  if (installed.length === 0 && s.provider.name === "ollama") return; // can't tell
+
+  const pick = chain.find(available);
   if (pick) {
-    s.provider.setModel(pick);
+    await applyModelRef(s, pick);
+    console.log(chalk.yellow(`⚠ "${s.config.model.model}" not available — using fallback "${pick}".`));
+  } else if (installed.length) {
     console.log(
-      chalk.yellow(`⚠ model "${s.config.model.model}" not installed — using fallback "${pick}".`)
-    );
-  } else {
-    console.log(
-      chalk.yellow(
-        `⚠ "${s.config.model.model}" and all fallbacks (${chain.join(", ")}) are uninstalled. ` +
-          `Pull one with \`ollama pull <name>\` or pick one with /models.`
-      )
+      chalk.yellow(`⚠ "${s.config.model.model}" and all fallbacks are unavailable. Pick one with /model.`)
     );
   }
 }
 
 /** Heuristic: does this provider error mean the requested model is unavailable? */
 function looksUnavailable(err: Error): boolean {
-  return /not found|no such model|unknown model|failed to load|404|model .* does not exist|try pulling/i.test(
+  return /not found|no such model|unknown model|failed to load|404|model .* does not exist|try pulling|connection refused|fetch failed|ECONNREFUSED/i.test(
     err.message
   );
 }
 
 /**
- * Generate, walking the fallback chain if the request fails because the active
- * model is unavailable. Each switch is sticky for the rest of the session (so we
- * don't keep retrying a model that's missing).
+ * Generate, walking the (provider-aware) fallback chain when a request fails
+ * because the active model/backend is unavailable. Switches are sticky.
  */
 async function generateWithFallback(
   s: Session,
@@ -518,14 +583,14 @@ async function generateWithFallback(
   try {
     return await s.provider.generate(history, options);
   } catch (err) {
-    if (!s.provider.setModel || !looksUnavailable(err as Error)) throw err;
+    if (!looksUnavailable(err as Error)) throw err;
     for (const fb of fallbackChain(s)) {
       console.log(chalk.yellow(`\n⚠ "${s.provider.model}" unavailable — falling back to "${fb}".`));
-      s.provider.setModel(fb);
+      await applyModelRef(s, fb);
       try {
         return await s.provider.generate(history, options);
       } catch (e2) {
-        if (!looksUnavailable(e2 as Error)) throw e2; // a real error, not just a missing model
+        if (!looksUnavailable(e2 as Error)) throw e2;
       }
     }
     throw err; // nothing in the chain worked
@@ -787,91 +852,111 @@ function indent(text: string): string {
     .join("\n");
 }
 
-/**
- * `/models` lists installed models; `/model <name|#>` switches the active one
- * for the rest of the session. Returns the model list so callers can cache it
- * for index-based switching.
- */
-async function handleModels(
-  s: Session,
-  line: string,
-  cached: ModelInfo[]
-): Promise<ModelInfo[]> {
-  if (!s.provider.listModels || !s.provider.setModel) {
-    console.log(chalk.gray(`(model switching not supported for ${s.provider.name})\n`));
-    return cached;
-  }
+interface ModelEntry {
+  ref: string; // "lmstudio:<key>" or an ollama tag
+  label: string; // display name
+  hint: string; // size / backend tag
+  current: boolean;
+}
 
-  const parts = line.split(/\s+/).slice(1); // drop the /models|/model token
-  const arg = parts.join(" ").trim();
+/** Gather selectable models from both backends (Ollama tags + LM Studio models). */
+async function gatherModelEntries(s: Session, cached: ModelInfo[]): Promise<ModelEntry[]> {
+  const entries: ModelEntry[] = [];
 
-  let models = cached;
-  try {
-    models = await s.provider.listModels();
-  } catch (err) {
-    console.log(chalk.red(`[could not list models: ${(err as Error).message}]\n`));
-    return cached;
-  }
-
-  // No argument → interactive picker (TTY) or a plain numbered list (piped).
-  if (!arg) {
-    if (!models.length) {
-      console.log(chalk.gray("(no models installed — pull one with `ollama pull <name>`)\n"));
-      return models;
+  // Ollama tags (only when Ollama is the configured backend).
+  let ollama: ModelInfo[] = cached;
+  if (s.config.model.provider === "ollama") {
+    try {
+      const op = s.provider.name === "ollama" ? s.provider : createProvider(s.config);
+      if (op.listModels) ollama = await op.listModels();
+    } catch {
+      /* leave cached */
     }
-    if (process.stdin.isTTY) {
-      const currentIdx = models.findIndex((m) => m.name === s.provider.model);
-      const items: SelectItem[] = models.map((m) => ({
-        label: m.name,
-        hint: m.size,
-        current: m.name === s.provider.model,
-      }));
-      const picked = await selectFromList(
-        `Select a model  (${s.provider.name}, current ● = ${s.provider.model})`,
-        items,
-        currentIdx >= 0 ? currentIdx : 0
-      );
-      if (picked < 0) {
-        console.log(chalk.gray("(model unchanged)\n"));
-      } else if (models[picked].name === s.provider.model) {
-        console.log(chalk.gray(`(already on ${models[picked].name})\n`));
-      } else {
-        s.provider.setModel(models[picked].name);
-        console.log(chalk.green(`✓ switched to ${models[picked].name}`) + chalk.gray(` (${s.provider.name})\n`));
+  }
+  for (const m of ollama) {
+    entries.push({
+      ref: m.name,
+      label: m.name,
+      hint: [m.size, "ollama"].filter(Boolean).join(" · "),
+      current: s.provider.name === "ollama" && m.name === s.provider.model,
+    });
+  }
+
+  // LM Studio models (headless, tokenless list).
+  if (s.config.lmstudio.enabled && s.lms.installed()) {
+    try {
+      const lms = await s.lms.list();
+      for (const m of lms) {
+        entries.push({
+          ref: `lmstudio:${m.key}`,
+          label: m.key,
+          hint: `${m.sizeGB.toFixed(1)}GB · lms${m.toolUse ? " · tools" : ""}${m.paramsB >= s.config.lmstudio.big_params_b || m.sizeGB >= s.config.lmstudio.big_size_gb ? " · big" : ""}`,
+          current: s.provider.name === "lmstudio" && m.key === s.provider.model,
+        });
       }
-      return models;
+    } catch {
+      /* LM Studio optional */
     }
-    // Non-TTY fallback: numbered list.
-    console.log(chalk.bold(`Installed models (${s.provider.name}):`));
-    models.forEach((m, i) => {
-      const current = m.name === s.provider.model;
-      const marker = current ? chalk.green("●") : chalk.gray("○");
-      const size = m.size ? chalk.gray(`  ${m.size}`) : "";
-      const label = current ? chalk.green(m.name) : m.name;
-      console.log(`  ${marker} ${chalk.gray(String(i + 1).padStart(2))}  ${label}${size}`);
+  }
+  return entries;
+}
+
+/**
+ * `/models` opens a picker over BOTH Ollama and LM Studio models; `/model
+ * <name|#>` switches directly. Switching to an LM Studio model safe-loads it
+ * and points the backend at LM Studio. Returns the Ollama list for index reuse.
+ */
+async function handleModels(s: Session, line: string, cached: ModelInfo[]): Promise<ModelInfo[]> {
+  const arg = line.split(/\s+/).slice(1).join(" ").trim();
+  const entries = await gatherModelEntries(s, cached);
+  const ollamaList = entries.filter((e) => !e.ref.startsWith("lmstudio:")).map((e) => ({ name: e.ref }));
+
+  if (entries.length === 0) {
+    console.log(chalk.gray("(no models found — pull one with `ollama pull <name>` or install via LM Studio)\n"));
+    return cached;
+  }
+
+  // No argument → interactive picker (TTY) or numbered list (piped).
+  if (!arg) {
+    if (process.stdin.isTTY) {
+      const currentIdx = Math.max(0, entries.findIndex((e) => e.current));
+      const items: SelectItem[] = entries.map((e) => ({ label: e.label, hint: e.hint, current: e.current }));
+      const picked = await selectFromList(`Select a model  (● = current)`, items, currentIdx);
+      if (picked < 0) console.log(chalk.gray("(model unchanged)\n"));
+      else if (entries[picked].current) console.log(chalk.gray(`(already on ${entries[picked].label})\n`));
+      else {
+        await applyModelRef(s, entries[picked].ref);
+        console.log(chalk.green(`✓ switched to ${s.provider.model}`) + chalk.gray(` (${s.provider.name})\n`));
+      }
+      return ollamaList;
+    }
+    console.log(chalk.bold("Models (Ollama + LM Studio):"));
+    entries.forEach((e, i) => {
+      const marker = e.current ? chalk.green("●") : chalk.gray("○");
+      console.log(`  ${marker} ${chalk.gray(String(i + 1).padStart(2))}  ${e.label}  ${chalk.gray(e.hint)}`);
     });
     console.log(chalk.gray("\nSwitch with /model <name> or /model <number>\n"));
-    return models;
+    return ollamaList;
   }
 
-  // Argument given → resolve by 1-based index or by name and switch.
-  let target: ModelInfo | undefined;
+  // Argument → resolve by 1-based index or by name/key and switch.
   const asIndex = Number(arg);
-  if (Number.isInteger(asIndex) && asIndex >= 1 && asIndex <= models.length) {
-    target = models[asIndex - 1];
+  let target: ModelEntry | undefined;
+  if (Number.isInteger(asIndex) && asIndex >= 1 && asIndex <= entries.length) {
+    target = entries[asIndex - 1];
   } else {
-    target = models.find((m) => m.name === arg) || models.find((m) => m.name.startsWith(arg));
+    const a = arg.toLowerCase();
+    target =
+      entries.find((e) => e.label.toLowerCase() === a || e.ref.toLowerCase() === a) ||
+      entries.find((e) => e.label.toLowerCase().includes(a));
   }
-
   if (!target) {
-    console.log(chalk.red(`[no installed model matches "${arg}"]`));
-    console.log(chalk.gray("Run /models to see what's available.\n"));
-    return models;
+    console.log(chalk.red(`[no model matches "${arg}"]`) + chalk.gray(" — run /model to see the list.\n"));
+    return ollamaList;
   }
-
-  s.provider.setModel(target.name);
-  console.log(chalk.green(`✓ switched to ${target.name}`) + chalk.gray(` (${s.provider.name})\n`));
-  return models;
+  await applyModelRef(s, target.ref);
+  console.log(chalk.green(`✓ switched to ${s.provider.model}`) + chalk.gray(` (${s.provider.name})\n`));
+  return ollamaList;
 }
 
 function expandFileRefs(line: string, cwd: string): string {

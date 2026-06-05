@@ -46,4 +46,22 @@ export function createProvider(config: Config): Provider {
   }
 }
 
+/**
+ * Build an LM Studio provider for a specific model id, independent of the
+ * configured default provider — used to switch the active backend to LM Studio
+ * at runtime (model picker / fallback).
+ */
+export function createLmStudioProvider(config: Config, model: string): Provider {
+  const m = config.model;
+  return new LMStudioProvider({
+    model,
+    baseUrl: config.lmstudio.base_url || "http://localhost:1234",
+    apiKey: config.lmstudio.api_key || "",
+    temperature: m.temperature,
+    topP: m.top_p,
+    maxTokens: m.max_tokens,
+    contextTokens: m.context_tokens,
+  });
+}
+
 export { OpenAICompatibleProvider } from "./base";

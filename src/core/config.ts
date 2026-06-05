@@ -71,6 +71,26 @@ const KnowledgeConfig = z.object({
   embed_model: z.string().default("nomic-embed-text"),
 });
 
+/** Headless LM Studio backend: use its installed models via the lms CLI + /v1 server. */
+const LmStudioConfig = z.object({
+  enabled: z.boolean().default(true),
+  // OpenAI-compatible server. Use the Tailscale IP to reach it across the tailnet.
+  base_url: z.string().default("http://localhost:1234"),
+  // Bearer token if the server's "Require API Key" is on; empty if disabled.
+  api_key: z.string().default(""),
+  // Path to lms.exe; empty = auto-detect (~/.lmstudio/bin/lms.exe or PATH).
+  cli_path: z.string().default(""),
+  start_server: z.boolean().default(true), // ensure the headless server is up at launch
+  // Include LM Studio models in the fallback chain (as "lmstudio:<key>").
+  include_as_fallback: z.boolean().default(true),
+  // Crash-safe loading for big models.
+  safe_load: z.boolean().default(true),
+  big_params_b: z.number().default(20), // >= this many B params => treat as big
+  big_size_gb: z.number().default(14), // >= this on-disk size (GB) => big
+  big_context: z.number().default(8192), // capped context for big models
+  ttl_seconds: z.number().default(1800), // auto-unload idle big models
+});
+
 /** Self-improvement: reflect on mistakes and save lessons to the knowledge vault. */
 const EvolutionConfig = z.object({
   enabled: z.boolean().default(true),
@@ -97,6 +117,7 @@ export const ConfigSchema = z.object({
   knowledge: KnowledgeConfig.default({}),
   web: WebConfig.default({}),
   evolution: EvolutionConfig.default({}),
+  lmstudio: LmStudioConfig.default({}),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
