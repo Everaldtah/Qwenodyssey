@@ -390,7 +390,26 @@ async function runAssistantTurn(
   let emptyNudges = 0;
   const reasoning = isReasoningModel(s.provider.model);
   const failures: string[] = [];
+  const seenCalls = new Set<string>();
   const runCall = async (call: ToolCall): Promise<void> => {
+    // Loop guard: if the model repeats an IDENTICAL tool call it's stuck (e.g.
+    // calling shell_help over and over). Don't re-run it — return the result it
+    // already has and tell it to take the next action.
+    const sig = call.name + " " + JSON.stringify(call.arguments ?? {});
+    if (seenCalls.has(sig)) {
+      failures.push(`repeated identical call to ${call.name} (loop)`);
+      history.push({
+        role: "tool",
+        tool_call_id: call.id,
+        name: call.name,
+        content:
+          `You ALREADY called ${call.name} with these arguments and its result is above. ` +
+          `Do NOT call it again. Take the NEXT step now: run the actual command with run_shell, ` +
+          `or give your final answer.`,
+      });
+      return;
+    }
+    seenCalls.add(sig);
     const r = await executeToolCall(s, tools, call, ask);
     if (!r.ok) {
       const a = JSON.stringify(call.arguments ?? {}).slice(0, 120);

@@ -205,10 +205,12 @@ export const shellHelpTool: Tool = {
       ctx.log({ tool: "shell_help", query: "(index)" });
       return { ok: true, output: `Shell topics (query one for exact commands):\n${list}` };
     }
-    const ranked = SHELL_ENCYCLOPEDIA.map((t) => ({ t, s: scoreTopic(query, t) }))
+    const scored = SHELL_ENCYCLOPEDIA.map((t) => ({ t, s: scoreTopic(query, t) }))
       .filter((x) => x.s > 0)
-      .sort((a, b) => b.s - a.s)
-      .slice(0, 3);
+      .sort((a, b) => b.s - a.s);
+    // Return the best-matching topic only (plus a 2nd if it's nearly as relevant),
+    // so the model gets a tight, actionable answer instead of a wall of text.
+    const ranked = scored.filter((x, i) => i === 0 || x.s >= scored[0].s * 0.8).slice(0, 2);
     ctx.log({ tool: "shell_help", query, matched: ranked.length });
     if (ranked.length === 0) {
       const list = SHELL_ENCYCLOPEDIA.map((t) => `- ${t.topic}`).join("\n");
