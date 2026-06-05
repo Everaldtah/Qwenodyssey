@@ -575,7 +575,19 @@ function looksUnavailable(err: Error): boolean {
  * Generate, walking the (provider-aware) fallback chain when a request fails
  * because the active model/backend is unavailable. Switches are sticky.
  */
-async function generateWithFallback(
+/** Error means the model can't do tool-calling (so we should retry without tools). */
+function noToolSupport(err: Error): boolean {
+  return /does not support tools|tools.*not supported|tool (use|calling).*not|unsupported.*tool/i.test(
+    err.message
+  );
+}
+
+/**
+ * Generate against the active model, transparently retrying WITHOUT tools if the
+ * model rejects tool-calling (e.g. reasoning models like deepseek-r1). The model
+ * then simply answers in plain text instead of crashing the turn.
+ */
+async function tryGenerate(
   s: Session,
   history: Message[],
   options: ModelOptions
@@ -583,12 +595,27 @@ async function generateWithFallback(
   try {
     return await s.provider.generate(history, options);
   } catch (err) {
+    if (options.tools?.length && noToolSupport(err as Error)) {
+      return s.provider.generate(history, { ...options, tools: undefined });
+    }
+    throw err;
+  }
+}
+
+async function generateWithFallback(
+  s: Session,
+  history: Message[],
+  options: ModelOptions
+): Promise<GenerateResult> {
+  try {
+    return await tryGenerate(s, history, options);
+  } catch (err) {
     if (!looksUnavailable(err as Error)) throw err;
     for (const fb of fallbackChain(s)) {
       console.log(chalk.yellow(`\n⚠ "${s.provider.model}" unavailable — falling back to "${fb}".`));
       await applyModelRef(s, fb);
       try {
-        return await s.provider.generate(history, options);
+        return await tryGenerate(s, history, options);
       } catch (e2) {
         if (!looksUnavailable(e2 as Error)) throw e2;
       }
