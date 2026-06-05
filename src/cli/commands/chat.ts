@@ -586,9 +586,14 @@ async function resolveStartupModel(s: Session): Promise<void> {
 
 /** Heuristic: does this provider error mean the requested model is unavailable? */
 function looksUnavailable(err: Error): boolean {
-  return /not found|no such model|unknown model|failed to load|404|model .* does not exist|try pulling|connection refused|fetch failed|ECONNREFUSED/i.test(
+  return /not found|no such model|unknown model|failed to load|unable to load|cannot load|404|model .* does not exist|try pulling|connection refused|fetch failed|ECONNREFUSED|HTTP 50\d|out of memory|insufficient (memory|vram)|unsupported|no space/i.test(
     err.message
   );
+}
+
+/** Embedding models can't chat — keep them out of the model picker/fallbacks. */
+function isEmbeddingModel(name: string): boolean {
+  return /(^|[-_/])(embed|embedding|bge|gte|e5|nomic-embed)/i.test(name);
 }
 
 /**
@@ -921,6 +926,7 @@ async function gatherModelEntries(s: Session, cached: ModelInfo[]): Promise<Mode
     }
   }
   for (const m of ollama) {
+    if (isEmbeddingModel(m.name)) continue; // embeddings aren't chat models
     entries.push({
       ref: m.name,
       label: m.name,
