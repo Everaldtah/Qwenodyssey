@@ -416,9 +416,11 @@ async function runAssistantTurn(
     meter.record(res); // fold this request's exact usage into the session totals
     const calls = res.toolCalls ?? [];
 
-    // Happy path: the model made real tool calls.
+    // Happy path: the model made real tool calls. Store only the non-reasoning
+    // part of the assistant message — leaving a reasoning model's chain-of-thought
+    // in history confuses it on later turns.
     if (calls.length > 0) {
-      history.push({ role: "assistant", content: res.text || "", tool_calls: calls });
+      history.push({ role: "assistant", content: splitThinking(res.text).answer || "", tool_calls: calls });
       for (const call of calls) await runCall(call);
       continue;
     }
@@ -448,10 +450,11 @@ async function runAssistantTurn(
           )
         );
       }
-      // Don't feed the verbose <think> back into context (saves tokens, and
-      // reasoning models are trained to see only prior answers).
-      history.push({ role: "assistant", content: answer || res.text });
-      return { userMessage: "", failures, finalAnswer: answer || res.text, stepLimitHit: false };
+      // Store only the clean answer — NOT res.text (which still holds the raw
+      // chain-of-thought). Feeding reasoning back wastes tokens and derails
+      // reasoning models on subsequent turns.
+      history.push({ role: "assistant", content: answer });
+      return { userMessage: "", failures, finalAnswer: answer, stepLimitHit: false };
     }
 
     if (!nudged) {
@@ -809,16 +812,21 @@ function renderLessons(evolution: EvolutionEngine | null): string {
 
 /**
  * Split a reply into its chain-of-thought and final answer. Reasoning models
- * (DeepSeek-R1, QwQ) wrap deliberation in <think>…</think>. We surface that
- * dimmed and keep the answer clean. Handles an unterminated <think> (truncated
- * output) by treating the remainder as thinking.
+ * (DeepSeek-R1, QwQ, qwen3.5) wrap deliberation in <think>…</think>. We surface
+ * that dimmed and keep the answer clean. Handles three shapes:
+ *  - paired   <think>…</think> answer
+ *  - close-only …reasoning…</think> answer  (LM Studio templates pre-fill the
+ *    opening <think>, so the model only emits the closing tag)
+ *  - open-only <think>…  (truncated/streamed — remainder is all reasoning)
  */
 function splitThinking(text: string): { thinking: string; answer: string } {
   const closed = text.match(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/i);
   if (closed) {
-    const thinking = closed[1].trim();
-    const answer = text.replace(closed[0], "").trim();
-    return { thinking, answer };
+    return { thinking: closed[1].trim(), answer: text.replace(closed[0], "").trim() };
+  }
+  const closeOnly = text.match(/^([\s\S]*?)<\/think(?:ing)?>\s*([\s\S]*)$/i);
+  if (closeOnly) {
+    return { thinking: closeOnly[1].trim(), answer: closeOnly[2].trim() };
   }
   const open = text.match(/<think(?:ing)?>([\s\S]*)$/i);
   if (open) {
