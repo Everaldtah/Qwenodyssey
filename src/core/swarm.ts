@@ -1,0 +1,283 @@
+/**
+ * Agent swarm: fan a single task out to MANY frontier models at the SAME TIME,
+ * each running on its own backend + API key (NVIDIA NIM, OpenRouter, and—when
+ * asked—local Ollama/LM Studio). Two shapes:
+ *
+ *  - ensemble: every worker answers the SAME task in parallel, then their
+ *    answers are synthesized into one best result (breadth + consensus).
+ *  - divide:   a list of independent subtasks is sharded across the workers,
+ *    one per worker (round-robin), all running concurrently (parallelism).
+ *
+ * The roster is built from the configured PRIMARY (when it's a cloud model) plus
+ * every cloud ref in `model.fallback_models` whose API key is present — so the
+ * swarm automatically uses all the frontier keys you already have configured.
+ */
+import type { Config } from "./config";
+import type { Message, Provider } from "../types";
+import { loadPrompt } from "./promptLoader";
+import {
+  createNvidiaProvider,
+  createOpenRouterProvider,
+  createOllamaProvider,
+  createLmStudioProvider,
+  resolveNvidiaKey,
+  resolveOpenRouterKey,
+} from "../providers";
+
+export type WorkerKind = "nvidia" | "openrouter" | "ollama" | "lmstudio";
+
+export interface SwarmWorker {
+  ref: string; // canonical ref, e.g. "openrouter:moonshotai/kimi-k2.6"
+  kind: WorkerKind;
+  model: string;
+  label: string; // short display name
+  provider: Provider;
+}
+
+export interface WorkerResult {
+  label: string;
+  model: string;
+  backend: WorkerKind;
+  /** The subtask this worker handled (divide mode); the shared task otherwise. */
+  task: string;
+  ok: boolean;
+  text: string;
+  error?: string;
+  ms: number;
+  promptTokens?: number;
+  completionTokens?: number;
+}
+
+export interface SwarmRun {
+  mode: "ensemble" | "divide";
+  results: WorkerResult[];
+  /** Final synthesized answer, when synthesis ran. */
+  synthesis?: string;
+  synthesizedBy?: string;
+}
+
+export interface SwarmOptions {
+  /** Cap the number of workers spun up. */
+  maxWorkers?: number;
+  /** Also include local refs (bare Ollama tags / lmstudio:*) from the fallback list. */
+  includeLocal?: boolean;
+  /** Per-worker output budget. */
+  maxTokens?: number;
+}
+
+interface ParsedRef {
+  kind: WorkerKind;
+  model: string;
+}
+
+/** A fallback/primary ref → backend kind + model id. */
+function parseRef(ref: string): ParsedRef {
+  if (ref.startsWith("nvidia:")) return { kind: "nvidia", model: ref.slice("nvidia:".length) };
+  if (ref.startsWith("openrouter:")) return { kind: "openrouter", model: ref.slice("openrouter:".length) };
+  if (ref.startsWith("lmstudio:")) return { kind: "lmstudio", model: ref.slice("lmstudio:".length) };
+  return { kind: "ollama", model: ref };
+}
+
+/** Short label for display (drop the org/ prefix). */
+function shortLabel(model: string): string {
+  const tail = model.includes("/") ? model.slice(model.lastIndexOf("/") + 1) : model;
+  return tail;
+}
+
+/** Reasoning/thinking models need heat — at temp 0 they loop. (Mirrors chat.ts.) */
+function isReasoningModel(model: string): boolean {
+  return (
+    /(^|[-_/:.])(r1|qwq|o1|o3|thinking|reason|kimi|k2|nemotron)/i.test(model) ||
+    /deepseek-r1/i.test(model)
+  );
+}
+
+function buildProvider(config: Config, kind: WorkerKind, model: string): Provider {
+  switch (kind) {
+    case "nvidia":
+      return createNvidiaProvider(config, model);
+    case "openrouter":
+      return createOpenRouterProvider(config, model);
+    case "lmstudio":
+      return createLmStudioProvider(config, model);
+    case "ollama":
+    default:
+      return createOllamaProvider(config, model);
+  }
+}
+
+/**
+ * Build the swarm roster from config: the primary (if it's a cloud backend) plus
+ * every cloud ref in the fallback chain whose API key is available. Cloud refs
+ * without a key are skipped; local refs are included only when includeLocal.
+ */
+export function frontierWorkers(config: Config, opts: SwarmOptions = {}): SwarmWorker[] {
+  const haveNvidia = config.nvidia.enabled && !!resolveNvidiaKey(config);
+  const haveOpenRouter = config.openrouter.enabled && !!resolveOpenRouterKey(config);
+
+  const refs: string[] = [];
+  // Primary, when it is itself a cloud model.
+  if (config.model.provider === "nvidia") refs.push(`nvidia:${config.model.model}`);
+  else if (config.model.provider === "openrouter") refs.push(`openrouter:${config.model.model}`);
+  // Fallback chain.
+  for (const r of config.model.fallback_models ?? []) {
+    const t = r.trim();
+    if (t) refs.push(t);
+  }
+
+  const seen = new Set<string>();
+  const workers: SwarmWorker[] = [];
+  for (const ref of refs) {
+    const { kind, model } = parseRef(ref);
+    const canonical = `${kind}:${model}`.toLowerCase();
+    if (seen.has(canonical)) continue;
+    if (kind === "nvidia" && !haveNvidia) continue; // cloud needs a key
+    if (kind === "openrouter" && !haveOpenRouter) continue;
+    if ((kind === "ollama" || kind === "lmstudio") && !opts.includeLocal) continue;
+    seen.add(canonical);
+    workers.push({
+      ref: kind === "ollama" ? model : `${kind}:${model}`,
+      kind,
+      model,
+      label: shortLabel(model),
+      provider: buildProvider(config, kind, model),
+    });
+    if (opts.maxWorkers && workers.length >= opts.maxWorkers) break;
+  }
+  return workers;
+}
+
+/** Drives a roster of workers concurrently. */
+export class Swarm {
+  constructor(
+    private workers: SwarmWorker[],
+    private opts: SwarmOptions = {}
+  ) {}
+
+  get size(): number {
+    return this.workers.length;
+  }
+
+  roster(): { label: string; model: string; backend: WorkerKind }[] {
+    return this.workers.map((w) => ({ label: w.label, model: w.model, backend: w.kind }));
+  }
+
+  /** Same task to every worker, all at once. */
+  async ensemble(task: string, context?: string): Promise<SwarmRun> {
+    const prompt = context ? `${task}\n\n--- Context ---\n${context}` : task;
+    const results = await Promise.all(this.workers.map((w) => this.ask(w, task, prompt)));
+    return { mode: "ensemble", results };
+  }
+
+  /**
+   * Shard independent subtasks across the workers (round-robin) and run them all
+   * concurrently. With more subtasks than workers, a worker handles several (still
+   * sequential within that worker, parallel across workers).
+   */
+  async divide(subtasks: string[], context?: string): Promise<SwarmRun> {
+    const clean = subtasks.map((s) => s.trim()).filter(Boolean);
+    // Group subtasks per worker by round-robin, then run each worker's group
+    // sequentially while all workers run in parallel.
+    const groups: { worker: SwarmWorker; tasks: string[] }[] = this.workers.map((w) => ({
+      worker: w,
+      tasks: [],
+    }));
+    clean.forEach((st, i) => groups[i % groups.length].tasks.push(st));
+
+    const nested = await Promise.all(
+      groups
+        .filter((g) => g.tasks.length > 0)
+        .map(async (g) => {
+          const out: WorkerResult[] = [];
+          for (const st of g.tasks) {
+            const prompt = context ? `${st}\n\n--- Context ---\n${context}` : st;
+            out.push(await this.ask(g.worker, st, prompt));
+          }
+          return out;
+        })
+    );
+    return { mode: "divide", results: nested.flat() };
+  }
+
+  /** One worker, one prompt. Never throws — failures become a failed result. */
+  private async ask(worker: SwarmWorker, task: string, prompt: string): Promise<WorkerResult> {
+    const start = Date.now();
+    const messages: Message[] = [
+      { role: "system", content: loadPrompt("system") },
+      { role: "user", content: prompt },
+    ];
+    try {
+      const res = await worker.provider.generate(messages, {
+        temperature: isReasoningModel(worker.model) ? 0.6 : 0.3,
+        max_tokens: this.opts.maxTokens ?? 1500,
+      });
+      return {
+        label: worker.label,
+        model: worker.model,
+        backend: worker.kind,
+        task,
+        ok: true,
+        text: stripThinking(res.text).trim(),
+        ms: Date.now() - start,
+        promptTokens: res.promptTokens,
+        completionTokens: res.completionTokens,
+      };
+    } catch (err) {
+      return {
+        label: worker.label,
+        model: worker.model,
+        backend: worker.kind,
+        task,
+        ok: false,
+        text: "",
+        error: (err as Error).message,
+        ms: Date.now() - start,
+      };
+    }
+  }
+}
+
+/** Drop a reasoning model's <think>…</think> block, keeping the final answer. */
+function stripThinking(text: string): string {
+  const closed = text.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "");
+  // Close-only shape (templates pre-fill the opening tag).
+  const closeOnly = closed.match(/^[\s\S]*?<\/think(?:ing)?>\s*([\s\S]*)$/i);
+  return (closeOnly ? closeOnly[1] : closed).trim();
+}
+
+/**
+ * Merge the workers' answers into one best result, using `lead` to judge and
+ * combine. Falls back to concatenation if the synthesizer call fails.
+ */
+export async function synthesize(
+  lead: Provider,
+  task: string,
+  run: SwarmRun,
+  maxTokens = 1800
+): Promise<string> {
+  const ok = run.results.filter((r) => r.ok && r.text);
+  if (ok.length === 0) return "All swarm workers failed; no answer to synthesize.";
+  if (ok.length === 1) return ok[0].text;
+
+  const blocks = ok
+    .map((r, i) => `### Answer ${i + 1} — model: ${r.model}\n${r.text}`)
+    .join("\n\n");
+  const instruction =
+    run.mode === "ensemble"
+      ? `Multiple frontier models independently answered the SAME task. Combine their answers into a single, correct, complete best answer. Resolve disagreements by reasoning about which is right, keep the strongest ideas from each, and drop anything wrong or redundant. Do not mention that multiple models were involved.`
+      : `Independent subtasks were each handled by a different model. Integrate their outputs into one coherent result that addresses the overall task. Keep each subtask's substance; reconcile overlaps.`;
+
+  const messages: Message[] = [
+    { role: "system", content: loadPrompt("system") },
+    {
+      role: "user",
+      content: `TASK:\n${task}\n\n${instruction}\n\n${blocks}\n\n--- Now write the single best final answer below. ---`,
+    },
+  ];
+  try {
+    const res = await lead.generate(messages, { temperature: 0.3, max_tokens: maxTokens });
+    return stripThinking(res.text).trim() || blocks;
+  } catch {
+    return blocks;
+  }
+}

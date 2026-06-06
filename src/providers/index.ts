@@ -7,6 +7,7 @@ import { OpenAICompatibleEndpointProvider } from "./openaiCompatible";
 import { VLLMProvider } from "./vllm";
 import { LlamaCppProvider } from "./llamacpp";
 import { NvidiaNimProvider } from "./nvidia";
+import { OpenRouterProvider } from "./openrouter";
 
 /** Sensible default base URLs per provider when the config leaves it blank. */
 const DEFAULT_BASE: Record<string, string> = {
@@ -16,6 +17,7 @@ const DEFAULT_BASE: Record<string, string> = {
   vllm: "http://localhost:8000",
   llamacpp: "http://localhost:8080",
   nvidia: "https://integrate.api.nvidia.com",
+  openrouter: "https://openrouter.ai/api",
 };
 
 /**
@@ -28,9 +30,20 @@ export function resolveNvidiaKey(config: Config): string {
   return n.api_key || process.env[envName] || process.env.NVIDIA_API_KEY || "";
 }
 
+/**
+ * Resolve the OpenRouter API key without ever requiring it to live in a committed
+ * file: explicit config first, then the configured env var, then OPENROUTER_API_KEY.
+ */
+export function resolveOpenRouterKey(config: Config): string {
+  const o = config.openrouter;
+  const envName = o.api_key_env || "OPENROUTER_API_KEY";
+  return o.api_key || process.env[envName] || process.env.OPENROUTER_API_KEY || "";
+}
+
 export function createProvider(config: Config): Provider {
   const m = config.model;
   if (m.provider === "nvidia") return createNvidiaProvider(config, m.model);
+  if (m.provider === "openrouter") return createOpenRouterProvider(config, m.model);
   const cfg: ProviderConfig = {
     model: m.model,
     baseUrl: m.base_url || DEFAULT_BASE[m.provider] || "http://localhost:11434",
@@ -99,6 +112,25 @@ export function createNvidiaProvider(config: Config, model: string): Provider {
     requestTimeoutMs: config.nvidia.request_timeout_ms,
     nemotronThinking: config.nvidia.nemotron_thinking,
     reasoningBudget: config.nvidia.reasoning_budget,
+  });
+}
+
+/**
+ * Build an OpenRouter provider for a specific hosted model, independent of the
+ * configured default provider — used as the primary backend or a fallback. The
+ * key is resolved from config/env (never required in a committed file).
+ */
+export function createOpenRouterProvider(config: Config, model: string): Provider {
+  const m = config.model;
+  return new OpenRouterProvider({
+    model,
+    baseUrl: config.openrouter.base_url || DEFAULT_BASE.openrouter,
+    apiKey: resolveOpenRouterKey(config),
+    temperature: m.temperature,
+    topP: m.top_p,
+    maxTokens: m.max_tokens,
+    contextTokens: m.context_tokens,
+    requestTimeoutMs: config.openrouter.request_timeout_ms,
   });
 }
 

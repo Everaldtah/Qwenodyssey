@@ -10,14 +10,15 @@ export const WORKSPACE_DIR = ".qwenodyssey";
 
 const ModelConfig = z.object({
   provider: z
-    .enum(["ollama", "lmstudio", "openai", "vllm", "llamacpp", "nvidia"])
+    .enum(["ollama", "lmstudio", "openai", "vllm", "llamacpp", "nvidia", "openrouter"])
     .default("ollama"),
   model: z.string().default("qwen2.5:7b"),
   // Ordered fallback chain: tried in turn if `model` isn't installed at launch,
   // or when a request fails because the active model is unavailable. The first
   // installed/working one wins. Empty list disables fallback.
-  // Refs are bare Ollama tags, "lmstudio:<key>", or "nvidia:<model>" (cloud NIM —
-  // only used when an NVIDIA API key is configured; skipped otherwise).
+  // Refs are bare Ollama tags, "lmstudio:<key>", "nvidia:<model>" (cloud NIM), or
+  // "openrouter:<model>" (cloud OpenRouter) — cloud refs are only used when the
+  // matching API key is configured; skipped otherwise.
   fallback_models: z
     .array(z.string())
     .default([
@@ -136,6 +137,28 @@ const NvidiaConfig = z.object({
   reasoning_budget: z.number().default(4096),
 });
 
+/**
+ * OpenRouter cloud endpoint (OpenAI-compatible, https://openrouter.ai/api). One
+ * key aggregates many providers/models (e.g. moonshotai/kimi-k2.6) that can act
+ * as the primary brain or a fallback. The API key is a SECRET — never commit it:
+ * leave it blank here and set the OPENROUTER_API_KEY environment variable, or put
+ * it only in your user-level ~/.qwenodyssey/config.toml (which lives outside the repo).
+ */
+const OpenRouterConfig = z.object({
+  enabled: z.boolean().default(true),
+  base_url: z.string().default("https://openrouter.ai/api"),
+  // Prefer leaving blank + using the env var below. If set here, keep it OUT of
+  // any committed config file (public repo).
+  api_key: z.string().default(""),
+  // Environment variable to read the key from when api_key is blank.
+  api_key_env: z.string().default("OPENROUTER_API_KEY"),
+  // Include the openrouter:* refs from fallback_models in the runtime fallback chain.
+  include_as_fallback: z.boolean().default(true),
+  // Abort a request after this many ms so a hung/slow hosted model fails over to
+  // the next model in the chain.
+  request_timeout_ms: z.number().default(90000),
+});
+
 /** Webcam vision: capture a frame and describe it with a vision-language model. */
 const VisionConfig = z.object({
   enabled: z.boolean().default(true),
@@ -193,6 +216,26 @@ const TtsConfig = z.object({
   piper_voice: z.string().default(""),
 });
 
+/**
+ * Agent swarm: fan a complex task out to MANY frontier models at once, each on
+ * its own backend + API key (the cloud refs already in model.fallback_models).
+ * "ensemble" = every model answers the same task then a lead synthesizes the
+ * best answer; "divide" = independent subtasks are sharded across the models.
+ */
+const SwarmConfig = z.object({
+  enabled: z.boolean().default(true),
+  // Hard cap on how many models run concurrently (protects rate limits / cost).
+  max_workers: z.number().default(4),
+  // Also enlist local refs (bare Ollama tags / lmstudio:*) from the fallback list,
+  // not just cloud models. Off by default so the swarm stays frontier-only.
+  include_local: z.boolean().default(false),
+  // Who merges the workers' answers: "primary" (the active model) or an explicit
+  // ref like "openrouter:moonshotai/kimi-k2.6".
+  synthesizer: z.string().default("primary"),
+  // Per-worker (and synthesis) output token budget.
+  max_tokens: z.number().default(1500),
+});
+
 /** Internet search + page fetch. */
 const WebConfig = z.object({
   enabled: z.boolean().default(true),
@@ -210,9 +253,11 @@ export const ConfigSchema = z.object({
   memory: MemoryConfig.default({}),
   knowledge: KnowledgeConfig.default({}),
   web: WebConfig.default({}),
+  swarm: SwarmConfig.default({}),
   evolution: EvolutionConfig.default({}),
   lmstudio: LmStudioConfig.default({}),
   nvidia: NvidiaConfig.default({}),
+  openrouter: OpenRouterConfig.default({}),
   vision: VisionConfig.default({}),
   audio: AudioConfig.default({}),
   tts: TtsConfig.default({}),

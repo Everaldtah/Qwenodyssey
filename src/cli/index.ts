@@ -13,6 +13,7 @@ import { testCommand } from "./commands/test";
 import { applyCommand } from "./commands/apply";
 import { memoryCommand } from "./commands/memory";
 import { chatCommand } from "./commands/chat";
+import { swarmCommand } from "./commands/swarm";
 import { liveCommand } from "./commands/live";
 import { mictestCommand } from "./commands/mictest";
 import { miclevelCommand } from "./commands/miclevel";
@@ -105,6 +106,21 @@ program
   .command("chat")
   .description("Interactive pair-coding chat (streaming)")
   .action((_o, cmd) => chatCommand(globals(cmd)));
+
+program
+  .command("swarm")
+  .description("Run a complex task across a parallel swarm of frontier models (one per cloud key)")
+  .argument("[task]", "the task/question for the swarm (omit only with --list)")
+  .option("--divide <subtasks...>", "shard these independent subtasks across the models instead")
+  .option("--no-synth", "don't synthesize a final answer; just show each model's output")
+  .option("--local", "also enlist local fallback models, not just cloud ones")
+  .option("--list", "show the swarm roster and exit (no models are called)")
+  .action((task, _o, cmd) =>
+    swarmCommand(
+      task,
+      globals(cmd, { divide: cmd.opts().divide, synth: cmd.opts().synth, local: cmd.opts().local, list: cmd.opts().list })
+    )
+  );
 
 program
   .command("live")

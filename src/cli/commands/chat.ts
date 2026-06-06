@@ -7,14 +7,18 @@ import { resolveInside } from "../../tools/fileTools";
 import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
-import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS } from "../chatTools";
+import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS, SWARM_TOOL_SPECS } from "../chatTools";
+import { createSwarmTools } from "../../tools/swarmTools";
+import { frontierWorkers } from "../../core/swarm";
 import { createPrompt, selectFromList, captureInterjections, SlashCommand, SelectItem } from "../prompt";
 import {
   createProvider,
   createLmStudioProvider,
   createNvidiaProvider,
+  createOpenRouterProvider,
   createOllamaProvider,
   resolveNvidiaKey,
+  resolveOpenRouterKey,
 } from "../../providers";
 import { KnowledgeBase } from "../../core/knowledge";
 import { EvolutionEngine, TurnSignals } from "../../core/evolution";
@@ -47,7 +51,7 @@ function isReasoningModel(model: string): boolean {
 
 /** Cloud backends, where a hard 0 temperature risks repetition loops. */
 function isCloudProvider(name: string): boolean {
-  return name === "nvidia" || name === "openai";
+  return name === "nvidia" || name === "openai" || name === "openrouter";
 }
 
 /**
@@ -144,6 +148,25 @@ knowledge_save durable facts (reuse a title to update a note; cite source URLs).
 durable understanding so future sessions start smarter, and prefer saved knowledge over guessing.`;
 
 /**
+ * Teaches the model that it can fan out to a parallel swarm of frontier models.
+ * Only appended when ≥2 frontier workers (cloud API keys) are actually available,
+ * so the model never offers a capability it can't use. This is what makes the
+ * swarm "auto-activate": the model decides to call agent_swarm on complex tasks.
+ */
+const SWARM_SYSTEM = `
+AGENT SWARM — for genuinely COMPLEX or large tasks you can spin up a swarm of frontier
+models that run AT THE SAME TIME, each on a different cloud model and its own API key,
+via the agent_swarm tool. Use it when extra reasoning power or parallelism clearly helps:
+- mode "ensemble" (default): every model answers the SAME task in parallel, then their
+  answers are synthesized into one best result. Use for hard reasoning, design, tricky
+  debugging, planning, or review where multiple strong perspectives raise quality.
+- mode "divide": pass a "subtasks" array; each independent part is handed to a different
+  model concurrently. Use to parallelize a big job that splits into separate pieces.
+Judgement: DON'T swarm trivial questions, quick lookups, or routine edits — just answer
+or use the normal tools. Reach for agent_swarm when the task is hard or naturally parallel.
+Call it at most once per turn; you get back every worker's answer plus the merged result.`;
+
+/**
  * Tells the model the concrete truth about itself: where its persistent memory
  * lives, that its own source code is on disk and editable, and that it learns
  * from mistakes. Paths are real so it can answer "do you remember / where?"
@@ -159,6 +182,7 @@ function selfAwareness(
     ollama: "a local Ollama model",
     lmstudio: "a local LM Studio model",
     nvidia: "a cloud model via NVIDIA NIM (integrate.api.nvidia.com)",
+    openrouter: "a cloud model via OpenRouter (openrouter.ai)",
     openai: "an OpenAI-compatible endpoint",
     vllm: "a local vLLM server",
     llamacpp: "a local llama.cpp server",
@@ -230,10 +254,21 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
         })
       : null;
 
+  // Agent swarm: usable only when ≥2 frontier workers (cloud models with keys)
+  // exist. Computed up front so the system prompt and tool set agree.
+  const swarmWorkers = s.config.swarm.enabled
+    ? frontierWorkers(s.config, {
+        maxWorkers: s.config.swarm.max_workers,
+        includeLocal: s.config.swarm.include_local,
+      })
+    : [];
+  const swarmReady = swarmWorkers.length >= 2;
+
   // Base system prompt now; the PROJECT summary is appended once the repo scan
   // finishes in the background (so a slow scan doesn't delay the prompt).
   let sys = loadPrompt("system") + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK;
   if (memoryEnabled || s.config.web.enabled) sys += "\n" + MEMORY_SYSTEM;
+  if (swarmReady) sys += "\n" + SWARM_SYSTEM;
   sys += "\n" + selfAwareness(s, kb, memoryEnabled, !!evolution);
   const history: Message[] = [{ role: "system", content: sys }];
 
@@ -320,6 +355,16 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   if (memoryEnabled) {
     createKnowledgeTools(kb).forEach((t) => chatTools.register(t));
     toolSpecs.push(...KNOWLEDGE_TOOL_SPECS);
+  }
+  if (swarmReady) {
+    createSwarmTools(s.config).forEach((t) => chatTools.register(t));
+    toolSpecs.push(...SWARM_TOOL_SPECS);
+    console.log(
+      chalk.gray(
+        `  ✦ agent swarm ready — ${swarmWorkers.length} frontier models: ` +
+          swarmWorkers.map((w) => w.label).join(", ") + "\n"
+      )
+    );
   }
 
   // Cached result of the last /models listing, so /model <#> can resolve indexes.
@@ -637,19 +682,28 @@ function lmsPort(baseUrl: string): number {
   return m ? Number(m[1]) : 1234;
 }
 
+type ModelKind = "ollama" | "lmstudio" | "nvidia" | "openrouter";
+
 /**
  * A fallback/picker entry is "lmstudio:<key>" for LM Studio, "nvidia:<model>" for
- * the NVIDIA NIM cloud endpoint, else a bare Ollama tag.
+ * the NVIDIA NIM cloud endpoint, "openrouter:<model>" for OpenRouter, else a bare
+ * Ollama tag.
  */
-function parseModelRef(ref: string): { kind: "ollama" | "lmstudio" | "nvidia"; model: string } {
+function parseModelRef(ref: string): { kind: ModelKind; model: string } {
   if (ref.startsWith("lmstudio:")) return { kind: "lmstudio", model: ref.slice("lmstudio:".length) };
   if (ref.startsWith("nvidia:")) return { kind: "nvidia", model: ref.slice("nvidia:".length) };
+  if (ref.startsWith("openrouter:")) return { kind: "openrouter", model: ref.slice("openrouter:".length) };
   return { kind: "ollama", model: ref };
 }
 
 /** Is an NVIDIA NIM API key available (config or env)? Cloud refs need it. */
 function nvidiaKeyPresent(s: Session): boolean {
   return !!resolveNvidiaKey(s.config);
+}
+
+/** Is an OpenRouter API key available (config or env)? Cloud refs need it. */
+function openRouterKeyPresent(s: Session): boolean {
+  return !!resolveOpenRouterKey(s.config);
 }
 
 /**
@@ -662,6 +716,10 @@ async function applyModelRef(s: Session, ref: string): Promise<void> {
   const { kind, model } = parseModelRef(ref);
   if (kind === "nvidia") {
     s.provider = createNvidiaProvider(s.config, model);
+    return;
+  }
+  if (kind === "openrouter") {
+    s.provider = createOpenRouterProvider(s.config, model);
     return;
   }
   if (kind === "lmstudio") {
@@ -704,12 +762,21 @@ function fallbackChain(s: Session): string[] {
   }
   const nvidiaOk =
     s.config.nvidia.enabled && s.config.nvidia.include_as_fallback && nvidiaKeyPresent(s);
-  const activeKind: "ollama" | "lmstudio" | "nvidia" =
-    s.provider.name === "nvidia" ? "nvidia" : s.provider.name === "lmstudio" ? "lmstudio" : "ollama";
+  const openRouterOk =
+    s.config.openrouter.enabled && s.config.openrouter.include_as_fallback && openRouterKeyPresent(s);
+  const activeKind: ModelKind =
+    s.provider.name === "nvidia"
+      ? "nvidia"
+      : s.provider.name === "openrouter"
+        ? "openrouter"
+        : s.provider.name === "lmstudio"
+          ? "lmstudio"
+          : "ollama";
   return refs.filter((ref) => {
     if (!ref) return false;
     const { kind, model } = parseModelRef(ref);
     if (kind === "nvidia" && !nvidiaOk) return false; // cloud needs a key
+    if (kind === "openrouter" && !openRouterOk) return false; // cloud needs a key
     // Drop the currently-active backend+model so we never "fall back" to it.
     if (kind === activeKind && model.toLowerCase() === s.provider.model.toLowerCase()) return false;
     if (seen.has(ref)) return false;
@@ -734,6 +801,16 @@ async function resolveStartupModel(s: Session): Promise<void> {
     );
   }
 
+  // OpenRouter cloud primary: usable as long as we have an API key (assume reachable).
+  if (s.provider.name === "openrouter") {
+    if (openRouterKeyPresent(s)) return;
+    console.log(
+      chalk.yellow(
+        `⚠ "${s.config.model.model}" needs an OpenRouter API key (set OPENROUTER_API_KEY or [openrouter].api_key) — not found. Trying local fallbacks.`
+      )
+    );
+  }
+
   const chain = fallbackChain(s);
   if (!chain.length) return;
 
@@ -754,6 +831,7 @@ async function resolveStartupModel(s: Session): Promise<void> {
     const { kind, model } = parseModelRef(ref);
     if (kind === "lmstudio") return s.lmsModelKeys.includes(model);
     if (kind === "nvidia") return nvidiaKeyPresent(s);
+    if (kind === "openrouter") return openRouterKeyPresent(s);
     return ollamaHas(model);
   };
 
@@ -1160,6 +1238,25 @@ async function gatherModelEntries(s: Session, cached: ModelInfo[]): Promise<Mode
         label: model,
         hint: "nvidia · cloud",
         current: s.provider.name === "nvidia" && model === s.provider.model,
+      });
+    }
+  }
+
+  // OpenRouter cloud models (the configured primary and any openrouter:* fallbacks),
+  // shown only when an API key is available.
+  if (s.config.openrouter.enabled && openRouterKeyPresent(s)) {
+    const orModels = new Set<string>();
+    if (s.config.model.provider === "openrouter") orModels.add(s.config.model.model);
+    for (const ref of s.config.model.fallback_models ?? []) {
+      const t = ref.trim();
+      if (t.startsWith("openrouter:")) orModels.add(t.slice("openrouter:".length));
+    }
+    for (const model of orModels) {
+      entries.push({
+        ref: `openrouter:${model}`,
+        label: model,
+        hint: "openrouter · cloud",
+        current: s.provider.name === "openrouter" && model === s.provider.model,
       });
     }
   }

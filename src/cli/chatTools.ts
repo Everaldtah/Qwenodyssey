@@ -217,4 +217,40 @@ export const KNOWLEDGE_TOOL_SPECS: ToolSpec[] = [
   },
 ];
 
+/** Agent-swarm tool — included when ≥2 frontier workers (cloud keys) are available. */
+export const SWARM_TOOL_SPECS: ToolSpec[] = [
+  {
+    name: "agent_swarm",
+    description:
+      "Spin up a SWARM of frontier models that run IN PARALLEL — each worker is a different cloud " +
+      "model on its own API key, all executing at the same time. Use for genuinely COMPLEX tasks: " +
+      "hard reasoning/design/debugging where multiple strong perspectives help (mode 'ensemble'), or " +
+      "a big job that splits into independent parts you can parallelize (mode 'divide'). For simple " +
+      "questions answer directly instead. Returns each worker's answer plus a single synthesized result.",
+    parameters: {
+      type: "object",
+      properties: {
+        task: str("The overall task/question for the swarm (always required, even in divide mode — it frames the subtasks)."),
+        mode: {
+          type: "string",
+          enum: ["ensemble", "divide"],
+          description:
+            "'ensemble' (default): every model answers the SAME task, then their answers are merged into the best one. " +
+            "'divide': shard `subtasks` across the models, one per worker, all at once.",
+        },
+        subtasks: {
+          type: "array",
+          items: { type: "string" },
+          description: "Independent subtasks to parallelize (required for mode 'divide').",
+        },
+        synthesize: {
+          type: "boolean",
+          description: "Merge the workers' outputs into one final answer (default true).",
+        },
+      },
+      required: ["task"],
+    },
+  },
+];
+
 export const CHAT_TOOL_NAMES = new Set(CHAT_TOOL_SPECS.map((t) => t.name));
