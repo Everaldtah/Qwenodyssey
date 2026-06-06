@@ -80,3 +80,11 @@ enabled = true
 engine = "piper"                # piper (local neural) | sapi (Windows built-in) | none
 piper_bin = ""                  # "" = ~/.qwenodyssey/piper/piper/piper.exe
 piper_voice = ""                # "" = ~/.qwenodyssey/piper/voices/en_US-amy-medium.onnx
+
+# Omni mode: one multimodal model hears + sees + reasons in a single call (audio
+# and frames go to the cloud). When false, `live` uses the local whisper+vision split.
+[omni]
+enabled = false
+model = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"   # audio+vision+reasoning; or microsoft/phi-4-multimodal-instruct
+provider = "nvidia"
+send_image = true

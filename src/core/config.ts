@@ -173,9 +173,10 @@ const AudioConfig = z.object({
  */
 const OmniConfig = z.object({
   enabled: z.boolean().default(false),
-  // Multimodal model that accepts input_audio (+ images). phi-4-multimodal does
-  // text+image+audio; nemotron-3-nano-omni is the NVIDIA omni option.
-  model: z.string().default("microsoft/phi-4-multimodal-instruct"),
+  // Multimodal model that accepts input_audio (+ images) and reasons in one call.
+  // nemotron-3-nano-omni (NVIDIA) is verified audio+vision+reasoning and reliable
+  // on NIM; microsoft/phi-4-multimodal-instruct also works when not degraded.
+  model: z.string().default("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"),
   provider: z.enum(["nvidia", "openai"]).default("nvidia"),
   // Send the camera frame alongside the audio each turn.
   send_image: z.boolean().default(true),

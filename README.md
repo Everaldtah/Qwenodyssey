@@ -150,6 +150,15 @@ qwenodyssey live
 Configure under `[vision]`, `[audio]`, `[tts]` (see the sample config). Frames and
 audio stay on your machine; only extracted text reaches the cloud brain.
 
+### Omni mode (one model does everything)
+
+Set `[omni].enabled = true` and `live` instead sends your **mic audio + a camera
+frame straight to a single multimodal model** that hears, sees, and reasons in one
+call (Node-side voice-activity detection segments your speech — still hands-free).
+`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` is verified for audio+vision+reasoning
+on NIM. In this mode audio and frames go to the cloud. Test pieces independently:
+`qwenodyssey miclevel` (mic meter), `qwenodyssey mictest` (transcription + omni audio).
+
 ---
 
 ## Commands

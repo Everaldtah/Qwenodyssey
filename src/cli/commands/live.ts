@@ -22,10 +22,13 @@ import {
   resolveWhisperStream,
   defaultWhisperModel,
   pickVideoDevice,
+  pickAudioDevice,
   captureFrame,
 } from "../../core/media";
 import { describeImage } from "../../core/vision";
 import { speak, ttsAvailable } from "../../core/tts";
+import { startMicVad } from "../../core/micstream";
+import { askOmni } from "../../core/omni";
 
 const LIVE_SYSTEM =
   "You are Qwenodyssey in LIVE mode: a hands-free spoken conversation. The user talks to you " +
@@ -57,6 +60,11 @@ export async function liveCommand(opts: GlobalOpts): Promise<void> {
   const s = createSession(opts);
   const cfg = s.config;
   const ffmpeg = resolveFfmpeg();
+
+  // Omni mode: one multimodal model ingests the mic audio + camera frame directly.
+  if (cfg.omni.enabled) {
+    return runOmniLive(opts);
+  }
 
   const cam = cfg.vision.enabled ? await pickVideoDevice(cfg.vision.device, ffmpeg).catch(() => null) : null;
   const whisperStream = resolveWhisperStream();
@@ -207,5 +215,136 @@ export async function liveCommand(opts: GlobalOpts): Promise<void> {
     };
     if (tty) stdin.on("keypress", onKey);
     ws.on("exit", () => cleanup());
+  });
+}
+
+const OMNI_INSTRUCTION =
+  "You are Qwenodyssey, a live voice assistant. The user just spoke to you (their audio is " +
+  "attached); a webcam frame may also be attached as your eyes. Reply briefly and naturally — it " +
+  "is read aloud. No code blocks or lists unless asked.";
+
+/**
+ * Omni live: a single multimodal model does everything. One ffmpeg mic reader feeds
+ * Node-side voice-activity detection; each detected utterance's audio (plus a fresh
+ * camera frame) is sent straight to the omni model, whose reply is spoken. Listening
+ * is paused while it thinks/speaks so it never hears its own voice.
+ */
+async function runOmniLive(opts: GlobalOpts): Promise<void> {
+  const s = createSession(opts);
+  const cfg = s.config;
+  const ffmpeg = resolveFfmpeg();
+  const cam = cfg.vision.enabled ? await pickVideoDevice(cfg.vision.device, ffmpeg).catch(() => null) : null;
+  const mic = await pickAudioDevice(cfg.audio.device, cam, ffmpeg).catch(() => null);
+  const tts = ttsAvailable(cfg);
+
+  console.log(chalk.bold("\n  Qwenodyssey — live (omni: one model does everything)\n"));
+  console.log(chalk.gray("  brain : ") + `${cfg.omni.model} (${cfg.omni.provider}) — audio + vision + reasoning`);
+  console.log(chalk.gray("  mic   : ") + (mic ? mic : chalk.red("none")));
+  console.log(chalk.gray("  camera: ") + (cam ? cam : chalk.yellow("none")) + (cfg.omni.send_image ? "" : chalk.gray(" (image off)")));
+  console.log(chalk.gray("  voice : ") + (tts.ok ? tts.detail : chalk.yellow(`off (${tts.detail})`)));
+  console.log("\n  " + chalk.gray("Just talk. ") + chalk.cyan("c") + chalk.gray(" camera · ") + chalk.cyan("m") + chalk.gray(" mute · ") + chalk.cyan("q") + chalk.gray(" quit\n"));
+
+  if (!mic) {
+    console.log(chalk.red("  No microphone found. Set audio.device or check Windows mic privacy.\n"));
+    return;
+  }
+
+  let cameraOn = cfg.vision.enabled && !!cam;
+  let busy = false;
+  let lastHeard = 0;
+
+  const vad = startMicVad(
+    mic,
+    {
+      onLevel: () => {
+        /* level available for a future inline meter; kept quiet here */
+      },
+      onSpeechStart: () => {
+        if (busy) return;
+        const now = Date.now();
+        if (now - lastHeard > 1500) {
+          process.stdout.write(chalk.gray("  🎤 hearing you…\n"));
+          lastHeard = now;
+        }
+      },
+      onUtterance: async (wav) => {
+        if (busy) return; // ignore speech captured while we're replying
+        busy = true;
+        vad.pause(); // don't transcribe our own TTS
+        try {
+          let imagePath: string | undefined;
+          if (cameraOn && cam && cfg.omni.send_image) {
+            try {
+              imagePath = await captureFrame(cam, ffmpeg);
+            } catch (e) {
+              console.log(chalk.yellow(`  (no camera frame: ${(e as Error).message})`));
+            }
+          }
+          const spinner = new Spinner(thinkingWord(), 0);
+          spinner.begin();
+          let reply = "";
+          try {
+            reply = await askOmni(
+              { model: cfg.omni.model, text: OMNI_INSTRUCTION, audioPath: wav, imagePath, maxTokens: cfg.model.max_tokens },
+              cfg
+            );
+          } finally {
+            spinner.stop();
+          }
+          console.log(chalk.green("  model › ") + (reply || "(no response)") + "\n");
+          if (reply && tts.ok) await speak(reply, cfg);
+        } catch (e) {
+          console.log(chalk.red(`  [error: ${(e as Error).message}]\n`));
+        } finally {
+          setTimeout(() => {
+            vad.resume();
+            busy = false;
+          }, 400);
+        }
+      },
+      onError: () => {
+        /* ffmpeg stderr noise — ignore */
+      },
+    },
+    { speakDb: -38 },
+    ffmpeg
+  );
+
+  await new Promise<void>((resolve) => {
+    const stdin = process.stdin;
+    const tty = !!stdin.isTTY;
+    if (tty) {
+      readline.emitKeypressEvents(stdin);
+      stdin.setRawMode(true);
+      stdin.resume();
+    }
+    const cleanup = () => {
+      vad.stop();
+      try {
+        if (tty) stdin.setRawMode(false);
+      } catch {
+        /* ignore */
+      }
+      stdin.removeListener("keypress", onKey);
+      console.log(chalk.gray("\n  live session ended.\n"));
+      resolve();
+    };
+    const onKey = (_str: string | undefined, key: readline.Key) => {
+      if (!key) return;
+      if (key.name === "q" || (key.ctrl && key.name === "c")) return cleanup();
+      if (key.name === "c") {
+        if (!cam) return console.log(chalk.yellow("  (no camera)"));
+        cameraOn = !cameraOn;
+        console.log(chalk.gray(`  camera ${cameraOn ? "ON" : "off"}`));
+      }
+      if (key.name === "m") {
+        // toggle listening
+        busy = !busy;
+        if (busy) vad.pause();
+        else vad.resume();
+        console.log(chalk.gray(`  mic ${busy ? "MUTED" : "live"}`));
+      }
+    };
+    if (tty) stdin.on("keypress", onKey);
   });
 }
