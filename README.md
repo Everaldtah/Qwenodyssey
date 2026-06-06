@@ -1,5 +1,11 @@
 # Qwenodyssey
 
+```
+ ▟█▜▛█▙
+ ▜█▟▙█▛
+  ▀▘▝▀
+```
+
 **An Odyssey-class coding harness for Qwen 2.5 7B.**
 
 Qwenodyssey is a local-first CLI coding agent that wraps a small/medium model
