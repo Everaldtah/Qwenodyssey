@@ -136,6 +136,47 @@ const NvidiaConfig = z.object({
   reasoning_budget: z.number().default(4096),
 });
 
+/** Webcam vision: capture a frame and describe it with a vision-language model. */
+const VisionConfig = z.object({
+  enabled: z.boolean().default(true),
+  // Which backend analyzes the captured frame. nvidia/openai use the OpenAI-style
+  // image_url payload; ollama uses its native images field.
+  provider: z.enum(["nvidia", "openai", "ollama"]).default("nvidia"),
+  model: z.string().default("nvidia/nemotron-nano-12b-v2-vl"),
+  // DirectShow camera device name; "" = auto-detect the first dshow video device.
+  device: z.string().default(""),
+  // Ask for confirmation before each capture (the camera is privacy-sensitive).
+  confirm: z.boolean().default(true),
+});
+
+/** Microphone speech-to-text via a local whisper.cpp binary. */
+const AudioConfig = z.object({
+  enabled: z.boolean().default(true),
+  // DirectShow audio device; "" = auto-detect a mic (prefers one matching the camera).
+  device: z.string().default(""),
+  // whisper.cpp CLI; "" = auto (whisper-cli / whisper-cpp / main on PATH).
+  whisper_bin: z.string().default(""),
+  // ggml model path; "" = ~/.qwenodyssey/models/ggml-base.en.bin.
+  whisper_model: z.string().default(""),
+  // Safety cap on a single push-to-talk recording.
+  max_seconds: z.number().default(30),
+  language: z.string().default("en"),
+  // Voice-activity-detection threshold for continuous listening (whisper-stream).
+  // Higher = needs louder/clearer speech to trigger; lower = more sensitive.
+  vad_threshold: z.number().default(0.6),
+});
+
+/** Spoken replies (text-to-speech). */
+const TtsConfig = z.object({
+  enabled: z.boolean().default(true),
+  // piper = local neural TTS; sapi = built-in Windows voice; none = text only.
+  engine: z.enum(["piper", "sapi", "none"]).default("piper"),
+  // "" = ~/.qwenodyssey/piper/piper/piper.exe
+  piper_bin: z.string().default(""),
+  // "" = ~/.qwenodyssey/piper/voices/en_US-amy-medium.onnx
+  piper_voice: z.string().default(""),
+});
+
 /** Internet search + page fetch. */
 const WebConfig = z.object({
   enabled: z.boolean().default(true),
@@ -156,6 +197,9 @@ export const ConfigSchema = z.object({
   evolution: EvolutionConfig.default({}),
   lmstudio: LmStudioConfig.default({}),
   nvidia: NvidiaConfig.default({}),
+  vision: VisionConfig.default({}),
+  audio: AudioConfig.default({}),
+  tts: TtsConfig.default({}),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

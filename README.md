@@ -120,6 +120,36 @@ instead of hanging.
 
 See [`docs/providers.md`](docs/providers.md).
 
+## Live voice + vision (`qwenodyssey live`)
+
+Talk to the model out loud and let it see your webcam — senses run locally, the
+frontier model is the brain, the reply is spoken:
+
+```
+🎤 mic ─▶ whisper.cpp (local STT) ─────────┐
+                                            ├─▶ frontier model ─▶ reply ─▶ Piper TTS ─▶ 🔊
+📷 camera ▶ local vision model (Ollama) ────┘
+```
+
+- **Continuous & hands-free:** `whisper-stream` listens with voice-activity
+  detection — just talk, no push-to-talk. Listening mutes itself while the model
+  speaks so it doesn't hear its own voice.
+- **Local vision:** a fresh frame is captured per turn and described by a local
+  Ollama model (e.g. `moondream`); the description (not the image) is sent to the
+  brain. Toggle the camera with `c`, mute with `m`, quit with `q`.
+- **Spoken replies:** local Piper neural TTS (or `tts.engine = "sapi"` for the
+  built-in Windows voice).
+
+**Setup (Windows):**
+```powershell
+scoop install ffmpeg whisper-cpp          # capture + speech-to-text
+ollama pull moondream                      # local vision
+# whisper model + Piper live under ~/.qwenodyssey/ (models/, piper/)
+qwenodyssey live
+```
+Configure under `[vision]`, `[audio]`, `[tts]` (see the sample config). Frames and
+audio stay on your machine; only extracted text reaches the cloud brain.
+
 ---
 
 ## Commands

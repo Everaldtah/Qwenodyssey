@@ -56,3 +56,27 @@ sandbox = true
 [memory]
 enabled = true
 path = ".qwenodyssey/memory"
+
+# ── Live voice + vision: `qwenodyssey live` (needs ffmpeg + whisper.cpp; vision
+# via Ollama or NIM; TTS via Piper or Windows SAPI). ──
+[vision]
+enabled = true
+provider = "ollama"             # ollama (local) | nvidia | openai
+model = "moondream"             # local: moondream / llava:7b / qwen2.5vl ; NIM: nvidia/nemotron-nano-12b-v2-vl
+device = ""                     # "" = auto-detect first webcam
+confirm = true                  # ask before each capture (chat `look`); live mode ignores this
+
+[audio]
+enabled = true
+device = ""                     # "" = auto-detect mic
+whisper_bin = ""                # "" = auto (whisper-cli on PATH)
+whisper_model = ""              # "" = ~/.qwenodyssey/models/ggml-base.en.bin
+max_seconds = 30
+language = "en"
+vad_threshold = 0.6             # continuous-listening sensitivity (whisper-stream)
+
+[tts]
+enabled = true
+engine = "piper"                # piper (local neural) | sapi (Windows built-in) | none
+piper_bin = ""                  # "" = ~/.qwenodyssey/piper/piper/piper.exe
+piper_voice = ""                # "" = ~/.qwenodyssey/piper/voices/en_US-amy-medium.onnx

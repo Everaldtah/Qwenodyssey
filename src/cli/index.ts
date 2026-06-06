@@ -13,6 +13,7 @@ import { testCommand } from "./commands/test";
 import { applyCommand } from "./commands/apply";
 import { memoryCommand } from "./commands/memory";
 import { chatCommand } from "./commands/chat";
+import { liveCommand } from "./commands/live";
 
 const program = new Command();
 
@@ -102,6 +103,11 @@ program
   .command("chat")
   .description("Interactive pair-coding chat (streaming)")
   .action((_o, cmd) => chatCommand(globals(cmd)));
+
+program
+  .command("live")
+  .description("Talk to the model out loud and let it see your webcam (push-to-talk voice + vision)")
+  .action((_o, cmd) => liveCommand(globals(cmd)));
 
 // Bare `qwenodyssey` (no subcommand) drops straight into interactive chat,
 // the same as `qwenodyssey chat`.
