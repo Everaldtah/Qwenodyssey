@@ -95,6 +95,8 @@ export function createNvidiaProvider(config: Config, model: string): Provider {
     topP: m.top_p,
     maxTokens: m.max_tokens,
     contextTokens: m.context_tokens,
+    disableThinking: config.nvidia.disable_thinking,
+    requestTimeoutMs: config.nvidia.request_timeout_ms,
   });
 }
 

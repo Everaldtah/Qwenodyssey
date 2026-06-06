@@ -21,6 +21,7 @@ const ModelConfig = z.object({
   fallback_models: z
     .array(z.string())
     .default([
+      "nvidia:deepseek-ai/deepseek-v4-pro",
       "nvidia:moonshotai/kimi-k2.6",
       "deepseek-r1:7b",
       "igorls/gemma-4-12B-it-heretic-GGUF",
@@ -122,6 +123,12 @@ const NvidiaConfig = z.object({
   api_key_env: z.string().default("NVIDIA_API_KEY"),
   // Include the nvidia:* refs from fallback_models in the runtime fallback chain.
   include_as_fallback: z.boolean().default(true),
+  // For thinking models (kimi, deepseek-v4, r1…) send chat_template_kwargs.thinking=false.
+  // On NIM the thinking path degenerates/leaks raw CoT; disabling it gives clean answers.
+  disable_thinking: z.boolean().default(true),
+  // Abort a NIM request after this many ms so a hung/slow hosted model (e.g.
+  // deepseek-v4-pro can stall) fails over to the next model in the chain.
+  request_timeout_ms: z.number().default(90000),
 });
 
 /** Internet search + page fetch. */

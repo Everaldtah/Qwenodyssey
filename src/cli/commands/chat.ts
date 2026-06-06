@@ -714,7 +714,7 @@ async function resolveStartupModel(s: Session): Promise<void> {
 
 /** Heuristic: does this provider error mean the requested model is unavailable? */
 function looksUnavailable(err: Error): boolean {
-  return /not found|no such model|unknown model|failed to load|unable to load|cannot load|404|model .* does not exist|try pulling|connection refused|fetch failed|ECONNREFUSED|HTTP 50\d|out of memory|insufficient (memory|vram)|unsupported|no space|401|403|429|unauthorized|forbidden|invalid api key|api key|rate.?limit|quota/i.test(
+  return /not found|no such model|unknown model|failed to load|unable to load|cannot load|404|model .* does not exist|try pulling|connection refused|fetch failed|ECONNREFUSED|HTTP 50\d|out of memory|insufficient (memory|vram)|unsupported|no space|401|403|429|unauthorized|forbidden|invalid api key|api key|rate.?limit|quota|timed out|timeout|aborted/i.test(
     err.message
   );
 }

@@ -23,6 +23,10 @@ export interface ProviderConfig {
   gpuLayers?: number;
   lowVram?: boolean;
   keepAlive?: string;
+  /** Disable a thinking model's chain-of-thought (sends chat_template_kwargs.thinking=false). */
+  disableThinking?: boolean;
+  /** Abort a request after this many ms (0/undefined = no timeout). Used for cloud backends. */
+  requestTimeoutMs?: number;
 }
 
 export abstract class OpenAICompatibleProvider implements Provider {
@@ -109,14 +113,45 @@ export abstract class OpenAICompatibleProvider implements Provider {
         function: { name: t.name, description: t.description, parameters: t.parameters },
       }));
     }
+    Object.assign(body, this.extraBody());
     return body;
+  }
+
+  /**
+   * Extra provider-specific request-body fields merged into every request
+   * (e.g. NVIDIA NIM's `chat_template_kwargs`). Default: none.
+   */
+  protected extraBody(): Record<string, unknown> {
+    return {};
+  }
+
+  /**
+   * fetch with an optional request timeout (cfg.requestTimeoutMs). A hung/slow
+   * endpoint then fails fast with a clear "timed out" error instead of blocking
+   * the whole turn — which the chat layer treats as "unavailable" and falls back.
+   */
+  protected async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+    const ms = this.cfg.requestTimeoutMs;
+    if (!ms || ms <= 0) return fetch(url, init);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try {
+      return await fetch(url, { ...init, signal: ctrl.signal });
+    } catch (err) {
+      if ((err as any)?.name === "AbortError") {
+        throw new Error(`${this.name} request timed out after ${ms}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async generate(
     messages: Message[],
     options: ModelOptions = {}
   ): Promise<GenerateResult> {
-    const res = await fetch(`${this.apiBase()}/chat/completions`, {
+    const res = await this.fetchWithTimeout(`${this.apiBase()}/chat/completions`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(this.body(messages, options, false)),

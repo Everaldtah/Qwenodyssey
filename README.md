@@ -101,10 +101,17 @@ setx NVIDIA_API_KEY "nvapi-..."
 qwenodyssey config set model.provider nvidia
 qwenodyssey config set model.model moonshotai/kimi-k2.6
 ```
-`nvidia:<model>` refs also work in `fallback_models` (the default chain includes
-`nvidia:moonshotai/kimi-k2.6`, used automatically only when a key is present).
-Endpoint: `https://integrate.api.nvidia.com/v1`. If the key is missing or the call
-fails (auth/quota/network), Qwenodyssey transparently falls back to a local model.
+`nvidia:<model>` refs also work in `fallback_models`. Endpoint:
+`https://integrate.api.nvidia.com/v1`. If the key is missing or a call fails
+(auth/quota/network/**timeout**), Qwenodyssey transparently falls back to the next
+model in the chain.
+
+Notes on NIM models: **reliable** picks are `qwen/qwen3-coder-480b-a35b-instruct`
+(coding-focused) and `meta/llama-3.3-70b-instruct`. Thinking models
+(`moonshotai/kimi-k2.6`, `deepseek-ai/deepseek-v4-pro`, `*-r1`) degenerate or leak
+raw chain-of-thought on NIM, so `[nvidia].disable_thinking` (default on) sends
+`chat_template_kwargs.thinking=false` for them; `[nvidia].request_timeout_ms`
+(default 90s) makes a stalled hosted model fail over instead of hanging.
 
 See [`docs/providers.md`](docs/providers.md).
 
