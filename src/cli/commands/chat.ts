@@ -9,7 +9,13 @@ import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
 import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS } from "../chatTools";
 import { createPrompt, selectFromList, SlashCommand, SelectItem } from "../prompt";
-import { createProvider, createLmStudioProvider } from "../../providers";
+import {
+  createProvider,
+  createLmStudioProvider,
+  createNvidiaProvider,
+  createOllamaProvider,
+  resolveNvidiaKey,
+} from "../../providers";
 import { KnowledgeBase } from "../../core/knowledge";
 import { EvolutionEngine, TurnSignals } from "../../core/evolution";
 import { createKnowledgeTools } from "../../tools/knowledgeTools";
@@ -533,11 +539,19 @@ function lmsPort(baseUrl: string): number {
   return m ? Number(m[1]) : 1234;
 }
 
-/** A fallback/picker entry is "lmstudio:<key>" for LM Studio, else an Ollama tag. */
-function parseModelRef(ref: string): { kind: "ollama" | "lmstudio"; model: string } {
-  return ref.startsWith("lmstudio:")
-    ? { kind: "lmstudio", model: ref.slice("lmstudio:".length) }
-    : { kind: "ollama", model: ref };
+/**
+ * A fallback/picker entry is "lmstudio:<key>" for LM Studio, "nvidia:<model>" for
+ * the NVIDIA NIM cloud endpoint, else a bare Ollama tag.
+ */
+function parseModelRef(ref: string): { kind: "ollama" | "lmstudio" | "nvidia"; model: string } {
+  if (ref.startsWith("lmstudio:")) return { kind: "lmstudio", model: ref.slice("lmstudio:".length) };
+  if (ref.startsWith("nvidia:")) return { kind: "nvidia", model: ref.slice("nvidia:".length) };
+  return { kind: "ollama", model: ref };
+}
+
+/** Is an NVIDIA NIM API key available (config or env)? Cloud refs need it. */
+function nvidiaKeyPresent(s: Session): boolean {
+  return !!resolveNvidiaKey(s.config);
 }
 
 /**
@@ -548,6 +562,10 @@ function parseModelRef(ref: string): { kind: "ollama" | "lmstudio"; model: strin
  */
 async function applyModelRef(s: Session, ref: string): Promise<void> {
   const { kind, model } = parseModelRef(ref);
+  if (kind === "nvidia") {
+    s.provider = createNvidiaProvider(s.config, model);
+    return;
+  }
   if (kind === "lmstudio") {
     if (s.config.lmstudio.safe_load) {
       try {
@@ -567,8 +585,11 @@ async function applyModelRef(s: Session, ref: string): Promise<void> {
     }
     s.provider = createLmStudioProvider(s.config, model);
   } else {
-    if (s.provider.name !== "ollama") s.provider = createProvider(s.config);
-    s.provider.setModel?.(model);
+    // Always build a real Ollama provider here: the configured primary provider
+    // may be nvidia/openai/etc., so createProvider(s.config) would rebuild the
+    // wrong backend. createOllamaProvider targets Ollama regardless.
+    if (s.provider.name !== "ollama") s.provider = createOllamaProvider(s.config, model);
+    else s.provider.setModel?.(model);
   }
 }
 
@@ -583,9 +604,20 @@ function fallbackChain(s: Session): string[] {
   if (s.config.lmstudio.enabled && s.config.lmstudio.include_as_fallback) {
     refs.push(...s.lmsModelKeys.map((k) => `lmstudio:${k}`));
   }
-  return refs.filter(
-    (m) => m && m.toLowerCase() !== s.provider.model.toLowerCase() && !seen.has(m) && seen.add(m)
-  );
+  const nvidiaOk =
+    s.config.nvidia.enabled && s.config.nvidia.include_as_fallback && nvidiaKeyPresent(s);
+  const activeKind: "ollama" | "lmstudio" | "nvidia" =
+    s.provider.name === "nvidia" ? "nvidia" : s.provider.name === "lmstudio" ? "lmstudio" : "ollama";
+  return refs.filter((ref) => {
+    if (!ref) return false;
+    const { kind, model } = parseModelRef(ref);
+    if (kind === "nvidia" && !nvidiaOk) return false; // cloud needs a key
+    // Drop the currently-active backend+model so we never "fall back" to it.
+    if (kind === activeKind && model.toLowerCase() === s.provider.model.toLowerCase()) return false;
+    if (seen.has(ref)) return false;
+    seen.add(ref);
+    return true;
+  });
 }
 
 /**
@@ -594,32 +626,47 @@ function fallbackChain(s: Session): string[] {
  * LM Studio model present). Best-effort.
  */
 async function resolveStartupModel(s: Session): Promise<void> {
+  // NVIDIA cloud primary: usable as long as we have an API key (assume reachable).
+  if (s.provider.name === "nvidia") {
+    if (nvidiaKeyPresent(s)) return;
+    console.log(
+      chalk.yellow(
+        `⚠ "${s.config.model.model}" needs an NVIDIA API key (set NVIDIA_API_KEY or [nvidia].api_key) — not found. Trying local fallbacks.`
+      )
+    );
+  }
+
   const chain = fallbackChain(s);
   if (!chain.length) return;
 
-  let installed: ModelInfo[] = [];
+  // Ollama's installed tags, gathered independently of the active provider so we
+  // can judge Ollama fallbacks even when the primary is a cloud/LM Studio backend.
+  let ollamaTags: ModelInfo[] = [];
   try {
-    if (s.provider.listModels) installed = await s.provider.listModels();
+    const op = s.provider.name === "ollama" ? s.provider : createOllamaProvider(s.config, s.provider.model);
+    if (op.listModels) ollamaTags = await op.listModels();
   } catch {
-    /* keep going — we can still consider LM Studio fallbacks */
+    /* Ollama may be down — we can still consider LM Studio / NVIDIA fallbacks */
   }
   const ollamaHas = (name: string) => {
     const n = name.toLowerCase();
-    return installed.some((m) => m.name.toLowerCase() === n || m.name.toLowerCase().startsWith(n));
+    return ollamaTags.some((m) => m.name.toLowerCase() === n || m.name.toLowerCase().startsWith(n));
   };
   const available = (ref: string) => {
     const { kind, model } = parseModelRef(ref);
-    return kind === "lmstudio" ? s.lmsModelKeys.includes(model) : ollamaHas(model);
+    if (kind === "lmstudio") return s.lmsModelKeys.includes(model);
+    if (kind === "nvidia") return nvidiaKeyPresent(s);
+    return ollamaHas(model);
   };
 
   if (s.provider.name === "ollama" && ollamaHas(s.provider.model)) return; // primary ok
-  if (installed.length === 0 && s.provider.name === "ollama") return; // can't tell
+  if (s.provider.name === "ollama" && ollamaTags.length === 0) return; // Ollama down — can't tell
 
   const pick = chain.find(available);
   if (pick) {
     await applyModelRef(s, pick);
     console.log(chalk.yellow(`⚠ "${s.config.model.model}" not available — using fallback "${pick}".`));
-  } else if (installed.length) {
+  } else if (ollamaTags.length || s.provider.name !== "ollama") {
     console.log(
       chalk.yellow(`⚠ "${s.config.model.model}" and all fallbacks are unavailable. Pick one with /model.`)
     );
@@ -628,7 +675,7 @@ async function resolveStartupModel(s: Session): Promise<void> {
 
 /** Heuristic: does this provider error mean the requested model is unavailable? */
 function looksUnavailable(err: Error): boolean {
-  return /not found|no such model|unknown model|failed to load|unable to load|cannot load|404|model .* does not exist|try pulling|connection refused|fetch failed|ECONNREFUSED|HTTP 50\d|out of memory|insufficient (memory|vram)|unsupported|no space/i.test(
+  return /not found|no such model|unknown model|failed to load|unable to load|cannot load|404|model .* does not exist|try pulling|connection refused|fetch failed|ECONNREFUSED|HTTP 50\d|out of memory|insufficient (memory|vram)|unsupported|no space|401|403|429|unauthorized|forbidden|invalid api key|api key|rate.?limit|quota/i.test(
     err.message
   );
 }
@@ -952,7 +999,7 @@ function indent(text: string): string {
 }
 
 interface ModelEntry {
-  ref: string; // "lmstudio:<key>" or an ollama tag
+  ref: string; // "lmstudio:<key>", "nvidia:<model>", or a bare ollama tag
   label: string; // display name
   hint: string; // size / backend tag
   current: boolean;
@@ -996,6 +1043,25 @@ async function gatherModelEntries(s: Session, cached: ModelInfo[]): Promise<Mode
       }
     } catch {
       /* LM Studio optional */
+    }
+  }
+
+  // NVIDIA NIM cloud models (the configured primary and any nvidia:* fallbacks),
+  // shown only when an API key is available.
+  if (s.config.nvidia.enabled && nvidiaKeyPresent(s)) {
+    const nvModels = new Set<string>();
+    if (s.config.model.provider === "nvidia") nvModels.add(s.config.model.model);
+    for (const ref of s.config.model.fallback_models ?? []) {
+      const t = ref.trim();
+      if (t.startsWith("nvidia:")) nvModels.add(t.slice("nvidia:".length));
+    }
+    for (const model of nvModels) {
+      entries.push({
+        ref: `nvidia:${model}`,
+        label: model,
+        hint: "nvidia · cloud",
+        current: s.provider.name === "nvidia" && model === s.provider.model,
+      });
     }
   }
   return entries;

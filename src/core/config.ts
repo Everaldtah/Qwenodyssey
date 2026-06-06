@@ -10,15 +10,21 @@ export const WORKSPACE_DIR = ".qwenodyssey";
 
 const ModelConfig = z.object({
   provider: z
-    .enum(["ollama", "lmstudio", "openai", "vllm", "llamacpp"])
+    .enum(["ollama", "lmstudio", "openai", "vllm", "llamacpp", "nvidia"])
     .default("ollama"),
   model: z.string().default("qwen2.5:7b"),
   // Ordered fallback chain: tried in turn if `model` isn't installed at launch,
   // or when a request fails because the active model is unavailable. The first
   // installed/working one wins. Empty list disables fallback.
+  // Refs are bare Ollama tags, "lmstudio:<key>", or "nvidia:<model>" (cloud NIM —
+  // only used when an NVIDIA API key is configured; skipped otherwise).
   fallback_models: z
     .array(z.string())
-    .default(["deepseek-r1:7b", "igorls/gemma-4-12B-it-heretic-GGUF"]),
+    .default([
+      "nvidia:moonshotai/kimi-k2.6",
+      "deepseek-r1:7b",
+      "igorls/gemma-4-12B-it-heretic-GGUF",
+    ]),
   base_url: z.string().default("http://localhost:11434"),
   api_key: z.string().default(""),
   temperature: z.number().default(0.2),
@@ -99,6 +105,25 @@ const EvolutionConfig = z.object({
   reflect_on_failure: z.boolean().default(true),
 });
 
+/**
+ * NVIDIA NIM cloud endpoint (OpenAI-compatible, https://integrate.api.nvidia.com).
+ * Lets a powerful hosted model (e.g. moonshotai/kimi-k2.6) act as the primary
+ * brain or a fallback. The API key is a SECRET — never commit it: leave it blank
+ * here and set the NVIDIA_API_KEY environment variable, or put it only in your
+ * user-level ~/.qwenodyssey/config.toml (which lives outside the repo).
+ */
+const NvidiaConfig = z.object({
+  enabled: z.boolean().default(true),
+  base_url: z.string().default("https://integrate.api.nvidia.com"),
+  // Prefer leaving blank + using the env var below. If set here, keep it OUT of
+  // any committed config file (public repo).
+  api_key: z.string().default(""),
+  // Environment variable to read the key from when api_key is blank.
+  api_key_env: z.string().default("NVIDIA_API_KEY"),
+  // Include the nvidia:* refs from fallback_models in the runtime fallback chain.
+  include_as_fallback: z.boolean().default(true),
+});
+
 /** Internet search + page fetch. */
 const WebConfig = z.object({
   enabled: z.boolean().default(true),
@@ -118,6 +143,7 @@ export const ConfigSchema = z.object({
   web: WebConfig.default({}),
   evolution: EvolutionConfig.default({}),
   lmstudio: LmStudioConfig.default({}),
+  nvidia: NvidiaConfig.default({}),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

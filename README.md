@@ -91,6 +91,21 @@ qwenodyssey config set model.base_url https://your-endpoint
 qwenodyssey config set model.api_key sk-...        # or env QWENODYSSEY_API_KEY
 ```
 
+### NVIDIA NIM (cloud)
+Use a strong hosted model (e.g. `moonshotai/kimi-k2.6`) as the primary brain or a
+fallback. Set your key via the `NVIDIA_API_KEY` environment variable — **never commit it**.
+```bash
+# PowerShell (persisted for your user):
+setx NVIDIA_API_KEY "nvapi-..."
+# then, in a new shell:
+qwenodyssey config set model.provider nvidia
+qwenodyssey config set model.model moonshotai/kimi-k2.6
+```
+`nvidia:<model>` refs also work in `fallback_models` (the default chain includes
+`nvidia:moonshotai/kimi-k2.6`, used automatically only when a key is present).
+Endpoint: `https://integrate.api.nvidia.com/v1`. If the key is missing or the call
+fails (auth/quota/network), Qwenodyssey transparently falls back to a local model.
+
 See [`docs/providers.md`](docs/providers.md).
 
 ---

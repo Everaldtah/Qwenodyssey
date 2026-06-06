@@ -2,7 +2,7 @@
 # (or run `qwenodyssey init`) and adjust.
 
 [model]
-provider = "ollama"            # ollama | lmstudio | openai | vllm | llamacpp
+provider = "ollama"            # ollama | lmstudio | openai | vllm | llamacpp | nvidia
 model = "qwen2.5-coder:7b"
 base_url = "http://localhost:11434"
 api_key = ""                    # or set env QWENODYSSEY_API_KEY
@@ -10,6 +10,20 @@ temperature = 0.2
 top_p = 0.9
 max_tokens = 4096
 context_tokens = 8192           # total context window of the model
+# Ordered fallback chain. Bare tag = Ollama; "lmstudio:<key>" = LM Studio;
+# "nvidia:<model>" = NVIDIA NIM cloud (only used when an NVIDIA key is set).
+fallback_models = ["nvidia:moonshotai/kimi-k2.6", "deepseek-r1:7b"]
+
+# NVIDIA NIM cloud endpoint (OpenAI-compatible). Use a strong hosted model such as
+# moonshotai/kimi-k2.6 as the primary brain (provider = "nvidia", model = "...")
+# or just as a fallback (above). The API key is a SECRET — DO NOT commit it here.
+# Leave api_key blank and set the NVIDIA_API_KEY environment variable instead.
+[nvidia]
+enabled = true
+base_url = "https://integrate.api.nvidia.com"
+api_key = ""                    # leave blank; set env NVIDIA_API_KEY
+api_key_env = "NVIDIA_API_KEY"
+include_as_fallback = true
 
 [agent]
 max_retries = 4
