@@ -14,6 +14,8 @@ import { applyCommand } from "./commands/apply";
 import { memoryCommand } from "./commands/memory";
 import { chatCommand } from "./commands/chat";
 import { liveCommand } from "./commands/live";
+import { mictestCommand } from "./commands/mictest";
+import { miclevelCommand } from "./commands/miclevel";
 
 const program = new Command();
 
@@ -106,8 +108,18 @@ program
 
 program
   .command("live")
-  .description("Talk to the model out loud and let it see your webcam (push-to-talk voice + vision)")
+  .description("Talk to the model out loud and let it see your webcam (continuous voice + vision)")
   .action((_o, cmd) => liveCommand(globals(cmd)));
+
+program
+  .command("mictest")
+  .description("Record your voice and test local transcription + the omni model's audio support")
+  .action((_o, cmd) => mictestCommand(globals(cmd)));
+
+program
+  .command("miclevel")
+  .description("Live animated mic VU meter — confirm the microphone hears you")
+  .action((_o, cmd) => miclevelCommand(globals(cmd)));
 
 // Bare `qwenodyssey` (no subcommand) drops straight into interactive chat,
 // the same as `qwenodyssey chat`.

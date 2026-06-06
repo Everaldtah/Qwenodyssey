@@ -34,15 +34,23 @@ const LIVE_SYSTEM =
   "them as your own eyes, not the user's words. Your replies are SPOKEN ALOUD, so be brief, natural, " +
   "and conversational; avoid code blocks, lists, and long output unless asked.";
 
-/** Strip ANSI, surrounding brackets/timestamps, and decide if a line is real speech. */
-function cleanUtterance(raw: string): string {
-  let t = raw.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").trim();
-  t = t.replace(/^\[[0-9:.\s\->]+\]\s*/, ""); // drop a leading [00:00:00 --> ...] timestamp
-  // whisper-stream status/markers we should ignore.
-  if (/^\[(start speaking|2k|silence|blank_audio|.*?_)\]?/i.test(t)) return "";
-  if (/^[\[(](blank_audio|inaudible|music|silence)[\])]$/i.test(t)) return "";
-  t = t.replace(/^[\s.\-]+/, "").trim();
-  return /[a-z0-9]/i.test(t) ? t : "";
+/**
+ * whisper-stream (--step 0 / VAD) prints each utterance as a block:
+ *   ### Transcription N START | t0 = … | t1 = …
+ *   <the transcribed text, possibly several lines>
+ *   ### Transcription N END
+ * We capture the text BETWEEN the markers — never the marker line itself.
+ */
+const RE_START = /^###\s*Transcription\s+\d+\s+START/i;
+const RE_END = /^###\s*Transcription\s+\d+\s+END/i;
+
+/** Clean a captured segment: drop ANSI, bracketed non-speech tags, leading dots. */
+function extractSpeech(seg: string): string {
+  let t = seg.replace(/\x1b\[[0-9;]*[A-Za-z]/g, " ");
+  t = t.replace(/\[(?:blank_audio|inaudible|music|silence|noise|sound)\]/gi, " ");
+  t = t.replace(/\s+/g, " ").replace(/^[\s.\-]+/, "").trim();
+  // Need at least a couple of word characters to count as a real utterance.
+  return (t.match(/[a-z0-9]/gi)?.length ?? 0) >= 2 ? t : "";
 }
 
 export async function liveCommand(opts: GlobalOpts): Promise<void> {
@@ -128,11 +136,33 @@ export async function liveCommand(opts: GlobalOpts): Promise<void> {
   };
 
   const rlOut = readline.createInterface({ input: ws.stdout });
-  rlOut.on("line", (line) => {
-    const text = cleanUtterance(line);
+  let capturing = false;
+  let segBuf = "";
+  const handle = (utterance: string) => {
+    const text = extractSpeech(utterance);
     if (!text) return;
-    if (muted || busy || Date.now() < mutedUntil) return;
+    if (muted || busy || Date.now() < mutedUntil) return; // don't hear our own voice
     void respond(text);
+  };
+  rlOut.on("line", (raw) => {
+    const line = raw.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").trim();
+    if (RE_START.test(line)) {
+      capturing = true;
+      segBuf = "";
+      return;
+    }
+    if (RE_END.test(line)) {
+      capturing = false;
+      const seg = segBuf;
+      segBuf = "";
+      return handle(seg);
+    }
+    if (capturing) {
+      segBuf += " " + line;
+      return;
+    }
+    // Some builds print text inline without END markers — handle stray lines too.
+    if (line && !line.startsWith("###")) handle(line);
   });
 
   // ── Control keys on our own stdin (whisper-stream captures audio via SDL, not stdin). ──

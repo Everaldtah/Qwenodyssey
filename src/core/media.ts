@@ -166,6 +166,64 @@ export function startRecording(device: string, maxSeconds: number, ffmpeg = reso
   };
 }
 
+export interface LevelMeter {
+  stop(): void;
+}
+
+/**
+ * Stream live microphone loudness (RMS dB) from ffmpeg's astats filter. Calls
+ * onLevel ~10×/sec with a value roughly in [-90, 0] dB (−90 ≈ silence). Used to
+ * draw a VU meter so the user can see their mic is actually picking up sound.
+ */
+export function startLevelMeter(
+  device: string,
+  onLevel: (db: number) => void,
+  ffmpeg = resolveFfmpeg()
+): LevelMeter {
+  const sub = execa(
+    ffmpeg,
+    [
+      "-hide_banner",
+      "-f",
+      "dshow",
+      "-i",
+      `audio=${device}`,
+      "-af",
+      // ~0.1s windows → ~10 updates/sec, RMS level printed to stderr.
+      "aresample=16000,asetnsamples=n=1600:p=0,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+      "-f",
+      "null",
+      "-",
+    ],
+    { reject: false, buffer: false }
+  );
+  sub.catch(() => {});
+  const rl = sub.stderr ? readlineLines(sub.stderr) : null;
+  rl?.on("line", (line: string) => {
+    const m = line.match(/RMS_level=(-?inf|-?\d+(?:\.\d+)?)/i);
+    if (!m) return;
+    const db = /inf/i.test(m[1]) ? -90 : Number(m[1]);
+    if (!Number.isNaN(db)) onLevel(db);
+  });
+  return {
+    stop() {
+      rl?.close();
+      try {
+        sub.kill();
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+}
+
+/** Tiny helper: line-reader over a stream without pulling in extra deps at call sites. */
+function readlineLines(stream: NodeJS.ReadableStream) {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const readline = require("readline") as typeof import("readline");
+  return readline.createInterface({ input: stream });
+}
+
 /**
  * Transcribe a WAV with whisper.cpp. Writes a .txt next to a temp base and returns
  * the trimmed text. Throws if the binary/model is missing.

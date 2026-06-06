@@ -166,6 +166,21 @@ const AudioConfig = z.object({
   vad_threshold: z.number().default(0.6),
 });
 
+/**
+ * Omni mode: a single multimodal NIM model does everything — it ingests the mic
+ * audio AND the camera frame directly and replies (no separate local STT/vision).
+ * Audio + frames are uploaded to the cloud model in this mode.
+ */
+const OmniConfig = z.object({
+  enabled: z.boolean().default(false),
+  // Multimodal model that accepts input_audio (+ images). phi-4-multimodal does
+  // text+image+audio; nemotron-3-nano-omni is the NVIDIA omni option.
+  model: z.string().default("microsoft/phi-4-multimodal-instruct"),
+  provider: z.enum(["nvidia", "openai"]).default("nvidia"),
+  // Send the camera frame alongside the audio each turn.
+  send_image: z.boolean().default(true),
+});
+
 /** Spoken replies (text-to-speech). */
 const TtsConfig = z.object({
   enabled: z.boolean().default(true),
@@ -200,6 +215,7 @@ export const ConfigSchema = z.object({
   vision: VisionConfig.default({}),
   audio: AudioConfig.default({}),
   tts: TtsConfig.default({}),
+  omni: OmniConfig.default({}),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
