@@ -175,6 +175,113 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
   };
 }
 
+export interface Interjector {
+  /** Temporarily release stdin (e.g. while a y/N confirm prompt runs). */
+  suspend(): void;
+  /** Re-attach after suspend(). */
+  resume(): void;
+  /** Detach for good and restore the terminal. */
+  stop(): void;
+}
+
+/**
+ * Capture "on the side" interjections the user types WHILE the assistant is
+ * working (the `/btw` side-channel). Runs in raw mode for the duration of a turn;
+ * each completed line is handed to onSubmit so the caller can queue it. While the
+ * user is mid-line, onStartTyping/onStopTyping let the caller pause/resume the
+ * spinner so typed text isn't clobbered. TTY-only — returns null otherwise (you
+ * can't type concurrently into a pipe anyway).
+ */
+export function captureInterjections(opts: {
+  label: string;
+  onSubmit: (text: string) => void;
+  onStartTyping?: () => void;
+  onStopTyping?: () => void;
+}): Interjector | null {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) return null;
+  readline.emitKeypressEvents(stdin);
+
+  let buf = "";
+  let typing = false;
+  let attached = false;
+
+  const redraw = (): void => {
+    process.stdout.write("\r\x1b[2K" + opts.label + buf);
+  };
+
+  const beginTyping = () => {
+    if (typing) return;
+    typing = true;
+    opts.onStartTyping?.();
+    process.stdout.write("\n");
+  };
+  const endTyping = () => {
+    typing = false;
+    buf = "";
+    opts.onStopTyping?.();
+  };
+
+  const onKey = (str: string | undefined, key: readline.Key): void => {
+    if (key && key.ctrl && key.name === "c") {
+      detach();
+      process.exit(130); // preserve Ctrl-C = interrupt during a turn
+    }
+    if (key && (key.name === "return" || key.name === "enter")) {
+      if (!typing) return;
+      const text = buf.trim();
+      process.stdout.write("\r\x1b[2K"); // clear the input line
+      endTyping();
+      if (text) opts.onSubmit(text);
+      return;
+    }
+    if (key && key.name === "backspace") {
+      if (!typing) return;
+      buf = buf.slice(0, -1);
+      redraw();
+      return;
+    }
+    // Printable text (single char or pasted run).
+    if (str && !(key && (key.ctrl || key.meta)) && !/[\x00-\x1f\x7f]/.test(str)) {
+      beginTyping();
+      buf += str;
+      redraw();
+    }
+  };
+
+  const attach = () => {
+    if (attached) return;
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("keypress", onKey);
+    attached = true;
+  };
+  const detach = () => {
+    if (!attached) return;
+    stdin.removeListener("keypress", onKey);
+    try {
+      stdin.setRawMode(false);
+    } catch {
+      /* not a TTY anymore */
+    }
+    stdin.pause();
+    attached = false;
+  };
+
+  attach();
+  return {
+    suspend: detach,
+    resume: () => {
+      attach();
+      if (typing) redraw();
+    },
+    stop: () => {
+      if (typing) process.stdout.write("\r\x1b[2K");
+      detach();
+    },
+  };
+}
+
 export interface SelectItem {
   label: string;
   hint?: string;

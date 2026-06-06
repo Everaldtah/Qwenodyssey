@@ -90,6 +90,21 @@ export class Spinner {
     if (process.stdout.isTTY) process.stdout.write("\r\x1b[2K");
   }
 
+  /** Temporarily clear + halt the animation (e.g. while the user types an aside). */
+  pause(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    if (process.stdout.isTTY) process.stdout.write("\r\x1b[2K");
+  }
+
+  /** Resume after pause() without resetting the elapsed clock. */
+  resume(): void {
+    if (!process.stdout.isTTY || this.timer) return;
+    this.draw();
+    this.timer = setInterval(() => this.draw(), 140);
+    this.timer.unref?.();
+  }
+
   private draw(): void {
     const secs = Math.floor((Date.now() - this.startedAt) / 1000);
     const glyph = Spinner.FRAMES[this.frame++ % Spinner.FRAMES.length];

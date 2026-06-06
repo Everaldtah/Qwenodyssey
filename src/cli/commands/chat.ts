@@ -8,7 +8,7 @@ import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
 import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS } from "../chatTools";
-import { createPrompt, selectFromList, SlashCommand, SelectItem } from "../prompt";
+import { createPrompt, selectFromList, captureInterjections, SlashCommand, SelectItem } from "../prompt";
 import {
   createProvider,
   createLmStudioProvider,
@@ -328,8 +328,17 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   const meter = new TokenMeter();
 
   for (;;) {
-    const line = (await ask()).trim();
+    let line = (await ask()).trim();
     if (!line) continue;
+    // `/btw` is mainly for typing WHILE the model works; at the prompt it's just a
+    // normal question, so strip the prefix and fall through to a regular turn.
+    if (line === "/btw") {
+      console.log(
+        chalk.gray("  /btw <question> — ask an aside; also type it while the model is working to queue it\n")
+      );
+      continue;
+    }
+    if (/^\/btw\s+/i.test(line)) line = line.replace(/^\/btw\s+/i, "").trim();
     if (line === "/exit" || line === "/quit") break;
     if (line === "/reset") {
       history.length = 1;
@@ -436,6 +445,43 @@ async function runAssistantTurn(
   const reasoning = isReasoningModel(s.provider.model);
   const failures: string[] = [];
   const seenCalls = new Set<string>();
+
+  // ── /btw side-channel ──────────────────────────────────────────────────────
+  // Let the user type an aside WHILE the model is working. Each line is queued
+  // and injected as a user message at the next step boundary, so the model
+  // addresses it without the user waiting for the whole task to finish.
+  const pending: string[] = [];
+  let currentSpinner: Spinner | undefined;
+  const interject = captureInterjections({
+    label: chalk.yellow("btw › "),
+    onStartTyping: () => currentSpinner?.pause(),
+    onStopTyping: () => currentSpinner?.resume(),
+    onSubmit: (text) => {
+      const t = text.replace(/^\/btw\b\s*/i, "").trim();
+      if (!t) return;
+      pending.push(t);
+      console.log("\n" + chalk.yellow("  ↩ noted — I'll address that next step: ") + chalk.gray(t) + "\n");
+    },
+  });
+  // A y/N confirm prompt borrows stdin, so release the capture around it.
+  const askGuarded = async (): Promise<string> => {
+    interject?.suspend();
+    try {
+      return await ask();
+    } finally {
+      interject?.resume();
+    }
+  };
+  const drainPending = (): void => {
+    while (pending.length) {
+      const t = pending.shift()!;
+      history.push({
+        role: "user",
+        content: `[Side question from the user, sent while you were working — address it too, then carry on]: ${t}`,
+      });
+    }
+  };
+
   const runCall = async (call: ToolCall): Promise<void> => {
     // Loop guard: if the model repeats an IDENTICAL tool call it's stuck (e.g.
     // calling shell_help over and over). Don't re-run it — return the result it
@@ -455,7 +501,7 @@ async function runAssistantTurn(
       return;
     }
     seenCalls.add(sig);
-    const r = await executeToolCall(s, tools, call, ask);
+    const r = await executeToolCall(s, tools, call, askGuarded);
     if (!r.ok) {
       const a = JSON.stringify(call.arguments ?? {}).slice(0, 120);
       failures.push(`${call.name} ${a} → ${r.content.slice(0, 200)}`);
@@ -463,10 +509,14 @@ async function runAssistantTurn(
     history.push({ role: "tool", tool_call_id: call.id, name: call.name, content: r.content });
   };
 
+  try {
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
+    // Inject any asides the user typed (/btw) since the last step.
+    if (pending.length) drainPending();
     // Live status: elapsed time + the session's cumulative input tokens so far
     // (real usage; starts at 0 and climbs as the conversation grows).
     const spinner = new Spinner(thinkingWord(), meter.sessionIn);
+    currentSpinner = spinner;
     spinner.begin();
     let res: GenerateResult;
     try {
@@ -477,6 +527,7 @@ async function runAssistantTurn(
       });
     } finally {
       spinner.stop();
+      currentSpinner = undefined;
     }
     meter.record(res); // fold this request's exact usage into the session totals
     const calls = res.toolCalls ?? [];
@@ -536,6 +587,11 @@ async function runAssistantTurn(
       // chain-of-thought). Feeding reasoning back wastes tokens and derails
       // reasoning models on subsequent turns.
       history.push({ role: "assistant", content: answer });
+      // A `/btw` aside arrived while finishing? Address it before ending the turn.
+      if (pending.length) {
+        drainPending();
+        continue;
+      }
       return { userMessage: "", failures, finalAnswer: answer, stepLimitHit: false };
     }
 
@@ -570,6 +626,9 @@ async function runAssistantTurn(
     content: `Reached the ${MAX_TOOL_STEPS}-step tool limit for this turn.`,
   });
   return { userMessage: "", failures, finalAnswer: "", stepLimitHit: true };
+  } finally {
+    interject?.stop();
+  }
 }
 
 /** Port out of an http(s)://host:port base URL (default 1234). */
@@ -810,6 +869,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/model", args: "[name|#]", desc: "Open the model picker, or switch directly to name/number" },
   { name: "/memory", aliases: ["/knowledge"], desc: "Show the long-term knowledge vault (notes & path)" },
   { name: "/lessons", aliases: ["/evolution"], desc: "Show lessons the agent learned from past mistakes" },
+  { name: "/btw", args: "<question>", desc: "Aside — also type it while the model is working to queue it" },
   { name: "/reset", desc: "Clear the conversation history" },
   { name: "/exit", aliases: ["/quit"], desc: "Quit Qwenodyssey" },
 ];
