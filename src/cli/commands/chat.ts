@@ -32,9 +32,34 @@ const TOOL_TEMP = 0;
 /** Reasoning models (R1/QwQ) need a little heat or they loop; ~0.6 is recommended. */
 const REASONING_TEMP = 0.6;
 
-/** Models trained to deliberate with an internal chain-of-thought. */
+/**
+ * Models trained to deliberate with an internal chain-of-thought. These MUST run
+ * with a little heat — at temperature 0 they collapse into repetition loops
+ * ("the user wants to know... the user wants to know..."). Kimi K2/K2.6 are
+ * thinking models and belong here.
+ */
 function isReasoningModel(model: string): boolean {
-  return /(^|[-_/:.])(r1|qwq|o1|o3|thinking|reason)/i.test(model) || /deepseek-r1/i.test(model);
+  return (
+    /(^|[-_/:.])(r1|qwq|o1|o3|thinking|reason|kimi|k2)/i.test(model) ||
+    /deepseek-r1/i.test(model)
+  );
+}
+
+/** Cloud backends, where a hard 0 temperature risks repetition loops. */
+function isCloudProvider(name: string): boolean {
+  return name === "nvidia" || name === "openai";
+}
+
+/**
+ * Effective temperature for a turn:
+ *  - reasoning/thinking models get heat (REASONING_TEMP) — they loop at 0;
+ *  - local non-reasoning models run deterministic (TOOL_TEMP=0) for tool adherence;
+ *  - cloud non-reasoning models get a small floor as anti-degeneration insurance,
+ *    so a model the classifier doesn't recognize can't silently loop at 0.
+ */
+function turnTemperature(s: Session, reasoning: boolean): number {
+  if (reasoning) return REASONING_TEMP;
+  return isCloudProvider(s.provider.name) ? Math.max(TOOL_TEMP, 0.2) : TOOL_TEMP;
 }
 
 /**
@@ -130,8 +155,22 @@ function selfAwareness(
   memoryEnabled: boolean,
   evolutionOn: boolean
 ): string {
+  const backendLabel: Record<string, string> = {
+    ollama: "a local Ollama model",
+    lmstudio: "a local LM Studio model",
+    nvidia: "a cloud model via NVIDIA NIM (integrate.api.nvidia.com)",
+    openai: "an OpenAI-compatible endpoint",
+    vllm: "a local vLLM server",
+    llamacpp: "a local llama.cpp server",
+  };
+  const where = backendLabel[s.provider.name] || `the ${s.provider.name} backend`;
   const lines = [
-    `SELF-AWARENESS — you are "Qwenodyssey", a local AI coding agent running on the user's PC. ` +
+    `SELF-AWARENESS — you are "Qwenodyssey", an AI coding agent running on the user's PC. ` +
+      `RIGHT NOW you are powered by the model "${s.provider.model}" served through ${where} ` +
+      `(provider id: ${s.provider.name}). That is your real identity — if the user asks what model ` +
+      `you are, answer with exactly that; do NOT say you are Qwen 2.5 7B unless that is the model id above. ` +
+      `The active model and backend are set in the user's config (~/.qwenodyssey/config.toml) and can be ` +
+      `changed live with the /model command or "qwenodyssey config set model.*". ` +
       `You have persistent memory AND your own source code on this machine, and you can change both. ` +
       `Never claim you "have no memory", "don't store anything", or "can't modify yourself" — you can.`,
   ];
@@ -432,7 +471,7 @@ async function runAssistantTurn(
     let res: GenerateResult;
     try {
       res = await generateWithFallback(s, history, {
-        temperature: reasoning ? REASONING_TEMP : TOOL_TEMP,
+        temperature: turnTemperature(s, reasoning),
         tools: toolSpecs,
         think: reasoning,
       });
@@ -818,7 +857,7 @@ function renderSettings(s: Session, kb: KnowledgeBase, memoryEnabled: boolean): 
     ["model", `${s.provider.model}  (${s.provider.name} @ ${m.base_url})`],
     ["fallback chain", fbDisplay],
     ["thinking", reasoning ? "deep · native reasoning model" : "step-by-step scaffold"],
-    ["temperature", `${reasoning ? REASONING_TEMP : TOOL_TEMP} active · ${m.temperature} base`],
+    ["temperature", `${turnTemperature(s, reasoning)} active · ${m.temperature} base`],
     ["max output tokens", String(m.max_tokens)],
     ["context budget", String(m.context_tokens)],
     ["gpu", gpuPolicy(s)],

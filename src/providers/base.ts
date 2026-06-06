@@ -60,9 +60,20 @@ export abstract class OpenAICompatibleProvider implements Provider {
     return h;
   }
 
+  /**
+   * Whether this backend/model honors the `system` role. Some hosted models
+   * (e.g. Kimi K2.x on NVIDIA NIM) degenerate into repetition when given a
+   * system message, so subclasses can opt to fold it into the user turn.
+   */
+  protected systemRoleSupported(): boolean {
+    return true;
+  }
+
   /** Map our internal Message[] to OpenAI wire format (incl. tool fields). */
   protected wireMessages(messages: Message[]): Record<string, unknown>[] {
-    return mergeSystem(messages).map((m) => {
+    let prepared = mergeSystem(messages);
+    if (!this.systemRoleSupported()) prepared = foldSystemIntoUser(prepared);
+    return prepared.map((m) => {
       if (m.role === "tool") {
         return { role: "tool", content: m.content, tool_call_id: m.tool_call_id, name: m.name };
       }
@@ -209,6 +220,29 @@ function mergeSystem(messages: Message[]): Message[] {
       out.push(m);
     }
   }
+  return out;
+}
+
+/**
+ * Demote a leading `system` message into the conversation as user content, for
+ * backends/models that mishandle the system role. Assumes mergeSystem already
+ * collapsed system messages to at most one. The system text is prepended to the
+ * first user message (or inserted as a standalone user message if there is none),
+ * so the model still receives the instructions without a `system` role.
+ */
+function foldSystemIntoUser(messages: Message[]): Message[] {
+  const sys = messages.find((m) => m.role === "system");
+  if (!sys) return messages;
+  const rest = messages.filter((m) => m.role !== "system");
+  const firstUserIdx = rest.findIndex((m) => m.role === "user");
+  if (firstUserIdx === -1) {
+    return [{ role: "user", content: sys.content }, ...rest];
+  }
+  const out = rest.slice();
+  out[firstUserIdx] = {
+    ...out[firstUserIdx],
+    content: `${sys.content}\n\n---\n\n${out[firstUserIdx].content}`,
+  };
   return out;
 }
 
