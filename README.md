@@ -106,12 +106,17 @@ qwenodyssey config set model.model moonshotai/kimi-k2.6
 (auth/quota/network/**timeout**), Qwenodyssey transparently falls back to the next
 model in the chain.
 
-Notes on NIM models: **reliable** picks are `qwen/qwen3-coder-480b-a35b-instruct`
-(coding-focused) and `meta/llama-3.3-70b-instruct`. Thinking models
-(`moonshotai/kimi-k2.6`, `deepseek-ai/deepseek-v4-pro`, `*-r1`) degenerate or leak
-raw chain-of-thought on NIM, so `[nvidia].disable_thinking` (default on) sends
-`chat_template_kwargs.thinking=false` for them; `[nvidia].request_timeout_ms`
-(default 90s) makes a stalled hosted model fail over instead of hanging.
+Notes on NIM models: **reliable** picks are `nvidia/nemotron-3-ultra-550b-a55b`
+(reasoning, tool-capable), `qwen/qwen3-coder-480b-a35b-instruct` (coding-focused),
+and `meta/llama-3.3-70b-instruct`. Reasoning is handled per family:
+- **Nemotron** uses `chat_template_kwargs.enable_thinking` + `reasoning_budget`
+  (`[nvidia].nemotron_thinking` / `reasoning_budget`) and returns its chain-of-thought
+  in a separate `reasoning_content` field, which Qwenodyssey drops — answers stay clean.
+- **kimi-k2.6 / deepseek-v4 / *-r1** degenerate or leak raw CoT on NIM, so
+  `[nvidia].disable_thinking` (default on) sends `chat_template_kwargs.thinking=false`.
+
+`[nvidia].request_timeout_ms` (default 90s) makes a stalled hosted model fail over
+instead of hanging.
 
 See [`docs/providers.md`](docs/providers.md).
 

@@ -40,7 +40,7 @@ const REASONING_TEMP = 0.6;
  */
 function isReasoningModel(model: string): boolean {
   return (
-    /(^|[-_/:.])(r1|qwq|o1|o3|thinking|reason|kimi|k2)/i.test(model) ||
+    /(^|[-_/:.])(r1|qwq|o1|o3|thinking|reason|kimi|k2|nemotron)/i.test(model) ||
     /deepseek-r1/i.test(model)
   );
 }

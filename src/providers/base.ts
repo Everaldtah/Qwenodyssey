@@ -27,6 +27,9 @@ export interface ProviderConfig {
   disableThinking?: boolean;
   /** Abort a request after this many ms (0/undefined = no timeout). Used for cloud backends. */
   requestTimeoutMs?: number;
+  /** Nemotron reasoning models: enable_thinking toggle + reasoning_budget. */
+  nemotronThinking?: boolean;
+  reasoningBudget?: number;
 }
 
 export abstract class OpenAICompatibleProvider implements Provider {

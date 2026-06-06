@@ -129,6 +129,11 @@ const NvidiaConfig = z.object({
   // Abort a NIM request after this many ms so a hung/slow hosted model (e.g.
   // deepseek-v4-pro can stall) fails over to the next model in the chain.
   request_timeout_ms: z.number().default(90000),
+  // Nemotron reasoning models use chat_template_kwargs.enable_thinking (a
+  // different toggle than kimi/v4's `thinking`) + a reasoning_budget. When true,
+  // Qwenodyssey enables their reasoning and caps the thinking tokens below.
+  nemotron_thinking: z.boolean().default(true),
+  reasoning_budget: z.number().default(4096),
 });
 
 /** Internet search + page fetch. */

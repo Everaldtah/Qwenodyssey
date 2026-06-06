@@ -97,6 +97,8 @@ export function createNvidiaProvider(config: Config, model: string): Provider {
     contextTokens: m.context_tokens,
     disableThinking: config.nvidia.disable_thinking,
     requestTimeoutMs: config.nvidia.request_timeout_ms,
+    nemotronThinking: config.nvidia.nemotron_thinking,
+    reasoningBudget: config.nvidia.reasoning_budget,
   });
 }
 

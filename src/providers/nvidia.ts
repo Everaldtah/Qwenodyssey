@@ -20,6 +20,11 @@ export class NvidiaNimProvider extends OpenAICompatibleProvider {
     return !/(^|[-_/:.])(kimi|k2)/i.test(this.cfg.model);
   }
 
+  /** Nemotron reasoning models use a different thinking toggle + reasoning_budget. */
+  private isNemotron(): boolean {
+    return /nemotron/i.test(this.cfg.model);
+  }
+
   /** Models whose NIM chat template exposes a toggleable internal "thinking" mode. */
   private isThinkingModel(): boolean {
     return (
@@ -29,13 +34,22 @@ export class NvidiaNimProvider extends OpenAICompatibleProvider {
   }
 
   /**
-   * For thinking models (kimi, deepseek-v4, r1…), turning the chain-of-thought
-   * OFF (`chat_template_kwargs.thinking=false`) gives clean, stable direct
-   * answers — on NIM the thinking path is what degenerates / leaks raw CoT into
-   * `content`. Only sent for thinking models; non-thinking NIM models (llama,
-   * qwen-coder, gpt-oss) get nothing extra.
+   * Per-model NIM request extras:
+   *  - Nemotron: `chat_template_kwargs.enable_thinking` (+ reasoning_budget) — a
+   *    different toggle than below. Its reasoning is returned in a separate
+   *    `reasoning_content` field (which generate() drops), so the answer stays
+   *    clean. Reasoning is enabled by default (matches NVIDIA's recipe).
+   *  - Other thinking models (kimi, deepseek-v4, r1…): `thinking=false`, because
+   *    on NIM their thinking path degenerates / leaks raw CoT into `content`.
+   *  - Non-thinking models (qwen-coder, llama, gpt-oss): nothing extra.
    */
   protected extraBody(): Record<string, unknown> {
+    if (this.isNemotron()) {
+      return {
+        chat_template_kwargs: { enable_thinking: this.cfg.nemotronThinking !== false },
+        reasoning_budget: this.cfg.reasoningBudget ?? 4096,
+      };
+    }
     if (this.cfg.disableThinking !== false && this.isThinkingModel()) {
       return { chat_template_kwargs: { thinking: false } };
     }

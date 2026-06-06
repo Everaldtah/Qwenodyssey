@@ -31,9 +31,15 @@ disable_thinking = true
 # Abort a NIM request after this many ms so a stalled hosted model (e.g.
 # deepseek-v4-pro can hang) fails over to the next model in fallback_models.
 request_timeout_ms = 90000
-# Reliable picks on NIM: qwen/qwen3-coder-480b-a35b-instruct (coding, fast),
-# meta/llama-3.3-70b-instruct. deepseek-ai/deepseek-v4-pro is strong but can
-# stall; moonshotai/kimi-k2.6 is unstable with rich prompts.
+# Nemotron reasoning models use a different toggle (chat_template_kwargs.enable_thinking)
+# + a reasoning_budget, and return their CoT in a separate reasoning_content field
+# (which Qwenodyssey drops, so answers stay clean). Reasoning on by default.
+nemotron_thinking = true
+reasoning_budget = 4096
+# Reliable picks on NIM: nvidia/nemotron-3-ultra-550b-a55b (reasoning, tools, fast),
+# qwen/qwen3-coder-480b-a35b-instruct (coding, fast), meta/llama-3.3-70b-instruct.
+# deepseek-ai/deepseek-v4-pro is strong but can stall; moonshotai/kimi-k2.6 is
+# unstable with rich prompts.
 
 [agent]
 max_retries = 4
