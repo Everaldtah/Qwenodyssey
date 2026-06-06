@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="270" viewBox="0 0 600 270" font-family="ui-monospace, 'Cascadia Code', 'Consolas', monospace" font-size="16" xml:space="preserve">
+  <style>text { fill: #3b9dff; font-weight: 700; white-space: pre; }</style>
+  <text x="10" y="22">
+    <tspan x="10" dy="0">  ██████╗ ██╗    ██╗███████╗███╗   ██╗</tspan>
+    <tspan x="10" dy="1.25em"> ██╔═══██╗██║    ██║██╔════╝████╗  ██║</tspan>
+    <tspan x="10" dy="1.25em"> ██║   ██║██║ █╗ ██║█████╗  ██╔██╗ ██║</tspan>
+    <tspan x="10" dy="1.25em"> ██║▄▄ ██║██║███╗██║██╔══╝  ██║╚██╗██║</tspan>
+    <tspan x="10" dy="1.25em"> ╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║</tspan>
+    <tspan x="10" dy="1.25em">  ╚══▀▀═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝</tspan>
+    <tspan x="10" dy="2.0em"> ██████╗ ██████╗ ██╗   ██╗███████╗███████╗███████╗██╗   ██╗</tspan>
+    <tspan x="10" dy="1.25em">██╔═══██╗██╔══██╗╚██╗ ██╔╝██╔════╝██╔════╝██╔════╝╚██╗ ██╔╝</tspan>
+    <tspan x="10" dy="1.25em">██║   ██║██║  ██║ ╚████╔╝ ███████╗███████╗█████╗   ╚████╔╝ </tspan>
+    <tspan x="10" dy="1.25em">██║   ██║██║  ██║  ╚██╔╝  ╚════██║╚════██║██╔══╝    ╚██╔╝  </tspan>
+    <tspan x="10" dy="1.25em">╚██████╔╝██████╔╝   ██║   ███████║███████║███████╗   ██║   </tspan>
+    <tspan x="10" dy="1.25em"> ╚═════╝ ╚═════╝    ╚═╝   ╚══════╝╚══════╝╚══════╝   ╚═╝   </tspan>
+  </text>
+</svg>

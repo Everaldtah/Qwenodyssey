@@ -2,6 +2,8 @@
 
 <img src="assets/logo.svg" alt="Qwenodyssey logo" width="160" />
 
+<img src="assets/banner.svg" alt="QWEN ODYSSEY" width="600" />
+
 **An Odyssey-class coding harness for Qwen 2.5 7B.**
 
 Qwenodyssey is a local-first CLI coding agent that wraps a small/medium model
