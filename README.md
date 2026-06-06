@@ -1,10 +1,6 @@
 # Qwenodyssey
 
-```
- ▟█▜▛█▙
- ▜█▟▙█▛
-  ▀▘▝▀
-```
+<img src="assets/logo.svg" alt="Qwenodyssey logo" width="160" />
 
 **An Odyssey-class coding harness for Qwen 2.5 7B.**
 
