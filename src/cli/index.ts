@@ -23,7 +23,7 @@ const program = new Command();
 program
   .name("qwenodyssey")
   .description("An Odyssey-class coding harness for Qwen 2.5 7B.")
-  .version("0.1.0")
+  .version("0.2.0")
   .option("--cwd <dir>", "project directory (default: current)")
   .option("--verbose", "verbose debug output")
   .option("-y, --yes", "auto-confirm all prompts");
@@ -105,7 +105,11 @@ program
 program
   .command("chat")
   .description("Interactive pair-coding chat (streaming)")
-  .action((_o, cmd) => chatCommand(globals(cmd)));
+  .option("-c, --continue", "resume the most recent chat session in this directory")
+  .option("--resume [id]", "resume a saved chat session (omit id to pick from a list)")
+  .action((_o, cmd) =>
+    chatCommand(globals(cmd, { continue: cmd.opts().continue, resume: cmd.opts().resume }))
+  );
 
 program
   .command("swarm")

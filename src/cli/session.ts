@@ -15,6 +15,10 @@ export interface GlobalOpts {
   verbose?: boolean;
   yes?: boolean;
   mode?: AgentMode;
+  /** chat: resume the most recent session in this directory. */
+  continue?: boolean;
+  /** chat: resume a saved session by id, or `true` to pick one from a list. */
+  resume?: string | boolean;
 }
 
 export interface Session {

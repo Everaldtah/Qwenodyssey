@@ -110,6 +110,31 @@ export const CHAT_TOOL_SPECS: ToolSpec[] = [
       properties: { path: str("Optional path to scope the diff.") },
     },
   },
+  {
+    name: "update_plan",
+    description:
+      "Lay out and track a step-by-step plan for a MULTI-STEP task. Call it once at the start to " +
+      "list the steps, then again to update statuses as you progress. Always pass the FULL plan " +
+      "(the list is replaced each time). Keeps you on track over long tool chains.",
+    parameters: {
+      type: "object",
+      properties: {
+        plan: {
+          type: "array",
+          description: "The full ordered list of steps.",
+          items: {
+            type: "object",
+            properties: {
+              step: str("Short description of the step."),
+              status: { type: "string", enum: ["pending", "in_progress", "done"], description: "Step status." },
+            },
+            required: ["step", "status"],
+          },
+        },
+      },
+      required: ["plan"],
+    },
+  },
 ];
 
 /** Internet tools — included when web.enabled. */
@@ -153,6 +178,140 @@ export const WEB_TOOL_SPECS: ToolSpec[] = [
         pages: { type: "integer", description: "How many top results to read & condense (default 3, max 5)." },
       },
       required: ["query"],
+    },
+  },
+];
+
+/** GitHub tools — included when github.enabled and a login/token is available. */
+export const GITHUB_TOOL_SPECS: ToolSpec[] = [
+  {
+    name: "github_whoami",
+    description:
+      "Show which GitHub account the agent is acting as (and its scopes). Use to confirm GitHub access.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "github_list_repos",
+    description:
+      "List repositories on the user's GitHub account (most recently pushed first). Use to discover repos.",
+    parameters: {
+      type: "object",
+      properties: { limit: { type: "integer", description: "Max repos to list (default 30, max 100)." } },
+    },
+  },
+  {
+    name: "github_get_file",
+    description:
+      "Read a file (or list a directory) from a GitHub repo to review code that isn't checked out locally.",
+    parameters: {
+      type: "object",
+      properties: {
+        repo: str('Repo as "owner/name" or just "name" (defaults owner to your account).'),
+        path: str("Path within the repo. Empty/'/' lists the root directory."),
+        ref: str("Optional branch, tag, or commit SHA."),
+      },
+      required: ["repo", "path"],
+    },
+  },
+  {
+    name: "github_put_file",
+    description:
+      "Create or update (upload/commit) a file in a GitHub repo. Writes code straight to GitHub; the " +
+      "existing file's sha is fetched automatically when updating.",
+    parameters: {
+      type: "object",
+      properties: {
+        repo: str('Repo as "owner/name" or just "name".'),
+        path: str("Path within the repo to write."),
+        content: str("Full new file contents (UTF-8)."),
+        message: str("Commit message."),
+        branch: str("Optional branch to commit to (default the repo's default branch)."),
+      },
+      required: ["repo", "path", "content"],
+    },
+  },
+  {
+    name: "github_create_repo",
+    description: "Create a new repository on the user's account (private + auto-initialised by default).",
+    parameters: {
+      type: "object",
+      properties: {
+        name: str("Repository name."),
+        description: str("Optional description."),
+        private: { type: "boolean", description: "Private repo (default true)." },
+        auto_init: { type: "boolean", description: "Initialise with a README so it's immediately writable (default true)." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "github_list_prs",
+    description: "List pull requests in a repo (open by default).",
+    parameters: {
+      type: "object",
+      properties: {
+        repo: str('Repo as "owner/name" or just "name".'),
+        state: { type: "string", enum: ["open", "closed", "all"], description: "Default 'open'." },
+      },
+      required: ["repo"],
+    },
+  },
+  {
+    name: "github_get_pr",
+    description:
+      "Fetch a pull request's details AND full unified diff so you can review the code change.",
+    parameters: {
+      type: "object",
+      properties: {
+        repo: str('Repo as "owner/name" or just "name".'),
+        number: { type: "integer", description: "PR number." },
+      },
+      required: ["repo", "number"],
+    },
+  },
+  {
+    name: "github_create_pr",
+    description: "Open a pull request from a head branch into a base branch.",
+    parameters: {
+      type: "object",
+      properties: {
+        repo: str('Repo as "owner/name" or just "name".'),
+        title: str("PR title."),
+        head: str("Head branch (the branch with your changes)."),
+        base: str("Base branch to merge into (default 'main')."),
+        body: str("Optional PR description."),
+        draft: { type: "boolean", description: "Open as a draft (default false)." },
+      },
+      required: ["repo", "title", "head"],
+    },
+  },
+  {
+    name: "github_review_pr",
+    description:
+      "Submit a review on a PR after reading it with github_get_pr. Pick an event and explain it.",
+    parameters: {
+      type: "object",
+      properties: {
+        repo: str('Repo as "owner/name" or just "name".'),
+        number: { type: "integer", description: "PR number." },
+        event: { type: "string", enum: ["APPROVE", "REQUEST_CHANGES", "COMMENT"], description: "Review verdict." },
+        body: str("Review comment / summary."),
+      },
+      required: ["repo", "number", "event", "body"],
+    },
+  },
+  {
+    name: "github_create_issue",
+    description: "Open an issue in a repo (e.g. file a bug found while reviewing).",
+    parameters: {
+      type: "object",
+      properties: {
+        repo: str('Repo as "owner/name" or just "name".'),
+        title: str("Issue title."),
+        body: str("Optional issue body."),
+        labels: { type: "array", items: { type: "string" }, description: "Optional labels." },
+      },
+      required: ["repo", "title"],
     },
   },
 ];

@@ -170,7 +170,7 @@ on NIM. In this mode audio and frames go to the cloud. Test pieces independently
 | Command | Description |
 |---------|-------------|
 | `qwenodyssey init` | Create the `.qwenodyssey` workspace |
-| `qwenodyssey chat` | Interactive pair-coding chat (streaming) |
+| `qwenodyssey chat` | Interactive pair-coding chat (streaming); `-c/--continue` resumes the last session, `--resume [id]` picks one |
 | `qwenodyssey code "task"` | Full pipeline: plan → edit → review → test |
 | `qwenodyssey edit <file> "instruction"` | Edit a single file |
 | `qwenodyssey plan "goal"` | Produce a plan without editing |
@@ -187,6 +187,21 @@ on NIM. In this mode audio and frames go to the cloud. Test pieces independently
 - `--autofix` — run tests, diagnose, patch, repeat
 
 See [`docs/cli-usage.md`](docs/cli-usage.md).
+
+### In chat (v0.2)
+
+Long sessions now stay coherent on small-context local models, and you can pick a
+conversation back up later:
+
+- **Resumable sessions** — every turn is checkpointed to `~/.qwenodyssey/sessions/`.
+  `qwenodyssey chat -c` continues the last conversation in this directory;
+  `qwenodyssey chat --resume` opens a picker; `/sessions` and `/resume <id>` work in-chat.
+- **Context auto-compaction** — as the history approaches the model's context budget,
+  the oldest turns are automatically summarized into a memo so you never overflow (or
+  silently lose the system prompt). `/context` shows a live usage bar; `/compact` forces it now.
+- **Plan tracking** — the model can call the `update_plan` tool to lay out and tick off
+  the steps of a multi-step task, which keeps small models on track over long tool chains.
+  `/plan` shows the current checklist.
 
 ---
 

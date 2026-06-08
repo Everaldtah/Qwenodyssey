@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as path from "path";
 import chalk from "chalk";
 import { createSession, GlobalOpts } from "../session";
 import { loadPrompt } from "../../core/promptLoader";
@@ -7,8 +8,9 @@ import { resolveInside } from "../../tools/fileTools";
 import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
-import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS, SWARM_TOOL_SPECS } from "../chatTools";
+import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS, SWARM_TOOL_SPECS, GITHUB_TOOL_SPECS } from "../chatTools";
 import { createSwarmTools } from "../../tools/swarmTools";
+import { createGithubTools } from "../../tools/githubTools";
 import { frontierWorkers } from "../../core/swarm";
 import { createPrompt, selectFromList, captureInterjections, SlashCommand, SelectItem } from "../prompt";
 import {
@@ -24,6 +26,9 @@ import { KnowledgeBase } from "../../core/knowledge";
 import { EvolutionEngine, TurnSignals } from "../../core/evolution";
 import { createKnowledgeTools } from "../../tools/knowledgeTools";
 import { createWebTools } from "../../tools/webTools";
+import { SessionStore, deriveTitle, ChatSessionMeta } from "../../core/sessionStore";
+import { compactHistory, historyTokens, shouldCompact } from "../../core/compactor";
+import { createPlanTool, renderPlan, PlanState } from "../../tools/planTool";
 import type { GenerateResult, Message, ModelInfo, ModelOptions, ToolCall, ToolContext, ToolSpec } from "../../types";
 import type { Session } from "../session";
 
@@ -123,6 +128,17 @@ ANALYSING A PROJECT (e.g. "explain what this project is about <path>"):
 A directory listing is NOT an analysis: do not stop after one tree/list and summarise the
 file names — read the important files first, then explain the project's purpose, stack, and
 structure. Keep calling tools until you genuinely understand it.`;
+
+/**
+ * Teaches the model to track multi-step work with the update_plan tool. Small
+ * models lose the thread over long tool chains; an explicit, updated plan keeps
+ * them coherent.
+ */
+const PLAN_SYSTEM = `
+PLANNING — for any task that needs several steps or multiple tool calls, FIRST call the
+update_plan tool with the ordered list of steps, then UPDATE it (mark steps in_progress /
+done) as you go. This keeps you on track and lets the user see progress. Skip it for
+trivial one-step questions.`;
 
 /** Teaches the model to use its long-term memory + the internet. */
 const MEMORY_SYSTEM = `
@@ -266,7 +282,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
 
   // Base system prompt now; the PROJECT summary is appended once the repo scan
   // finishes in the background (so a slow scan doesn't delay the prompt).
-  let sys = loadPrompt("system") + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK;
+  let sys = loadPrompt("system") + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK + "\n" + PLAN_SYSTEM;
   if (memoryEnabled || s.config.web.enabled) sys += "\n" + MEMORY_SYSTEM;
   if (swarmReady) sys += "\n" + SWARM_SYSTEM;
   sys += "\n" + selfAwareness(s, kb, memoryEnabled, !!evolution);
@@ -304,7 +320,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
 
   console.log(
     banner({
-      version: "0.1.0",
+      version: "0.2.0",
       model: s.provider.model,
       provider: s.provider.name,
       mode: s.mode,
@@ -366,6 +382,53 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
       )
     );
   }
+  if (s.config.github.enabled) {
+    const ghTools = createGithubTools({
+      token: s.config.github.token,
+      tokenEnv: s.config.github.token_env,
+      defaultOwner: s.config.github.default_owner,
+      apiBase: s.config.github.api_base,
+    });
+    ghTools.forEach((t) => chatTools.register(t));
+    toolSpecs.push(...GITHUB_TOOL_SPECS);
+    // Probe the login so the user sees who the agent acts as (best-effort).
+    chatTools.run("github_whoami", {}).then((r) => {
+      if (r.ok) console.log(chalk.gray(`  ✦ GitHub ready — ${r.output}\n`));
+      else console.log(chalk.gray(`  ✦ GitHub tools loaded (not yet authenticated — run \`gh auth login\`)\n`));
+    });
+  }
+
+  // In-session plan / TODO tracking (always available) — improves multi-step
+  // coherence for small models. The spec is part of CHAT_TOOL_SPECS already.
+  const planState: PlanState = { items: [] };
+  chatTools.register(createPlanTool(planState));
+
+  // Persisted sessions: save after each turn so a conversation can be resumed
+  // later with `--continue` / `--resume` / `/resume`.
+  const store = new SessionStore();
+  let sessionId = store.newId();
+  let sessionCreatedAt = new Date().toISOString();
+  const persist = (): void => {
+    if (history.length <= 1) return; // nothing but the system prompt
+    const messages = history.slice(1);
+    store.save({
+      id: sessionId,
+      cwd: s.cwd,
+      title: deriveTitle(messages),
+      model: s.provider.model,
+      provider: s.provider.name,
+      createdAt: sessionCreatedAt,
+      updatedAt: new Date().toISOString(),
+      turns: messages.filter((m) => m.role === "user").length,
+      messages,
+    });
+  };
+  // Resume a prior session if requested (replaces history after the system msg).
+  const resumed = await resumeSession(store, s, opts, history);
+  if (resumed) {
+    sessionId = resumed.id;
+    sessionCreatedAt = resumed.createdAt;
+  }
 
   // Cached result of the last /models listing, so /model <#> can resolve indexes.
   let lastModels: ModelInfo[] = [];
@@ -387,7 +450,54 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     if (line === "/exit" || line === "/quit") break;
     if (line === "/reset") {
       history.length = 1;
-      console.log(chalk.gray("(history cleared)\n"));
+      // Strip any compaction memo folded into the system prompt by /compact.
+      history[0].content = history[0].content.split("\n\n[CONVERSATION SO FAR")[0];
+      sessionId = store.newId();
+      sessionCreatedAt = new Date().toISOString();
+      planState.items = [];
+      console.log(chalk.gray("(history cleared — new session)\n"));
+      continue;
+    }
+    if (line === "/context") {
+      console.log(renderContext(s, history));
+      continue;
+    }
+    if (line === "/compact") {
+      const r = await compactHistory(history, s.provider, { keepUserTurns: 2 });
+      if (r.compacted && r.newMessages) {
+        history.splice(0, history.length, ...r.newMessages);
+        persist();
+        console.log(chalk.gray(`(compacted ${r.removed} earlier messages into a summary)\n`));
+      } else {
+        console.log(chalk.gray("(not enough history to compact yet)\n"));
+      }
+      continue;
+    }
+    if (line === "/plan") {
+      console.log(
+        hrule() + "\n" + chalk.bold("  Current plan") + "\n" +
+          indent(renderPlan(planState.items)) + "\n" + hrule() + "\n"
+      );
+      continue;
+    }
+    if (line === "/sessions") {
+      console.log(renderSessions(store, sessionId));
+      continue;
+    }
+    if (line === "/resume" || line.startsWith("/resume ")) {
+      const arg = line.split(/\s+/).slice(1).join(" ").trim();
+      const picked = await chooseSession(store, s.cwd, arg);
+      if (picked) {
+        const full = store.load(picked.id);
+        if (full) {
+          history.splice(1, history.length - 1, ...full.messages);
+          sessionId = picked.id;
+          sessionCreatedAt = picked.createdAt;
+          console.log(chalk.green(`✓ resumed ${picked.id}`) + chalk.gray(` — ${full.messages.length} messages · "${picked.title}"\n`));
+        }
+      } else {
+        console.log(chalk.gray("(no matching session)\n"));
+      }
       continue;
     }
     if (line === "/help" || line === "/?" || line === "/commands" || line === "/") {
@@ -415,6 +525,16 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     // has finished before the first real turn. Instant once it's done.
     await ready;
 
+    // Auto-compact: if the history is near the model's context budget, summarize
+    // the oldest turns so we don't overflow (or silently lose the system prompt).
+    if (shouldCompact(history, s.provider, { contextTokens: s.config.model.context_tokens, maxTokens: s.config.model.max_tokens })) {
+      const r = await compactHistory(history, s.provider, { keepUserTurns: 3 });
+      if (r.compacted && r.newMessages) {
+        history.splice(0, history.length, ...r.newMessages);
+        console.log(chalk.gray(`  ✦ auto-compacted ${r.removed} earlier messages to free up context\n`));
+      }
+    }
+
     let userContent = expandFileRefs(line, s.cwd);
 
     // Auto-recall: prepend relevant long-term-memory notes to the USER message
@@ -437,7 +557,9 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     } catch (err) {
       console.log(chalk.red(`\n[error: ${(err as Error).message}]`));
     }
+    persist(); // checkpoint the session after every turn so it can be resumed
   }
+  persist();
   prompt.close();
   // Exit promptly even if a best-effort background job (LM Studio start / model
   // list) is still pending — there's nothing left to wait for.
@@ -936,6 +1058,105 @@ class TokenMeter {
   }
 }
 
+/** Resolve which saved session to resume from CLI flags (--continue / --resume[=id]). */
+async function resumeSession(
+  store: SessionStore,
+  s: Session,
+  opts: GlobalOpts,
+  history: Message[]
+): Promise<{ id: string; createdAt: string } | null> {
+  if (!opts.continue && !opts.resume) return null;
+  let meta: ChatSessionMeta | null = null;
+  if (typeof opts.resume === "string" && opts.resume) {
+    meta = store.list().find((m) => m.id === opts.resume) || null;
+    if (!meta) {
+      console.log(chalk.red(`No saved session "${opts.resume}".`) + "\n");
+      return null;
+    }
+  } else if (opts.resume === true) {
+    meta = await chooseSession(store, s.cwd, "");
+  } else if (opts.continue) {
+    meta = store.latestForCwd(s.cwd);
+    if (!meta) {
+      console.log(chalk.gray("(no previous session in this directory — starting fresh)\n"));
+      return null;
+    }
+  }
+  if (!meta) return null;
+  const full = store.load(meta.id);
+  if (!full) return null;
+  for (const m of full.messages) history.push(m);
+  console.log(
+    chalk.green(`✓ resumed session ${meta.id}`) +
+      chalk.gray(` — ${full.messages.length} messages · "${meta.title}"\n`)
+  );
+  return { id: meta.id, createdAt: meta.createdAt };
+}
+
+/** Pick a saved session by id (exact/substring) or interactively when no arg. */
+async function chooseSession(
+  store: SessionStore,
+  _cwd: string,
+  arg: string
+): Promise<ChatSessionMeta | null> {
+  const all = store.list();
+  if (!all.length) {
+    console.log(chalk.gray("(no saved sessions yet)\n"));
+    return null;
+  }
+  if (arg) return all.find((m) => m.id === arg) || all.find((m) => m.id.includes(arg)) || null;
+  if (!process.stdin.isTTY) return all[0];
+  const items: SelectItem[] = all.slice(0, 30).map((m) => ({
+    label: m.title || m.id,
+    hint: `${m.turns} turns · ${(m.updatedAt || "").slice(0, 16).replace("T", " ")} · ${path.basename(m.cwd || "")}`,
+  }));
+  const idx = await selectFromList("Resume which session?", items, 0);
+  return idx < 0 ? null : all[idx];
+}
+
+/** Render the saved-session list for /sessions. */
+function renderSessions(store: SessionStore, currentId: string): string {
+  const all = store.list();
+  const head = [hrule(), chalk.bold(`  Saved sessions  (${all.length})`), ""];
+  const body = all.length
+    ? all
+        .slice(0, 30)
+        .map(
+          (m) =>
+            "  " + (m.id === currentId ? chalk.green("● ") : chalk.gray("○ ")) +
+            chalk.cyan(m.id) + "  " + (m.title || "") +
+            chalk.dim(`  · ${m.turns} turns · ${(m.updatedAt || "").slice(0, 16).replace("T", " ")}`)
+        )
+    : ["  " + chalk.gray("(none yet)")];
+  return [
+    ...head,
+    ...body,
+    "",
+    chalk.gray("  Resume with ") + chalk.cyan("/resume <id>") + chalk.gray(", or relaunch ") + chalk.cyan("qwenodyssey chat --resume"),
+    hrule() + "\n",
+  ].join("\n");
+}
+
+/** Render a context-usage bar: estimated history tokens vs the model's budget. */
+function renderContext(s: Session, history: Message[]): string {
+  const used = historyTokens(history, s.provider);
+  const budget = s.config.model.context_tokens;
+  const pct = Math.min(100, Math.round((used / Math.max(1, budget)) * 100));
+  const width = 28;
+  const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
+  const bar = "█".repeat(filled) + "░".repeat(width - filled);
+  const color = pct >= 85 ? chalk.red : pct >= 65 ? chalk.yellow : chalk.green;
+  const msgs = history.length - 1;
+  return [
+    hrule(),
+    chalk.bold("  Context usage"),
+    "  " + color(bar) + `  ${pct}%`,
+    "  " + chalk.gray("estimated ") + `${formatTokens(used)} / ${formatTokens(budget)} tokens` + chalk.gray(`  ·  ${msgs} messages`),
+    "  " + chalk.gray("auto-compacts near the limit; force now with ") + chalk.cyan("/compact"),
+    hrule() + "\n",
+  ].join("\n");
+}
+
 /**
  * Slash commands — shared by the live `/` palette (prompt.ts) and the static
  * /help menu. Each entry's name/aliases drive the palette's letter filtering.
@@ -945,15 +1166,20 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/settings", aliases: ["/config"], desc: "Show the current model & runtime settings" },
   { name: "/models", desc: "Pick a model with ↑/↓ + Enter (or list when piped)" },
   { name: "/model", args: "[name|#]", desc: "Open the model picker, or switch directly to name/number" },
+  { name: "/context", desc: "Show how much of the context window is used" },
+  { name: "/compact", desc: "Summarize older turns now to free up context" },
+  { name: "/plan", desc: "Show the agent's current step-by-step plan" },
   { name: "/memory", aliases: ["/knowledge"], desc: "Show the long-term knowledge vault (notes & path)" },
   { name: "/lessons", aliases: ["/evolution"], desc: "Show lessons the agent learned from past mistakes" },
+  { name: "/sessions", desc: "List saved chat sessions you can resume" },
+  { name: "/resume", args: "[id]", desc: "Resume a saved session (pick from a list, or by id)" },
   { name: "/btw", args: "<question>", desc: "Aside — also type it while the model is working to queue it" },
-  { name: "/reset", desc: "Clear the conversation history" },
+  { name: "/reset", desc: "Clear history and start a new session" },
   { name: "/exit", aliases: ["/quit"], desc: "Quit Qwenodyssey" },
 ];
 
 const CHAT_TOOLS_LINE =
-  "run_shell, read/write_file, grep, git, web_search, web_fetch, knowledge_search/save";
+  "run_shell, read/write_file, grep, git, web_search, web_fetch, knowledge_search/save, update_plan";
 
 /** Render slash commands as an aligned two-column menu, boxed in rules. */
 function renderCommandMenu(): string {

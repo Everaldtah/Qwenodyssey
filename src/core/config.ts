@@ -2,6 +2,7 @@
  * Configuration: load/save .qwenodyssey/config.toml with defaults + validation.
  */
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import TOML from "@iarna/toml";
 import { z } from "zod";
@@ -236,6 +237,26 @@ const SwarmConfig = z.object({
   max_tokens: z.number().default(1500),
 });
 
+/**
+ * GitHub access: gives the agent the user's GitHub login so it can read, write,
+ * upload and review code. The token is a SECRET — never commit it. Leave `token`
+ * blank and the tools fall back to the GITHUB_TOKEN env var, then to the GitHub
+ * CLI's own login (`gh auth token`), so an already-`gh auth login`'d machine needs
+ * zero config here.
+ */
+const GithubConfig = z.object({
+  enabled: z.boolean().default(true),
+  // Personal access token (classic or fine-grained with `repo` scope). Prefer
+  // leaving blank + using `gh auth login` or the env var below.
+  token: z.string().default(""),
+  // Env var to read the token from when `token` is blank.
+  token_env: z.string().default("GITHUB_TOKEN"),
+  // Default owner for `owner/repo` args; blank = the authenticated user.
+  default_owner: z.string().default(""),
+  // REST API base (change for GitHub Enterprise).
+  api_base: z.string().default("https://api.github.com"),
+});
+
 /** Internet search + page fetch. */
 const WebConfig = z.object({
   enabled: z.boolean().default(true),
@@ -253,6 +274,7 @@ export const ConfigSchema = z.object({
   memory: MemoryConfig.default({}),
   knowledge: KnowledgeConfig.default({}),
   web: WebConfig.default({}),
+  github: GithubConfig.default({}),
   swarm: SwarmConfig.default({}),
   evolution: EvolutionConfig.default({}),
   lmstudio: LmStudioConfig.default({}),
@@ -278,18 +300,67 @@ export function configPath(cwd: string): string {
   return path.join(workspacePath(cwd), "config.toml");
 }
 
-export function loadConfig(cwd: string): Config {
-  const file = configPath(cwd);
-  if (!fs.existsSync(file)) {
-    return defaultConfig();
-  }
+/**
+ * User-level config (~/.qwenodyssey/config.toml). Acts as the cross-project base:
+ * settings here (e.g. the knowledge vault path, API keys) apply everywhere, while
+ * a project's own .qwenodyssey/config.toml overrides them per-repo.
+ */
+export function globalConfigPath(): string {
+  return path.join(os.homedir(), WORKSPACE_DIR, "config.toml");
+}
+
+function readTomlRaw(file: string): Record<string, unknown> | null {
+  if (!fs.existsSync(file)) return null;
   try {
-    const raw = TOML.parse(fs.readFileSync(file, "utf-8"));
-    return ConfigSchema.parse(raw);
+    return TOML.parse(fs.readFileSync(file, "utf-8")) as Record<string, unknown>;
   } catch (err) {
     throw new Error(
       `Failed to parse ${file}: ${(err as Error).message}. ` +
         `Run "qwenodyssey init --force" to regenerate it.`
+    );
+  }
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Deep-merge `source` over `base`: nested tables merge, arrays/scalars replace. */
+function deepMerge(
+  base: Record<string, unknown>,
+  source: Record<string, unknown>
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [k, v] of Object.entries(source)) {
+    out[k] = isPlainObject(v) && isPlainObject(out[k]) ? deepMerge(out[k], v) : v;
+  }
+  return out;
+}
+
+/**
+ * Load configuration, layering the project's .qwenodyssey/config.toml ON TOP of
+ * the user-level ~/.qwenodyssey/config.toml. The global file holds machine-wide
+ * defaults (knowledge vault, keys, backend); the project file overrides only what
+ * it sets. With neither present, built-in defaults are used.
+ */
+export function loadConfig(cwd: string): Config {
+  const projectFile = configPath(cwd);
+  const globalFile = globalConfigPath();
+  const sameFile = path.resolve(projectFile) === path.resolve(globalFile);
+
+  const globalRaw = readTomlRaw(globalFile);
+  // Avoid reading the same file twice when cwd IS the home directory.
+  const projectRaw = sameFile ? null : readTomlRaw(projectFile);
+
+  if (!globalRaw && !projectRaw) return defaultConfig();
+
+  const merged = deepMerge(globalRaw ?? {}, projectRaw ?? {});
+  try {
+    return ConfigSchema.parse(merged);
+  } catch (err) {
+    throw new Error(
+      `Invalid configuration (merged ${globalFile} + ${projectFile}): ` +
+        `${(err as Error).message}. Run "qwenodyssey init --force" to regenerate the project config.`
     );
   }
 }
