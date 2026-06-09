@@ -65,6 +65,7 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
       let buf = "";
       let sel = 0;
       let drawn = 0; // menu rows currently on screen
+      let lastKeyAt = 0; // for paste detection (rapid keypress bursts)
 
       stdin.setRawMode(true);
       stdin.resume();
@@ -102,6 +103,15 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
       };
 
       const onKey = (str: string | undefined, key: readline.Key) => {
+        // Detect pasted input: in raw mode a multi-line paste arrives as many
+        // keypress events microseconds apart, so its embedded newlines look like
+        // Enter. Treat a newline from such a burst as a literal line break in the
+        // buffer (building one multi-line message) rather than submitting — only
+        // an isolated, human-paced Enter sends.
+        const now = Date.now();
+        const burst = now - lastKeyAt < 12;
+        lastKeyAt = now;
+
         if (key.ctrl && key.name === "c") return finish("/exit");
         if (key.ctrl && key.name === "d" && buf === "") return finish("/exit");
 
@@ -113,6 +123,12 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
         }
 
         if (key.name === "return" || key.name === "enter" || str === "\r" || str === "\n") {
+          if (burst) {
+            // Paste-internal newline: keep editing as a multi-line message.
+            buf += "\n";
+            sel = 0;
+            return render();
+          }
           const items = filter(buf);
           if (drawn > 0 && items.length) {
             const c = items[sel];
@@ -205,6 +221,12 @@ export function captureInterjections(opts: {
   let buf = "";
   let typing = false;
   let attached = false;
+  // Lines accumulated from the current input burst. A multi-line PASTE arrives as
+  // many rapid keypress events (each embedded newline looks like Enter); without
+  // coalescing, every pasted line would submit its own aside and flood the screen.
+  // We gather lines and flush them as ONE aside a few ms after input goes idle.
+  let lines: string[] = [];
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
   const redraw = (): void => {
     process.stdout.write("\r\x1b[2K" + opts.label + buf);
@@ -219,7 +241,20 @@ export function captureInterjections(opts: {
   const endTyping = () => {
     typing = false;
     buf = "";
+    lines = [];
     opts.onStopTyping?.();
+  };
+
+  const flush = (): void => {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    if (!typing) return;
+    const text = [...lines, buf].join("\n").trim();
+    process.stdout.write("\r\x1b[2K"); // clear the input line
+    endTyping();
+    if (text) opts.onSubmit(text);
   };
 
   const onKey = (str: string | undefined, key: readline.Key): void => {
@@ -229,10 +264,15 @@ export function captureInterjections(opts: {
     }
     if (key && (key.name === "return" || key.name === "enter")) {
       if (!typing) return;
-      const text = buf.trim();
-      process.stdout.write("\r\x1b[2K"); // clear the input line
-      endTyping();
-      if (text) opts.onSubmit(text);
+      // Push the completed line and debounce the flush. A real (human) Enter has
+      // a gap, so the timer fires and submits one aside. A paste's internal
+      // newlines arrive back-to-back, repeatedly resetting the timer, so the
+      // whole blob is submitted as a single aside once the paste finishes.
+      lines.push(buf);
+      buf = "";
+      redraw();
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = setTimeout(flush, 16);
       return;
     }
     if (key && key.name === "backspace") {
@@ -241,11 +281,25 @@ export function captureInterjections(opts: {
       redraw();
       return;
     }
-    // Printable text (single char or pasted run).
-    if (str && !(key && (key.ctrl || key.meta)) && !/[\x00-\x1f\x7f]/.test(str)) {
+    // Printable text (single char or pasted run). Tabs/newlines inside a pasted
+    // run are control chars; keep newlines as line breaks, drop other controls.
+    if (str && !(key && (key.ctrl || key.meta))) {
+      const cleaned = str.replace(/\r\n?/g, "\n");
+      if (!/[^\x00-\x08\x0b-\x1f\x7f]/.test(cleaned) && !cleaned.includes("\n")) return;
       beginTyping();
-      buf += str;
+      for (const ch of cleaned) {
+        if (ch === "\n") {
+          lines.push(buf);
+          buf = "";
+        } else if (ch >= " " && ch !== "\x7f") {
+          buf += ch;
+        }
+      }
       redraw();
+      if (cleaned.includes("\n")) {
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = setTimeout(flush, 16);
+      }
     }
   };
 
@@ -258,6 +312,10 @@ export function captureInterjections(opts: {
   };
   const detach = () => {
     if (!attached) return;
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
     stdin.removeListener("keypress", onKey);
     try {
       stdin.setRawMode(false);
