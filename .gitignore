@@ -11,3 +11,5 @@ dist/
 
 # Keep the sample config that ships with the repo
 !examples/.qwenodyssey/config.toml
+
+stress/results.json
