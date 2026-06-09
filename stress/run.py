@@ -21,7 +21,10 @@ MODEL = os.environ.get("MODEL", "qwen2.5-coder:7b")
 SYSTEM = (
     "You are a precise Python coding engine. Respond with EXACTLY one ```python "
     "code block and nothing else — no prose, no explanation, no <tool_response> "
-    "tags. Define the requested name(s) at module top level so they are importable."
+    "tags. Define the requested name(s) at module top level so they are importable. "
+    "Before finishing, re-read EVERY constraint and handle edge cases explicitly: "
+    "empty input, zero capacity, whitespace runs, wrap-around, and the exact "
+    "priority/ordering rules stated in the task."
 )
 
 
@@ -45,6 +48,13 @@ def extract(text):
 
 def _grade_worker(source, check, q):
     import traceback
+    # Silence stderr in the child: a buggy model solution (e.g. a queue that
+    # misuses Condition) spawns threads whose tracebacks would otherwise spam the
+    # run log. The grade result still comes from the check's assertions.
+    try:
+        sys.stderr = open(os.devnull, "w")
+    except Exception:  # noqa: BLE001
+        pass
     try:
         ns = {}
         exec(source, ns)
