@@ -210,7 +210,8 @@ function selfAwareness(
     `SELF-AWARENESS — you are "Qwenodyssey", an AI coding agent running on the user's PC. ` +
       `RIGHT NOW you are powered by the model "${s.provider.model}" served through ${where} ` +
       `(provider id: ${s.provider.name}). That is your real identity — if the user asks what model ` +
-      `you are, answer with exactly that; do NOT say you are Qwen 2.5 7B unless that is the model id above. ` +
+      `or agent you are, answer DIRECTLY from this line in plain words and do NOT call any tool ` +
+      `(no knowledge_search, no shell) to answer it; do NOT say you are Qwen 2.5 7B unless that is the model id above. ` +
       `The active model and backend are set in the user's config (~/.qwenodyssey/config.toml) and can be ` +
       `changed live with the /model command or "qwenodyssey config set model.*". ` +
       `You have persistent memory AND your own source code on this machine, and you can change both. ` +
@@ -653,6 +654,7 @@ async function runAssistantTurn(
 ): Promise<TurnSignals> {
   let nudged = false;
   let emptyNudges = 0;
+  let toolAnswerNudges = 0;
   const reasoning = isReasoningModel(s.provider.model);
   const failures: string[] = [];
   const seenCalls = new Set<string>();
@@ -781,10 +783,28 @@ async function runAssistantTurn(
     // commands the model merely pondered aren't auto-run.
     const inline = splitThinking(res.text);
     const thinking = (res.thinking?.trim() || inline.thinking).trim();
-    const answer = inline.answer;
+    // Drop any chat-template tool tags the model leaked into its reply.
+    const answer = sanitizeAnswer(inline.answer);
     const fencedCmds = extractShellCommands(answer);
 
     if (fencedCmds.length === 0) {
+      // The model just ran a tool but then either parroted the raw result back
+      // (wrapped in <tool_response>, now stripped to empty) or produced no prose.
+      // Nudge it once to actually summarize the result in plain words. Bounded.
+      const echoed = echoesToolResult(answer, lastToolResult(history));
+      if ((!answer.trim() || echoed) && lastToolResult(history) && toolAnswerNudges < 2) {
+        toolAnswerNudges++;
+        failures.push("returned raw tool output / no prose answer after a tool call");
+        history.push({
+          role: "user",
+          content:
+            "[system] Do NOT repeat the tool output or wrap anything in " +
+            "<tool_response>/<tool_call> tags. Using the tool result above, answer my " +
+            "question directly in one or two plain sentences.",
+        });
+        continue;
+      }
+
       // Reasoning model planned but produced NO tool call and NO answer (it
       // "thought" about acting then stopped). Nudge it to follow through rather
       // than ending the turn empty. Bounded so it can't loop forever.
@@ -1479,6 +1499,44 @@ function splitThinking(text: string): { thinking: string; answer: string } {
     return { thinking: open[1].trim(), answer: "" };
   }
   return { thinking: "", answer: text.trim() };
+}
+
+/**
+ * Strip chat-template tool-call artifacts a model leaks into its visible answer.
+ * Small/coder models (qwen2.5-coder) sometimes parrot the tool result back
+ * wrapped in <tool_response>…</tool_response> — or emit <tool_call> / special
+ * <|…|> tokens — instead of writing a real reply. None of that is ever a
+ * legitimate answer, so we remove the whole blocks; an empty result then routes
+ * to the "no real answer" nudge below.
+ */
+export function sanitizeAnswer(text: string): string {
+  return text
+    .replace(/<tool_response>[\s\S]*?<\/tool_response>/gi, "")
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
+    .replace(/<\/?tool_(?:response|call)\s*>/gi, "")
+    .replace(/<\|[^|>]*\|>/g, "")
+    .trim();
+}
+
+/** The content of the most recent tool result in history, if any. */
+function lastToolResult(history: Message[]): string {
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === "tool") return history[i].content || "";
+  }
+  return "";
+}
+
+/**
+ * True when the model's "answer" is really just the tool output handed back
+ * (verbatim or nearly so) rather than a synthesized reply. Compared on collapsed
+ * whitespace so formatting differences don't hide an echo.
+ */
+function echoesToolResult(answer: string, toolResult: string): boolean {
+  const norm = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
+  const a = norm(answer);
+  const t = norm(toolResult);
+  if (a.length < 40 || t.length < 40) return false;
+  return t.includes(a) || a.includes(t.slice(0, Math.min(t.length, 200)));
 }
 
 /** Languages whose fenced blocks we treat as runnable shell commands. */
