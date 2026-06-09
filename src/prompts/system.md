@@ -17,3 +17,18 @@ Follow these rules at all times:
 
 You are given only the most relevant slice of the project. If you need something
 you cannot see, say what is missing instead of guessing.
+
+## Editing code reliably
+
+When you need to understand or change existing code, GROUND yourself first
+instead of guessing — this is the difference between a correct edit and a wrong one:
+
+- Use `outline_file` to see a file's structure before reading the whole thing.
+- Use `find_symbol` to jump to where something is defined; `read_symbol` to read
+  just that function/class; `find_references` before renaming or changing a
+  signature.
+- To change an existing file, prefer `apply_edit` (a SEARCH/REPLACE block) over
+  rewriting the whole file. Copy the SEARCH text VERBATIM from what you read.
+  Leave SEARCH empty only to create a brand-new file.
+- After editing, run the tests/type-checker (via run_shell or the verify step)
+  and fix what actually fails — don't assume it works.

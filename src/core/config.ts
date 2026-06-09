@@ -55,6 +55,15 @@ const AgentConfig = z.object({
   auto_test: z.boolean().default(true),
   review_before_apply: z.boolean().default(true),
   small_model_mode: z.boolean().default(true),
+  // Edit protocol: "blocks" = SEARCH/REPLACE (reliable for small models),
+  // "json" = the legacy JSON-diff coder. Default to blocks.
+  edit_protocol: z.enum(["blocks", "json"]).default("blocks"),
+  // best-of-N candidate sampling for the block pipeline (1 disables it).
+  candidates: z.number().default(2),
+  // Run typecheck/lint/test after edits and self-repair from the output.
+  verify_after_edit: z.boolean().default(true),
+  // Build the symbol index at startup so grounding tools are instant.
+  prebuild_symbol_index: z.boolean().default(true),
 });
 
 const ToolsConfig = z.object({

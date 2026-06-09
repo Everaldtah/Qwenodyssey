@@ -412,4 +412,91 @@ export const SWARM_TOOL_SPECS: ToolSpec[] = [
   },
 ];
 
-export const CHAT_TOOL_NAMES = new Set(CHAT_TOOL_SPECS.map((t) => t.name));
+/**
+ * Code-navigation + reliable-edit tools. These are the grounding layer that
+ * lets small models behave like they have an IDE: locate definitions, see a
+ * file's outline, find references, read one symbol, and apply precise
+ * SEARCH/REPLACE edits instead of error-prone whole-file rewrites.
+ */
+export const CODE_NAV_TOOL_SPECS: ToolSpec[] = [
+  {
+    name: "find_symbol",
+    description:
+      "Find where a function/class/interface/type/const is DEFINED (file:line + signature). " +
+      "Call this before editing so you change the right place.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: str("Exact symbol name to locate."),
+        kind: str('Optional filter: function|class|method|interface|type|const|enum|struct|trait.'),
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "search_symbols",
+    description: "Fuzzy-search symbol names across the project when you don't know the exact name.",
+    parameters: {
+      type: "object",
+      properties: { query: str("Substring to search for."), limit: { type: "number", description: "Max results." } },
+      required: ["query"],
+    },
+  },
+  {
+    name: "outline_file",
+    description:
+      "List every definition in a file (functions/classes/methods/types) with line numbers — a " +
+      "cheap structural map. Read this before reading a whole large file.",
+    parameters: {
+      type: "object",
+      properties: { path: str("File path relative to the project root.") },
+      required: ["path"],
+    },
+  },
+  {
+    name: "find_references",
+    description:
+      "Find every place a name is USED across the codebase (definitions flagged). Use before " +
+      "renaming or changing a signature to understand the blast radius.",
+    parameters: {
+      type: "object",
+      properties: { name: str("Symbol name to find uses of."), limit: { type: "number", description: "Max results." } },
+      required: ["name"],
+    },
+  },
+  {
+    name: "read_symbol",
+    description:
+      "Read the body of ONE function/class/method by name instead of the whole file — keeps " +
+      "context small. Optionally disambiguate with 'file'.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: str("Symbol name to read."),
+        file: str("Optional file path to disambiguate."),
+        max_lines: { type: "number", description: "Max lines to return (default 200)." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "apply_edit",
+    description:
+      "Apply a PRECISE edit using a SEARCH/REPLACE block — the reliable way to edit existing files " +
+      "(preferred over write_file for changes). Copy the 'search' text VERBATIM from the file. " +
+      "Leave 'search' empty to create a new file or append. Whitespace-tolerant with auto-repair.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: str("File path relative to the project root."),
+        search: str("Exact text to find (verbatim from the file). Empty = create/append."),
+        replace: str("Replacement text."),
+      },
+      required: ["path", "replace"],
+    },
+  },
+];
+
+export const CHAT_TOOL_NAMES = new Set(
+  [...CHAT_TOOL_SPECS, ...CODE_NAV_TOOL_SPECS].map((t) => t.name)
+);

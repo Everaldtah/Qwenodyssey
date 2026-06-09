@@ -47,6 +47,10 @@ auto_apply = false              # apply edits without asking (use with care)
 auto_test = true
 review_before_apply = true
 small_model_mode = true         # default to --safe, terse prompts, tight context
+edit_protocol = "blocks"        # "blocks" = SEARCH/REPLACE (reliable for small models) | "json"
+candidates = 2                  # best-of-N edit samples; pick the one that applies/compiles (1 disables)
+verify_after_edit = true        # run typecheck/lint/test after edits and self-repair from the output
+prebuild_symbol_index = true    # warm the code-navigation index at startup
 
 [tools]
 allow_shell = true

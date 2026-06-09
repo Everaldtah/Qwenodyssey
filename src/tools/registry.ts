@@ -14,6 +14,7 @@ import { runShellTool } from "./shellTools";
 import { shellHelpTool } from "./shellEncyclopedia";
 import { gitStatusTool, gitDiffTool } from "./gitTools";
 import { grepTool, searchDocsTool } from "./searchTools";
+import { CODE_NAV_TOOLS } from "./codeTools";
 
 export class ToolRegistry {
   private tools = new Map<string, Tool>();
@@ -36,11 +37,17 @@ export class ToolRegistry {
       gitDiffTool,
       grepTool,
       searchDocsTool,
+      ...CODE_NAV_TOOLS,
     ].forEach((t) => this.register(t));
   }
 
   register(tool: Tool): void {
     this.tools.set(tool.name, tool);
+  }
+
+  /** The shared tool context (cwd, sandbox flags, selfRoot, logger). */
+  get context(): ToolContext {
+    return this.ctx;
   }
 
   get(name: string): Tool | undefined {

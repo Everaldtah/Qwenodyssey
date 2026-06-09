@@ -24,9 +24,8 @@ interface Section {
   priority: number; // lower = more important
 }
 
-const approxTokens = (s: string) => Math.ceil(s.length / 4);
-
 export function buildContext(provider: Provider, input: ContextInput): string {
+  const approxTokens = (s: string) => provider.countTokens(s);
   const sections: Section[] = [];
 
   // 1. User request (always first / never dropped)

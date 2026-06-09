@@ -76,6 +76,105 @@ export class OllamaProvider extends OpenAICompatibleProvider {
     };
   }
 
+  /**
+   * Stream via Ollama's NATIVE /api/chat (newline-delimited JSON, NOT SSE).
+   * Each line is a JSON object with message.content deltas; the final line
+   * carries done:true plus prompt_eval_count / eval_count for exact usage.
+   * Counting eval_count live gives the real token-by-token climb.
+   */
+  async stream(
+    messages: Message[],
+    onChunk: (delta: string) => void,
+    options: ModelOptions = {}
+  ): Promise<GenerateResult> {
+    const opts: Record<string, unknown> = {
+      temperature: options.temperature ?? this.cfg.temperature,
+      top_p: options.top_p ?? this.cfg.topP,
+      num_predict: options.max_tokens ?? this.cfg.maxTokens,
+      num_ctx: this.cfg.contextTokens ?? 8192,
+      ...(options.stop ? { stop: options.stop } : {}),
+    };
+    if (typeof this.cfg.gpuLayers === "number" && this.cfg.gpuLayers >= 0) {
+      opts.num_gpu = this.cfg.gpuLayers;
+    }
+    if (this.cfg.lowVram) opts.low_vram = true;
+
+    const body: Record<string, unknown> = {
+      model: this.cfg.model,
+      messages: nativeMessages(messages),
+      stream: true,
+      options: opts,
+      ...(this.cfg.keepAlive ? { keep_alive: this.cfg.keepAlive } : {}),
+    };
+    if (options.json) body.format = "json";
+    if (options.think) body.think = true;
+    if (options.tools?.length) {
+      body.tools = options.tools.map((t) => ({
+        type: "function",
+        function: { name: t.name, description: t.description, parameters: t.parameters },
+      }));
+    }
+
+    const res = await fetch(`${this.root()}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok || !res.body) {
+      let detail = "";
+      try {
+        detail = (await res.text()).slice(0, 300);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(`${this.name} HTTP ${res.status}: ${detail}`);
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let full = "";
+    let thinking = "";
+    let promptTokens: number | undefined;
+    let completionTokens: number | undefined;
+    let toolCalls: ToolCall[] | undefined;
+
+    for await (const chunk of res.body as any) {
+      buffer += decoder.decode(chunk as Uint8Array, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const obj: any = JSON.parse(trimmed);
+          const msg = obj?.message ?? {};
+          if (typeof msg.content === "string" && msg.content) {
+            full += msg.content;
+            onChunk(msg.content);
+          }
+          if (typeof msg.thinking === "string") thinking += msg.thinking;
+          const tc = parseNativeToolCalls(msg.tool_calls);
+          if (tc) toolCalls = tc;
+          if (obj.done) {
+            promptTokens = obj.prompt_eval_count ?? promptTokens;
+            completionTokens = obj.eval_count ?? completionTokens;
+          }
+        } catch {
+          /* partial frame */
+        }
+      }
+    }
+    if (completionTokens === undefined && full) completionTokens = this.countTokens(full);
+    return {
+      text: full,
+      thinking: thinking.trim() || undefined,
+      toolCalls,
+      model: this.cfg.model,
+      promptTokens,
+      completionTokens,
+    };
+  }
+
   /** Use Ollama's native /api/tags so we get sizes alongside names. */
   async listModels(): Promise<ModelInfo[]> {
     const res = await fetch(`${this.root()}/api/tags`);

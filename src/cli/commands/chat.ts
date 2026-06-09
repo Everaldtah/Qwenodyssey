@@ -4,11 +4,12 @@ import chalk from "chalk";
 import { createSession, GlobalOpts } from "../session";
 import { loadPrompt } from "../../core/promptLoader";
 import { scanRepo, summarizeRepo } from "../../core/repoScanner";
+import { prewarmSymbolIndex } from "../../tools/codeTools";
 import { resolveInside } from "../../tools/fileTools";
 import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
-import { CHAT_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS, SWARM_TOOL_SPECS, GITHUB_TOOL_SPECS } from "../chatTools";
+import { CHAT_TOOL_SPECS, CODE_NAV_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS, SWARM_TOOL_SPECS, GITHUB_TOOL_SPECS } from "../chatTools";
 import { createSwarmTools } from "../../tools/swarmTools";
 import { createGithubTools } from "../../tools/githubTools";
 import { frontierWorkers } from "../../core/swarm";
@@ -314,13 +315,26 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
         })
         .catch(() => {})
     );
+    // Warm the symbol index so find_symbol / outline_file / read_symbol are
+    // instant on first use (small models lean on these heavily for grounding).
+    if (s.config.agent.prebuild_symbol_index) {
+      jobs.push(prewarmSymbolIndex({
+        cwd: s.cwd,
+        autoConfirm: true,
+        confirmDestructive: false,
+        allowShell: s.config.tools.allow_shell,
+        sandbox: s.config.tools.sandbox,
+        selfRoot: s.selfRoot,
+        log: () => {},
+      }).catch(() => {}));
+    }
     await Promise.all(jobs);
     await resolveStartupModel(s); // may switch model; needs the LM Studio list first
   })();
 
   console.log(
     banner({
-      version: "0.2.0",
+      version: "0.3.0",
       model: s.provider.model,
       provider: s.provider.name,
       mode: s.mode,
@@ -357,7 +371,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
 
   // Compose the tool set advertised to the model: shell/file/git always, plus
   // internet and long-term memory when enabled in config.
-  const toolSpecs: ToolSpec[] = [...CHAT_TOOL_SPECS];
+  const toolSpecs: ToolSpec[] = [...CHAT_TOOL_SPECS, ...CODE_NAV_TOOL_SPECS];
   if (s.config.web.enabled) {
     createWebTools({
       provider: s.config.web.provider,
@@ -686,17 +700,24 @@ async function runAssistantTurn(
     currentSpinner = spinner;
     spinner.begin();
     let res: GenerateResult;
+    // Stream the response so the token meter climbs live (↓ 1, 2, 3 …). We
+    // buffer the visible text and print it after the spinner clears, so the
+    // animated status line and the answer never fight over the same row. The
+    // spinner's ↓ counter is the live feedback during generation.
     try {
-      res = await generateWithFallback(s, history, {
+      res = await streamWithFallback(s, history, {
         temperature: turnTemperature(s, reasoning),
         tools: toolSpecs,
         think: reasoning,
-      });
+      }, spinner);
     } finally {
       spinner.stop();
       currentSpinner = undefined;
     }
-    meter.record(res); // fold this request's exact usage into the session totals
+    meter.record(res, {
+      in: historyTokens(history, s.provider),
+      out: s.provider.countTokens(res.text || ""),
+    }); // fold this request's exact usage into the session totals (heuristic if omitted)
     const calls = res.toolCalls ?? [];
 
     // Happy path: the model made real tool calls. Store only the non-reasoning
@@ -1037,6 +1058,89 @@ async function generateWithFallback(
 }
 
 /**
+ * Streaming variant: drives the live token ticker (spinner.bumpOut) as output
+ * tokens arrive, and updates ↑ once the prompt size is known. Counts output
+ * tokens token-by-token via the provider's tokenizer on each delta, so the
+ * meter climbs 1, 2, 3 … in real time. Falls back to the blocking path if the
+ * provider/model can't stream (and reuses the same unavailable-model fallback
+ * chain). The ↑/↓ totals are reconciled to the model's EXACT usage counts when
+ * the stream's final usage frame arrives.
+ */
+async function streamWithFallback(
+  s: Session,
+  history: Message[],
+  options: ModelOptions,
+  spinner: Spinner
+): Promise<GenerateResult> {
+  // Seed ↑ with the measured prompt size so the bar starts truthful, then let
+  // the exact prompt_tokens (when returned) reconcile it at the end.
+  spinner.setUp(historyTokens(history, s.provider));
+
+  let streamed = "";
+  let lastCounted = 0;
+  let sinceRecount = 0;
+  const onChunk = (delta: string): void => {
+    streamed += delta;
+    sinceRecount += delta.length;
+    // Re-tokenize the accumulated text every ~32 chars (cheap, and the meter
+    // only needs to feel live, not be exact mid-stream — the final usage frame
+    // reconciles it). This makes ↓ climb smoothly: 1, 2, 3 …
+    if (sinceRecount >= 32 || /[\s.,;:})\]]$/.test(delta)) {
+      const est = s.provider.countTokens(streamed);
+      if (est > lastCounted) {
+        spinner.bumpOut(est - lastCounted);
+        lastCounted = est;
+      }
+      sinceRecount = 0;
+    }
+  };
+
+  const attempt = async (): Promise<GenerateResult> => {
+    try {
+      const res = await s.provider.stream(history, onChunk, options);
+      // Reconcile the live ↓ tick to the exact completion count if we got one.
+      if (typeof res.completionTokens === "number") spinner.setOut(res.completionTokens);
+      if (typeof res.promptTokens === "number") spinner.setUp(res.promptTokens);
+      return res;
+    } catch (err) {
+      // Model rejects tool-calling mid-stream → retry once without tools.
+      if (options.tools?.length && noToolSupport(err as Error)) {
+        streamed = "";
+        lastCounted = 0;
+        sinceRecount = 0;
+        return s.provider.stream(history, onChunk, { ...options, tools: undefined });
+      }
+      throw err;
+    }
+  };
+
+  try {
+    return await attempt();
+  } catch (err) {
+    if (!looksUnavailable(err as Error)) {
+      // Streaming genuinely failed for a non-availability reason — fall back to
+      // the blocking path so the turn still completes.
+      return generateWithFallback(s, history, options);
+    }
+    for (const fb of fallbackChain(s)) {
+      console.log(chalk.yellow(`\n⚠ "${s.provider.model}" unavailable — falling back to "${fb}".`));
+      await applyModelRef(s, fb);
+      streamed = "";
+      lastCounted = 0;
+      sinceRecount = 0;
+      try {
+        return await attempt();
+      } catch (e2) {
+        if (!looksUnavailable(e2 as Error)) {
+          return generateWithFallback(s, history, options);
+        }
+      }
+    }
+    throw err;
+  }
+}
+
+/**
  * Running tally of the tokens actually consumed this session, accumulated from
  * the EXACT `usage` the model reports after each response (Ollama returns real
  * prompt/completion counts). Starts at 0 and only grows — the spinner shows the
@@ -1049,10 +1153,15 @@ class TokenMeter {
   lastIn = 0; // this turn's prompt tokens
   lastOut = 0; // this turn's completion tokens
 
-  /** Add a completed response's exact usage to the running totals. */
-  record(res: GenerateResult): void {
-    this.lastIn = res.promptTokens ?? 0;
-    this.lastOut = res.completionTokens ?? 0;
+  /**
+   * Add a completed response's exact usage to the running totals. If a backend
+   * omits usage (some OpenAI-compatible servers don't emit a usage frame), pass
+   * `estimate` (heuristic prompt + completion counts) so the meter keeps a
+   * truthful-ish tally rather than freezing at zero.
+   */
+  record(res: GenerateResult, estimate?: { in?: number; out?: number }): void {
+    this.lastIn = res.promptTokens ?? estimate?.in ?? 0;
+    this.lastOut = res.completionTokens ?? estimate?.out ?? 0;
     this.sessionIn += this.lastIn;
     this.sessionOut += this.lastOut;
   }

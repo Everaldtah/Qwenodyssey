@@ -62,17 +62,24 @@ export function formatElapsed(seconds: number): string {
 }
 
 /**
- * A single-line live status shown while the model generates, e.g.
- *   · Herding… (5m 25s · ↑ 9.6k tokens)
- * The leading glyph pulses and the elapsed time ticks; the token count is the
- * estimated input/context size sent up for this request. No-ops when stdout is
- * not a TTY (piped output / tests), so it never pollutes captured streams.
+ * A single-line LIVE status shown while the model generates, e.g.
+ *   · Herding… (12s · ↑ 9.6k ↓ 47 tokens · 18 tok/s)
+ * The leading glyph pulses, the elapsed time ticks, and the ↓ count climbs in
+ * real time (1, 2, 3 …) as streamed deltas arrive via bumpOut()/setOut().
+ * tok/s is the live generation rate measured from the first streamed token.
+ * No-ops when stdout is not a TTY (piped output / tests), so it never pollutes
+ * captured streams.
  */
 export class Spinner {
   private timer?: ReturnType<typeof setInterval>;
   private startedAt = 0;
   private frame = 0;
+  private paused = false;
+  private outTokens = 0;
+  private firstTokenAt = 0; // when streaming actually began (for tok/s)
+  private lastDraw = 0;
   private static FRAMES = ["·", "∘", "○", "◌", "○", "∘"];
+  private static MIN_REDRAW_MS = 60; // immediate-redraw throttle for token ticks
 
   constructor(private word: string, private upTokens: number) {}
 
@@ -84,6 +91,25 @@ export class Spinner {
     this.timer.unref?.();
   }
 
+  /** Update the ↑ (input/context) count, e.g. once the prompt size is known. */
+  setUp(tokens: number): void {
+    this.upTokens = Math.max(0, Math.floor(tokens));
+  }
+
+  /** Add streamed output tokens — call this from the stream onChunk handler. */
+  bumpOut(tokens = 1): void {
+    if (this.outTokens === 0) this.firstTokenAt = Date.now();
+    this.outTokens += Math.max(0, tokens);
+    this.tickDraw();
+  }
+
+  /** Set the absolute streamed-output token count (alternative to bumpOut). */
+  setOut(tokens: number): void {
+    if (this.outTokens === 0 && tokens > 0) this.firstTokenAt = Date.now();
+    this.outTokens = Math.max(0, Math.floor(tokens));
+    this.tickDraw();
+  }
+
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
@@ -92,6 +118,7 @@ export class Spinner {
 
   /** Temporarily clear + halt the animation (e.g. while the user types an aside). */
   pause(): void {
+    this.paused = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     if (process.stdout.isTTY) process.stdout.write("\r\x1b[2K");
@@ -99,20 +126,44 @@ export class Spinner {
 
   /** Resume after pause() without resetting the elapsed clock. */
   resume(): void {
+    this.paused = false;
     if (!process.stdout.isTTY || this.timer) return;
     this.draw();
     this.timer = setInterval(() => this.draw(), 140);
     this.timer.unref?.();
   }
 
+  /** Live tok/s once streaming has begun; 0 until then. */
+  private rate(): number {
+    if (!this.firstTokenAt || this.outTokens < 2) return 0;
+    const secs = (Date.now() - this.firstTokenAt) / 1000;
+    return secs > 0.2 ? this.outTokens / secs : 0;
+  }
+
+  /** Redraw immediately on a token tick, throttled so fast streams stay cheap. */
+  private tickDraw(): void {
+    if (!process.stdout.isTTY || this.paused || !this.timer) return;
+    const now = Date.now();
+    if (now - this.lastDraw < Spinner.MIN_REDRAW_MS) return;
+    this.draw();
+  }
+
   private draw(): void {
+    if (this.paused) return;
+    this.lastDraw = Date.now();
     const secs = Math.floor((Date.now() - this.startedAt) / 1000);
     const glyph = Spinner.FRAMES[this.frame++ % Spinner.FRAMES.length];
+    const r = this.rate();
+    const parts = [
+      formatElapsed(secs),
+      `↑ ${formatTokens(this.upTokens)}` + (this.outTokens > 0 ? ` ↓ ${formatTokens(this.outTokens)}` : "") + " tokens",
+    ];
+    if (r > 0) parts.push(`${r >= 10 ? Math.round(r) : r.toFixed(1)} tok/s`);
     const line =
       chalk.magenta(glyph) +
       " " +
       chalk.magenta(this.word) +
-      chalk.gray(`… (${formatElapsed(secs)} · ↑ ${formatTokens(this.upTokens)} tokens)`);
+      chalk.gray(`… (${parts.join(" · ")})`);
     process.stdout.write("\r\x1b[2K" + line);
   }
 }

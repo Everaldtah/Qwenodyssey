@@ -127,7 +127,23 @@ export async function liveCommand(opts: GlobalOpts): Promise<void> {
       spinner.begin();
       let answer = "";
       try {
-        const res = await s.provider.generate(history, { temperature: 0.5, max_tokens: cfg.model.max_tokens });
+        // Stream so the token meter ticks live; count output tokens as they
+        // arrive and reconcile to exact usage at the end.
+        let streamed = "";
+        let lastCounted = 0;
+        const res = await s.provider.stream(
+          history,
+          (d) => {
+            streamed += d;
+            const est = s.provider.countTokens(streamed);
+            if (est > lastCounted) {
+              spinner.bumpOut(est - lastCounted);
+              lastCounted = est;
+            }
+          },
+          { temperature: 0.5, max_tokens: cfg.model.max_tokens }
+        );
+        if (typeof res.completionTokens === "number") spinner.setOut(res.completionTokens);
         answer = (res.text || "").trim();
       } finally {
         spinner.stop();

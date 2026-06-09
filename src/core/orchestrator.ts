@@ -16,6 +16,8 @@ import { applyEdits, previewEdit, rollback } from "./patchEngine";
 import { colorizeDiff } from "../cli/render";
 import { plan as planAgent } from "../agents/planner";
 import { code as codeAgent } from "../agents/coder";
+import { codeWithBlocks } from "../agents/editCoder";
+import { resolveWritable } from "../tools/fileTools";
 import { review as reviewAgent } from "../agents/reviewer";
 import { runTests } from "../agents/tester";
 import { fixErrors } from "../agents/errorFixer";
@@ -91,6 +93,54 @@ export class Orchestrator {
 
     // 4. Code
     this.log.step("Generating edits…");
+
+    // New path: SEARCH/REPLACE block pipeline (best-of-N + verify + self-repair).
+    // This is the default for small models and where most of the reliability
+    // gain comes from. Falls back to the legacy JSON-diff coder when configured.
+    if (this.config.agent.edit_protocol === "blocks") {
+      const selfRoot = this.tools.context.selfRoot;
+      const resolve = (rel: string) =>
+        resolveWritable({ cwd: this.cwd, selfRoot } as any, rel);
+      const runVerify = this.config.agent.verify_after_edit && (mode === "safe" || mode === "deep");
+      const shouldApplyFirst =
+        autoConfirm || this.config.agent.auto_apply || (await this.confirmApply());
+      if (!shouldApplyFirst) {
+        return { edits: [], applied: false, summary: "Held back before editing. Re-run with --yes." };
+      }
+      const result = await codeWithBlocks({
+        provider: this.provider,
+        task,
+        context,
+        root: this.cwd,
+        resolve,
+        candidates: Math.max(1, this.config.agent.candidates),
+        maxRepairRounds: mode === "deep" ? this.config.agent.max_retries : runVerify ? 1 : 0,
+        runVerify,
+        baseTemperature: this.config.model.temperature,
+        onEvent: (e) => this.log.debug(JSON.stringify(e)),
+      });
+      this.log.event({ type: "code_blocks", applied: result.applied, verified: result.verified, rounds: result.rounds });
+      if (!result.applied) {
+        return { edits: [], applied: false, summary: result.message };
+      }
+      const edits = result.blocks.map((b) => ({ path: b.path, mode: "patch" as const }));
+      this.reportApply(
+        result.applyResults.map((r) => ({
+          path: r.path,
+          mode: r.strategy ?? "edit",
+          ok: r.ok,
+          error: r.error,
+        }))
+      );
+      const summary = await this.summarize(task, edits as any, result.verify?.allPassed);
+      return {
+        edits: edits as any,
+        applied: true,
+        testsPassed: result.verify?.allPassed,
+        summary: `${result.message}\n\n${summary}`,
+      };
+    }
+
     const coderOut = await codeAgent(this.provider, task, plan, context);
     if (coderOut.edits.length === 0) {
       return { edits: [], applied: false, summary: "Model produced no edits. Try rephrasing or use --deep." };
