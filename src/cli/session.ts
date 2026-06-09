@@ -36,6 +36,14 @@ export interface Session {
   lms: LmStudioControl;
   /** Cached LM Studio model keys (populated at chat startup), for fallback. */
   lmsModelKeys: string[];
+  /**
+   * Rebuild the dynamic SELF-AWARENESS block in the chat system prompt so it
+   * matches the currently active provider/model. Installed by the chat command
+   * and invoked whenever the active model changes (model switch or fallback),
+   * so a model never reports a stale identity (e.g. a switched-to Ollama model
+   * claiming to still be the configured cloud primary).
+   */
+  refreshIdentity?: () => void;
 }
 
 /** This package's root: dist/cli/session.js → ../.. ; src/cli/session.ts → ../.. */

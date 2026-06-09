@@ -243,6 +243,29 @@ function selfAwareness(
 }
 
 /**
+ * Replace the SELF-AWARENESS block inside the system prompt (history[0]) in
+ * place, preserving anything appended after it (the PROJECT summary, a /compact
+ * memo). Called whenever the active model changes so the model's stated identity
+ * tracks the real provider/model instead of the one the session launched on.
+ */
+export function replaceSelfAwareness(history: Message[], newText: string): void {
+  const sys = history[0];
+  if (!sys || sys.role !== "system") return;
+  const start = sys.content.indexOf("SELF-AWARENESS");
+  if (start === -1) {
+    sys.content += "\n" + newText;
+    return;
+  }
+  // The block ends where the next appended section begins (or at end of prompt).
+  const after = sys.content.slice(start);
+  const ends = ["\n\nPROJECT:", "\n\n[CONVERSATION SO FAR"]
+    .map((m) => after.indexOf(m))
+    .filter((i) => i !== -1);
+  const tail = ends.length ? after.slice(Math.min(...ends)) : "";
+  sys.content = sys.content.slice(0, start) + newText + tail;
+}
+
+/**
  * Interactive pair-coding chat. Streams responses. Type @path to inline a
  * file's contents, /reset to clear history, /exit to quit.
  */
@@ -289,6 +312,12 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   if (swarmReady) sys += "\n" + SWARM_SYSTEM;
   sys += "\n" + selfAwareness(s, kb, memoryEnabled, !!evolution);
   const history: Message[] = [{ role: "system", content: sys }];
+
+  // Keep the model's stated identity in sync with the active backend: rebuilt
+  // on every model switch / fallback (applyModelRef) so e.g. switching to
+  // qwen2.5-coder no longer leaves it claiming to be the cloud primary.
+  s.refreshIdentity = () =>
+    replaceSelfAwareness(history, selfAwareness(s, kb, memoryEnabled, !!evolution));
 
   // Heavy startup work runs in the BACKGROUND so the banner/prompt appear
   // instantly; we await it (usually already finished) before the first turn.
@@ -877,10 +906,12 @@ async function applyModelRef(s: Session, ref: string): Promise<void> {
   const { kind, model } = parseModelRef(ref);
   if (kind === "nvidia") {
     s.provider = createNvidiaProvider(s.config, model);
+    s.refreshIdentity?.();
     return;
   }
   if (kind === "openrouter") {
     s.provider = createOpenRouterProvider(s.config, model);
+    s.refreshIdentity?.();
     return;
   }
   if (kind === "lmstudio") {
@@ -908,6 +939,7 @@ async function applyModelRef(s: Session, ref: string): Promise<void> {
     if (s.provider.name !== "ollama") s.provider = createOllamaProvider(s.config, model);
     else s.provider.setModel?.(model);
   }
+  s.refreshIdentity?.();
 }
 
 /**
