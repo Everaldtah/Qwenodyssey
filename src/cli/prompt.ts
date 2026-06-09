@@ -28,6 +28,26 @@ const visibleLen = (s: string) => s.replace(ANSI, "").length;
 /** Max menu rows drawn at once (keeps us clear of bottom-of-screen scroll). */
 const MAX_MENU = 8;
 
+// Bracketed paste: when enabled, the terminal wraps pasted text between these two
+// markers, so we can capture a paste as one unit (newlines and all) instead of
+// seeing it as a flood of individual keystrokes / Enters.
+const BRACKET_ON = "\x1b[?2004h";
+const BRACKET_OFF = "\x1b[?2004l";
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+
+/** Collapse a multi-line paste to a one-line chip: first line + "[+N lines]". */
+export function pasteChip(text: string): string {
+  const nl = text.split("\n");
+  const more = nl.length - 1;
+  const head = nl[0].slice(0, 48);
+  const ell = nl[0].length > 48 ? "…" : "";
+  return (
+    chalk.cyan(head + ell) +
+    chalk.gray(` [+${more} line${more === 1 ? "" : "s"}]`)
+  );
+}
+
 export function createPrompt(promptLabel: string, commands: SlashCommand[]): Prompt {
   const stdin = process.stdin;
 
@@ -62,20 +82,34 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
 
   function ask(): Promise<string> {
     return new Promise<string>((resolve) => {
+      // `buf` is the logical input. Multi-line pastes are stored out-of-line in
+      // `pastes` and represented in `buf` by a sentinel (\x01<id>\x02) rendered
+      // as a one-line chip; they expand back to the real text on submit.
       let buf = "";
       let sel = 0;
       let drawn = 0; // menu rows currently on screen
-      let lastKeyAt = 0; // for paste detection (rapid keypress bursts)
+      let lastKeyAt = 0; // paste detection fallback (rapid keypress bursts)
+      let pasting = false; // inside a bracketed-paste span
+      let pasteBuf = ""; // raw bytes accumulated during a paste
+      const pastes = new Map<number, string>();
+      let pasteSeq = 0;
 
       stdin.setRawMode(true);
       stdin.resume();
+      process.stdout.write(BRACKET_ON); // ask the terminal to bracket pastes
+
+      // Sentinel <-> text helpers.
+      const display = (s: string) =>
+        s.replace(/\x01(\d+)\x02/g, (_m, d) => pasteChip(pastes.get(Number(d)) ?? ""));
+      const expand = (s: string) =>
+        s.replace(/\x01(\d+)\x02/g, (_m, d) => pastes.get(Number(d)) ?? "");
 
       const render = () => {
         const items = filter(buf);
         if (sel >= items.length) sel = Math.max(0, items.length - 1);
 
         // Return to input-line column 0 and clear everything below.
-        let out = "\r\x1b[0J" + promptLabel + buf;
+        let out = "\r\x1b[0J" + promptLabel + display(buf);
 
         if (items.length) {
           const pad = Math.max(...items.map((c) => label(c).length)) + 2;
@@ -87,7 +121,9 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
                 : chalk.gray("  ") + chalk.cyan(head) + chalk.dim(c.desc);
             out += "\n  " + row;
           });
-          // Move cursor back up to the input line, just past the buffer.
+          // Move cursor back up to the input line, just past the buffer. (Only
+          // shown for slash commands, whose buffer has no chips, so buf.length
+          // is the true on-screen width.)
           out += `\x1b[${items.length}A\r\x1b[${promptCols + buf.length}C`;
         }
         drawn = items.length;
@@ -95,19 +131,55 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
       };
 
       const finish = (value: string) => {
-        process.stdout.write("\r\x1b[0J" + promptLabel + buf + "\n");
+        process.stdout.write("\r\x1b[0J" + promptLabel + display(buf) + "\n");
+        process.stdout.write(BRACKET_OFF);
         stdin.setRawMode(false);
         stdin.removeListener("keypress", onKey);
         stdin.pause();
         resolve(value);
       };
 
+      // Fold a finished paste into the buffer: short single-line pastes go in
+      // literally; anything multi-line becomes a collapsed chip.
+      const commitPaste = (raw: string) => {
+        const text = raw.replace(/\r\n?/g, "\n");
+        if (!text) return;
+        if (text.includes("\n")) {
+          const id = pasteSeq++;
+          pastes.set(id, text);
+          buf += `\x01${id}\x02`;
+        } else {
+          buf += text;
+        }
+        sel = 0;
+        render();
+      };
+
       const onKey = (str: string | undefined, key: readline.Key) => {
-        // Detect pasted input: in raw mode a multi-line paste arrives as many
-        // keypress events microseconds apart, so its embedded newlines look like
-        // Enter. Treat a newline from such a burst as a literal line break in the
-        // buffer (building one multi-line message) rather than submitting — only
-        // an isolated, human-paced Enter sends.
+        const seq = key?.sequence ?? "";
+
+        // ── Bracketed paste: capture everything between the markers verbatim. ──
+        if (key?.name === "paste-start" || seq === PASTE_START || (!pasting && seq.startsWith(PASTE_START))) {
+          pasting = true;
+          pasteBuf = "";
+          return;
+        }
+        if (pasting) {
+          const end = seq.indexOf(PASTE_END);
+          if (key?.name === "paste-end" || seq === PASTE_END || end !== -1) {
+            if (end > 0) pasteBuf += seq.slice(0, end);
+            pasting = false;
+            commitPaste(pasteBuf);
+            pasteBuf = "";
+            return;
+          }
+          pasteBuf += seq || str || "";
+          return;
+        }
+
+        // Detect a paste on terminals WITHOUT bracketed-paste support: events
+        // arrive microseconds apart, so a newline from such a burst is a literal
+        // line break, not a submit.
         const now = Date.now();
         const burst = now - lastKeyAt < 12;
         lastKeyAt = now;
@@ -124,7 +196,6 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
 
         if (key.name === "return" || key.name === "enter" || str === "\r" || str === "\n") {
           if (burst) {
-            // Paste-internal newline: keep editing as a multi-line message.
             buf += "\n";
             sel = 0;
             return render();
@@ -139,7 +210,7 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
             }
             buf = c.name;
           }
-          return finish(buf.trim());
+          return finish(expand(buf).trim());
         }
 
         if (key.name === "tab") {
@@ -153,7 +224,14 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
         }
 
         if (key.name === "backspace") {
-          buf = buf.slice(0, -1);
+          // Backspacing onto a chip removes the whole paste, not one sentinel byte.
+          const m = buf.match(/\x01(\d+)\x02$/);
+          if (m) {
+            pastes.delete(Number(m[1]));
+            buf = buf.slice(0, m.index);
+          } else {
+            buf = buf.slice(0, -1);
+          }
           return render();
         }
         if (key.name === "up") {
@@ -165,7 +243,7 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
           return render();
         }
 
-        // Printable input (single char or pasted run, no control chars).
+        // Printable input (single char, no control chars).
         if (str && !key.ctrl && !key.meta && !/[\x00-\x1f\x7f]/.test(str)) {
           buf += str;
           sel = 0;
@@ -182,6 +260,7 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
     ask,
     close: () => {
       try {
+        process.stdout.write(BRACKET_OFF);
         stdin.setRawMode(false);
       } catch {
         /* not a TTY anymore */
@@ -227,6 +306,8 @@ export function captureInterjections(opts: {
   // We gather lines and flush them as ONE aside a few ms after input goes idle.
   let lines: string[] = [];
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  let pasting = false;
+  let pasteBuf = "";
 
   const redraw = (): void => {
     process.stdout.write("\r\x1b[2K" + opts.label + buf);
@@ -257,7 +338,42 @@ export function captureInterjections(opts: {
     if (text) opts.onSubmit(text);
   };
 
+  const commitPaste = (raw: string): void => {
+    const text = raw.replace(/\r\n?/g, "\n");
+    if (!text) return;
+    beginTyping();
+    const parts = text.split("\n");
+    for (let i = 0; i < parts.length - 1; i++) lines.push(buf + parts[i]), (buf = "");
+    buf += parts[parts.length - 1];
+    redraw();
+    if (text.includes("\n")) {
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = setTimeout(flush, 16);
+    }
+  };
+
   const onKey = (str: string | undefined, key: readline.Key): void => {
+    const seq = key?.sequence ?? "";
+
+    // ── Bracketed paste: gather the whole paste, then queue it as one aside. ──
+    if (key?.name === "paste-start" || seq === PASTE_START || (!pasting && seq.startsWith(PASTE_START))) {
+      pasting = true;
+      pasteBuf = "";
+      return;
+    }
+    if (pasting) {
+      const end = seq.indexOf(PASTE_END);
+      if (key?.name === "paste-end" || seq === PASTE_END || end !== -1) {
+        if (end > 0) pasteBuf += seq.slice(0, end);
+        pasting = false;
+        commitPaste(pasteBuf);
+        pasteBuf = "";
+        return;
+      }
+      pasteBuf += seq || str || "";
+      return;
+    }
+
     if (key && key.ctrl && key.name === "c") {
       detach();
       process.exit(130); // preserve Ctrl-C = interrupt during a turn
@@ -307,6 +423,7 @@ export function captureInterjections(opts: {
     if (attached) return;
     stdin.setRawMode(true);
     stdin.resume();
+    process.stdout.write(BRACKET_ON);
     stdin.on("keypress", onKey);
     attached = true;
   };
@@ -316,6 +433,7 @@ export function captureInterjections(opts: {
       clearTimeout(flushTimer);
       flushTimer = null;
     }
+    process.stdout.write(BRACKET_OFF);
     stdin.removeListener("keypress", onKey);
     try {
       stdin.setRawMode(false);
