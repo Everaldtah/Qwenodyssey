@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractJson } from "../src/core/parse";
+import { extractJson, extractAllJson } from "../src/core/parse";
 
 describe("extractJson", () => {
   it("parses bare JSON", () => {
@@ -24,5 +24,33 @@ describe("extractJson", () => {
 
   it("returns undefined when there is no JSON", () => {
     expect(extractJson("just words")).toBeUndefined();
+  });
+});
+
+describe("extractAllJson", () => {
+  it("recovers a tool call a coder model emitted as a ```json fence", () => {
+    const text = '```json\n{"name": "shell_help", "arguments": {"query": "network tests"}}\n```';
+    expect(extractAllJson(text)).toEqual([
+      { name: "shell_help", arguments: { query: "network tests" } },
+    ]);
+  });
+
+  it("recovers multiple JSON values across separate fences in order", () => {
+    const text =
+      'first:\n```json\n{"name":"run_shell","arguments":{"command":"ls"}}\n```\n' +
+      'then:\n```json\n{"name":"update_plan","arguments":{}}\n```';
+    const out = extractAllJson(text);
+    expect(out.map((o) => o.name)).toEqual(["run_shell", "update_plan"]);
+  });
+
+  it("recovers a bare object embedded in prose", () => {
+    const text = 'Sure! {"name":"run_shell","arguments":{"command":"echo hi"}}';
+    expect(extractAllJson(text)).toEqual([
+      { name: "run_shell", arguments: { command: "echo hi" } },
+    ]);
+  });
+
+  it("returns an empty list for plain prose", () => {
+    expect(extractAllJson("the time is 14:05, no json here")).toEqual([]);
   });
 });

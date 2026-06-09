@@ -40,7 +40,13 @@ function tryParse<T>(s: string): T | undefined {
 function balancedSpan(text: string): string | undefined {
   const start = text.search(/[{[]/);
   if (start === -1) return undefined;
+  return balancedSpanAt(text, start)?.text;
+}
+
+/** The balanced {…}/[…] span starting at `start`, plus the index just past it. */
+function balancedSpanAt(text: string, start: number): { text: string; end: number } | undefined {
   const open = text[start];
+  if (open !== "{" && open !== "[") return undefined;
   const close = open === "{" ? "}" : "]";
   let depth = 0;
   let inStr = false;
@@ -57,8 +63,33 @@ function balancedSpan(text: string): string | undefined {
     else if (ch === open) depth++;
     else if (ch === close) {
       depth--;
-      if (depth === 0) return text.slice(start, i + 1);
+      if (depth === 0) return { text: text.slice(start, i + 1), end: i + 1 };
     }
   }
   return undefined;
+}
+
+/**
+ * Every top-level balanced JSON value embedded in free text, parsed loosely.
+ * Small models often emit one or more tool-call objects inline (sometimes in
+ * separate ```json fences); this recovers all of them in document order.
+ */
+export function extractAllJson(text: string): any[] {
+  if (!text) return [];
+  const out: any[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const rel = text.slice(i).search(/[{[]/);
+    if (rel === -1) break;
+    const start = i + rel;
+    const span = balancedSpanAt(text, start);
+    if (!span) {
+      i = start + 1;
+      continue;
+    }
+    const parsed = tryParse(span.text);
+    if (parsed !== undefined) out.push(parsed);
+    i = span.end;
+  }
+  return out;
 }

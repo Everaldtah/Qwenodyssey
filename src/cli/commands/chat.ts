@@ -29,6 +29,7 @@ import { createKnowledgeTools } from "../../tools/knowledgeTools";
 import { createWebTools } from "../../tools/webTools";
 import { SessionStore, deriveTitle, ChatSessionMeta } from "../../core/sessionStore";
 import { compactHistory, historyTokens, shouldCompact } from "../../core/compactor";
+import { extractAllJson } from "../../core/parse";
 import { createPlanTool, renderPlan, PlanState } from "../../tools/planTool";
 import type { GenerateResult, Message, ModelInfo, ModelOptions, ToolCall, ToolContext, ToolSpec } from "../../types";
 import type { Session } from "../session";
@@ -718,13 +719,30 @@ async function runAssistantTurn(
       in: historyTokens(history, s.provider),
       out: s.provider.countTokens(res.text || ""),
     }); // fold this request's exact usage into the session totals (heuristic if omitted)
-    const calls = res.toolCalls ?? [];
+    let calls = res.toolCalls ?? [];
+
+    // Small models (esp. coder models on Ollama) often emit the tool call as
+    // JSON TEXT instead of via the structured tool_calls field. Recover those so
+    // they execute instead of being printed as the answer.
+    let callsFromText = false;
+    if (calls.length === 0) {
+      const textCalls = extractTextToolCalls(res.text, toolSpecs, step);
+      if (textCalls.length > 0) {
+        calls = textCalls;
+        callsFromText = true;
+      }
+    }
 
     // Happy path: the model made real tool calls. Store only the non-reasoning
     // part of the assistant message — leaving a reasoning model's chain-of-thought
-    // in history confuses it on later turns.
+    // in history confuses it on later turns. For text-emitted calls we drop the
+    // raw JSON so it isn't fed back as content.
     if (calls.length > 0) {
-      history.push({ role: "assistant", content: splitThinking(res.text).answer || "", tool_calls: calls });
+      history.push({
+        role: "assistant",
+        content: callsFromText ? "" : splitThinking(res.text).answer || "",
+        tool_calls: calls,
+      });
       for (const call of calls) await runCall(call);
       continue;
     }
@@ -1461,6 +1479,48 @@ function extractShellCommands(text: string): string[] {
   return cmds;
 }
 
+/**
+ * Recover tool calls a small model emitted as TEXT — a JSON object/array with
+ * {name, arguments} — instead of via the structured tool_calls field. Coder
+ * models on Ollama (e.g. qwen2.5-coder) routinely WRITE the call in a ```json
+ * fence rather than using native function-calling, which left the harness
+ * printing the raw JSON as the "answer". We map those onto real tool calls,
+ * accepting the common shape variants ({tool_call:…}, {function:…}, parameters/
+ * args aliases) and only for tools we actually advertised this turn.
+ */
+function extractTextToolCalls(text: string, toolSpecs: ToolSpec[], step: number): ToolCall[] {
+  if (!text) return [];
+  const known = new Set(toolSpecs.map((t) => t.name));
+  const calls: ToolCall[] = [];
+  const seen = new Set<string>();
+
+  const consider = (raw: any) => {
+    if (!raw || typeof raw !== "object") return;
+    const o = raw.tool_call ?? raw.function ?? raw;
+    const name = typeof o?.name === "string" ? o.name : undefined;
+    if (!name || !known.has(name)) return;
+    let args: any = o.arguments ?? o.parameters ?? o.args ?? {};
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        args = {};
+      }
+    }
+    if (!args || typeof args !== "object") args = {};
+    const key = name + JSON.stringify(args);
+    if (seen.has(key)) return; // de-dupe a call the model repeated
+    seen.add(key);
+    calls.push({ id: `text_${step}_${calls.length}`, name, arguments: args });
+  };
+
+  for (const value of extractAllJson(text)) {
+    if (Array.isArray(value)) value.forEach(consider);
+    else consider(value);
+  }
+  return calls;
+}
+
 /** Run a single tool call against the registry, with a confirm gate for shell. */
 async function executeToolCall(
   s: Session,
@@ -1521,16 +1581,17 @@ interface ModelEntry {
 async function gatherModelEntries(s: Session, cached: ModelInfo[]): Promise<ModelEntry[]> {
   const entries: ModelEntry[] = [];
 
-  // Ollama tags (only when Ollama is the configured backend).
-  let ollama: ModelInfo[] = cached;
-  if (s.config.model.provider === "ollama") {
-    try {
-      const op = s.provider.name === "ollama" ? s.provider : createProvider(s.config);
-      if (op.listModels) ollama = await op.listModels();
-    } catch {
-      /* leave cached */
-    }
+  // Ollama tags — listed whenever the local Ollama server is reachable, not just
+  // when it's the configured primary (mirrors how LM Studio models are always
+  // offered). This lets you pick a local model even with a cloud primary.
+  let ollama: ModelInfo[] = [];
+  try {
+    const op = s.provider.name === "ollama" ? s.provider : createOllamaProvider(s.config, s.provider.model);
+    if (op.listModels) ollama = await op.listModels();
+  } catch {
+    /* Ollama not running — skip its entries */
   }
+  if (ollama.length === 0) ollama = cached; // fall back to a previously fetched list
   for (const m of ollama) {
     if (isEmbeddingModel(m.name)) continue; // embeddings aren't chat models
     entries.push({
