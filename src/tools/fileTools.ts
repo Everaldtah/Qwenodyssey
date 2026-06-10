@@ -44,7 +44,7 @@ export function resolveWritable(ctx: ToolContext, p: string): string {
 
 export const readFileTool: Tool = {
   name: "read_file",
-  description: "Read the contents of a file.",
+  description: "Read the contents of a file, optionally a line range (offset/limit) for large files.",
   mutating: false,
   async run(args, ctx): Promise<ToolResult> {
     const abs = resolveReadable(ctx.cwd, String(args.path));
@@ -53,6 +53,26 @@ export const readFileTool: Tool = {
       return { ok: false, output: `${args.path} is a directory — use tree or list_files for it.` };
     const content = fs.readFileSync(abs, "utf-8");
     ctx.log({ tool: "read_file", path: args.path, bytes: content.length });
+
+    // Pagination: when offset/limit are given (or the file is very large) return
+    // a window of lines plus a header telling the model how to fetch the next
+    // page, instead of dumping a huge file into the context.
+    const hasWindow = args.offset !== undefined || args.limit !== undefined;
+    const lines = content.split("\n");
+    const total = lines.length;
+    const AUTO_PAGE = 800; // auto-paginate files longer than this even without args
+    if (hasWindow || total > AUTO_PAGE) {
+      const start = Math.max(1, Number(args.offset) || 1); // 1-based line number
+      const count = Math.max(1, Number(args.limit) || AUTO_PAGE);
+      const end = Math.min(total, start + count - 1);
+      const slice = lines.slice(start - 1, end).join("\n");
+      const more =
+        end < total
+          ? `\n…(${total - end} more lines — call read_file again with offset=${end + 1})`
+          : "";
+      const header = `${args.path} — lines ${start}-${end} of ${total}\n`;
+      return { ok: true, output: header + slice + more, data: content };
+    }
     return { ok: true, output: content, data: content };
   },
 };

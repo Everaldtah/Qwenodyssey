@@ -64,12 +64,30 @@ const AgentConfig = z.object({
   verify_after_edit: z.boolean().default(true),
   // Build the symbol index at startup so grounding tools are instant.
   prebuild_symbol_index: z.boolean().default(true),
+  // Budget of PRODUCTIVE tool steps per user turn (turns that actually ran a
+  // tool). Corrective nudges don't count against this — they're bounded by a
+  // separate hard cap (3× this) so the model can't loop forever. Raised from the
+  // old fixed 8 because research / multi-file shell work needs more headroom.
+  max_tool_steps: z.number().default(16),
 });
 
 const ToolsConfig = z.object({
   allow_shell: z.boolean().default(true),
   confirm_destructive: z.boolean().default(true),
   sandbox: z.boolean().default(true),
+  // Regex patterns (case-insensitive). Commands matching allow_commands skip the
+  // destructive-confirm prompt (handy for unattended/headless runs of known-safe
+  // families like "^git (status|log|diff)" or "^npm (test|run)"). Commands
+  // matching deny_commands are hard-blocked. deny wins over allow; neither can
+  // override the built-in catastrophic hard-block list.
+  allow_commands: z.array(z.string()).default([]),
+  deny_commands: z.array(z.string()).default([]),
+  // Enable the persistent shell-session tools (shell_session / _read / _reset),
+  // backed by a real pseudo-terminal (node-pty). Keeps cwd/env/processes alive
+  // across calls and lets long-running commands be polled. Opt-in because a live
+  // shell weakens the one-shot isolation of run_shell, and node-pty is a native
+  // (optional) dependency — if it isn't installed the tools report so.
+  shell_session: z.boolean().default(false),
 });
 
 const MemoryConfig = z.object({
@@ -274,6 +292,9 @@ const WebConfig = z.object({
   searxng_url: z.string().default(""),
   max_results: z.number().default(5),
   fetch_chars: z.number().default(8000),
+  // Abort a single search/page fetch after this many ms so a hung site can't
+  // stall the turn (0 = no timeout).
+  fetch_timeout_ms: z.number().default(15000),
 });
 
 export const ConfigSchema = z.object({

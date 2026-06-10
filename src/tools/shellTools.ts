@@ -19,6 +19,19 @@ const HARD_BLOCK: RegExp[] = [
   /\bformat\s+[a-z]:/i, // Windows format C:
   />\s*\/dev\/sda/i,
   /\bchmod\s+-R\s+777\s+\//i,
+  // ── Windows / PowerShell catastrophic operations ──
+  /\bFormat-Volume\b/i,
+  /\b(Clear|Initialize|Remove)-Disk\b/i,
+  /\b(Stop|Restart)-Computer\b/i,
+  // Recursive force-delete of a drive root, the user profile, or the Windows dir
+  // (either -Recurse/-Force order). Defense-in-depth for the PowerShell shell.
+  /\bRemove-Item\b[^|\n]*-(Recurse|Force)\b[^|\n]*-(Recurse|Force)\b[^|\n]*(\b[A-Za-z]:\\?(?:\s|$|["'])|\$HOME\b|\$env:USERPROFILE\b|\$env:SystemRoot\b|[\\/]Windows\b)/i,
+  // Deleting a whole registry hive
+  /\breg\s+delete\s+HK(LM|EY_LOCAL_MACHINE|CR|EY_CLASSES_ROOT)\b/i,
+  /\bRemove-Item\b[^|\n]*\bHKLM:/i,
+  // cmd recursive wipe of a drive root: rd /s /q C:\
+  /\b(rd|rmdir)\s+\/s\s+\/q\s+[A-Za-z]:\\?(\s|$)/i,
+  /\bdel\s+\/[sq]\s+.*[A-Za-z]:\\?(\s|$)/i,
 ];
 
 /** Patterns that require confirmation when confirm_destructive is on. */
@@ -28,13 +41,53 @@ const DESTRUCTIVE: RegExp[] = [
   /\bdel\b/i,
   /\brmdir\b/i,
   /\bRemove-Item\b/i,
+  /\bRemove-Item\b.*\bHK(CU|LM|CR):/i,
   /\bmv\b/i,
+  /\bMove-Item\b/i,
   /\bnpm\s+uninstall\b/i,
   /\bdrop\s+(table|database)\b/i,
+  // ── Windows / PowerShell state-changing operations (confirm first) ──
+  /\breg\s+(delete|add)\b/i,
+  /\b(takeown|icacls)\b/i,
+  /\bClear-Content\b/i,
+  /\bSet-ItemProperty\b/i,
+  /\bStop-Process\b/i,
+  /\bUninstall-\w+/i,
+  /\bnet\s+user\b.*\/(delete|add)/i,
 ];
 
-export function classifyCommand(cmd: string): "blocked" | "destructive" | "safe" {
+/** Compile config-supplied patterns; fall back to a literal-substring match. */
+function compilePatterns(patterns?: string[]): RegExp[] {
+  if (!patterns?.length) return [];
+  return patterns.map((p) => {
+    try {
+      return new RegExp(p, "i");
+    } catch {
+      return new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    }
+  });
+}
+
+export interface ClassifyOptions {
+  /** Config tools.allow_commands — matching commands skip the destructive gate. */
+  allow?: string[];
+  /** Config tools.deny_commands — matching commands are hard-blocked. */
+  deny?: string[];
+}
+
+/**
+ * Classify a command for the safety gate. Precedence:
+ *   deny-list  →  built-in hard-block  →  allow-list  →  built-in destructive.
+ * The allow-list can downgrade a *destructive* command to safe (auto-approve),
+ * but it can NEVER override a hard-block — you cannot allowlist `rm -rf /`.
+ */
+export function classifyCommand(
+  cmd: string,
+  opts?: ClassifyOptions
+): "blocked" | "destructive" | "safe" {
+  if (compilePatterns(opts?.deny).some((re) => re.test(cmd))) return "blocked";
   if (HARD_BLOCK.some((re) => re.test(cmd))) return "blocked";
+  if (compilePatterns(opts?.allow).some((re) => re.test(cmd))) return "safe";
   if (DESTRUCTIVE.some((re) => re.test(cmd))) return "destructive";
   return "safe";
 }
@@ -80,7 +133,7 @@ export const runShellTool: Tool = {
       return { ok: false, output: "Shell execution is disabled (tools.allow_shell=false)" };
     }
 
-    const cls = classifyCommand(cmd);
+    const cls = classifyCommand(cmd, { allow: ctx.allowCommands, deny: ctx.denyCommands });
     if (cls === "blocked") {
       ctx.log({ tool: "run_shell", command: cmd, blocked: true });
       return { ok: false, output: `Refused: "${cmd}" matches a hard-blocked dangerous pattern.` };

@@ -11,6 +11,8 @@ export interface WebConfig {
   searxngUrl: string;
   maxResults: number;
   fetchChars: number;
+  /** Abort an individual page/search fetch after this many ms (0 = no timeout). */
+  fetchTimeoutMs?: number;
 }
 
 const UA =
@@ -115,16 +117,173 @@ export function createWebTools(cfg: WebConfig): Tool[] {
     },
   };
 
-  return [webSearch, webFetch, webResearch];
+  // Deep, multi-round research in ONE tool call. Runs several related searches,
+  // reads many pages, de-dupes by URL and caps per domain, then returns a single
+  // citation-indexed digest ([1], [2]…) with a Sources list. This lets a small
+  // model do genuine multi-hop research without spending its outer tool-step
+  // budget — the looping happens in here, extractively (no model tokens).
+  const deepResearch: Tool = {
+    name: "deep_research",
+    description:
+      "Thoroughly research a topic from the live web in ONE call: runs several related searches, reads " +
+      "many sources, de-duplicates them, and returns a single citation-indexed report (key findings with " +
+      "[n] markers + a Sources list). Use for hard/multi-faceted questions where one search isn't enough; " +
+      "for a quick lookup use web_research instead.",
+    mutating: false,
+    async run(args, ctx) {
+      const query = String(args.query || "").trim();
+      if (!query) return { ok: false, output: "No query given" };
+      const depth = Math.min(Math.max(Number(args.depth) || 2, 1), 3);
+
+      // Build a handful of related queries to widen coverage beyond one search.
+      const modifiers = ["", "latest", "explained in detail", "pros and cons", "how it works"];
+      const queries = modifiers.slice(0, depth + 1).map((m) => (m ? `${query} ${m}` : query));
+
+      // Collect results across rounds, de-duping by URL and capping per domain so
+      // one site doesn't dominate.
+      const byUrl = new Map<string, SearchResult>();
+      const perDomain = new Map<string, number>();
+      const domainOf = (u: string) => {
+        try {
+          return new URL(u).hostname.replace(/^www\./, "");
+        } catch {
+          return u;
+        }
+      };
+      for (const q of queries) {
+        let results: SearchResult[] = [];
+        try {
+          results = await search(q, cfg);
+        } catch {
+          /* one round failing is fine — keep going */
+        }
+        for (const r of results) {
+          if (!r.url || byUrl.has(r.url)) continue;
+          const d = domainOf(r.url);
+          const n = perDomain.get(d) ?? 0;
+          if (n >= 2) continue; // at most 2 pages from any single domain
+          byUrl.set(r.url, r);
+          perDomain.set(d, n + 1);
+        }
+        if (byUrl.size >= 8) break; // enough material gathered
+      }
+
+      const chosen = [...byUrl.values()].slice(0, 8);
+      if (chosen.length === 0) return { ok: true, output: `No web results for "${query}".` };
+
+      const budgetPer = Math.max(400, Math.floor(4000 / chosen.length));
+      const findings: string[] = [];
+      const sources: string[] = [];
+      let n = 0;
+      for (const r of chosen) {
+        n++;
+        let digest = r.snippet || "";
+        try {
+          const text = await fetchReadable(r.url, cfg);
+          const c = condense(text, query, budgetPer);
+          if (c.length > digest.length) digest = c;
+        } catch {
+          /* page failed — keep the search snippet */
+        }
+        findings.push(`[${n}] ${r.title}\n${digest}`);
+        sources.push(`[${n}] ${r.url}`);
+      }
+      ctx.log({ tool: "deep_research", query, rounds: queries.length, sources: chosen.length });
+      return {
+        ok: true,
+        output:
+          `Research digest for "${query}" (${chosen.length} sources across ${queries.length} searches):\n\n` +
+          findings.join("\n\n") +
+          `\n\n── Sources ──\n${sources.join("\n")}`,
+      };
+    },
+  };
+
+  return [webSearch, webFetch, webResearch, deepResearch];
 }
 
-/** Fetch a URL and return its readable text (HTML → text). */
+/**
+ * fetch with an abort timeout so one slow/hung page can't stall the whole turn.
+ * (The provider layer has its own fetchWithTimeout; the web tools used a bare
+ * fetch() with no deadline until now.)
+ */
+async function timedFetch(url: string, init: RequestInit, cfg: WebConfig): Promise<Response> {
+  const ms = cfg.fetchTimeoutMs ?? 15000;
+  if (!ms || ms <= 0) return fetch(url, init);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } catch (err) {
+    if ((err as any)?.name === "AbortError") throw new Error(`fetch timed out after ${ms}ms`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * SSRF guard: refuse to fetch loopback / link-local / private-network hosts so a
+ * tool call (or a redirect) can't be used to probe the machine's own services or
+ * the local network. Only http(s) public hosts are allowed.
+ */
+function assertPublicUrl(url: string): void {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new Error(`Invalid URL: ${url}`);
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error(`Refused: only http(s) URLs are allowed (got ${u.protocol}).`);
+  }
+  const host = u.hostname.toLowerCase();
+  const blockedHost =
+    host === "localhost" ||
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".local");
+  // IPv4 private / loopback / link-local ranges.
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  let blockedIp = false;
+  if (m) {
+    const [a, b] = [Number(m[1]), Number(m[2])];
+    blockedIp =
+      a === 127 || // loopback
+      a === 10 || // private
+      (a === 172 && b >= 16 && b <= 31) || // private
+      (a === 192 && b === 168) || // private
+      (a === 169 && b === 254) || // link-local
+      a === 0;
+  }
+  if (blockedHost || blockedIp) {
+    throw new Error(`Refused: "${host}" is a private/loopback address (SSRF guard).`);
+  }
+}
+
+// In-session readable-page cache: a web_research followed by a web_fetch of the
+// same URL (very common) shouldn't re-download the page. Bounded FIFO.
+const PAGE_CACHE = new Map<string, string>();
+const PAGE_CACHE_MAX = 64;
+
+/** Fetch a URL and return its readable text (HTML → text), guarded + cached. */
 async function fetchReadable(url: string, cfg: WebConfig): Promise<string> {
-  const res = await fetch(url, { headers: { "User-Agent": UA } });
+  assertPublicUrl(url);
+  const cached = PAGE_CACHE.get(url);
+  if (cached !== undefined) return cached;
+  const res = await timedFetch(url, { headers: { "User-Agent": UA } }, cfg);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const ctype = res.headers.get("content-type") || "";
   const raw = await res.text();
-  return /html/i.test(ctype) ? htmlToText(raw) : raw;
+  const text = /html/i.test(ctype) ? htmlToText(raw) : raw;
+  if (PAGE_CACHE.size >= PAGE_CACHE_MAX) {
+    const oldest = PAGE_CACHE.keys().next().value;
+    if (oldest !== undefined) PAGE_CACHE.delete(oldest);
+  }
+  PAGE_CACHE.set(url, text);
+  return text;
 }
 
 /**
@@ -166,25 +325,54 @@ export function condense(text: string, query: string, maxChars: number): string 
 
 /* ── search providers ── */
 
+/**
+ * Resilient search: try the configured provider first, then fall back through a
+ * ladder of keyless engines. The previous implementation returned [] (a dead
+ * end) whenever DuckDuckGo's HTML changed or rate-limited; now an empty/failed
+ * result just advances to the next engine. Each step is wrapped so one bad
+ * provider never aborts the whole search.
+ */
 async function search(query: string, cfg: WebConfig): Promise<SearchResult[]> {
+  const ladder: Array<() => Promise<SearchResult[]>> = [];
   switch (cfg.provider) {
     case "tavily":
-      return tavily(query, cfg);
+      ladder.push(() => tavily(query, cfg));
+      break;
     case "brave":
-      return brave(query, cfg);
+      ladder.push(() => brave(query, cfg));
+      break;
     case "searxng":
-      return searxng(query, cfg);
-    default:
-      return duckduckgo(query, cfg);
+      ladder.push(() => searxng(query, cfg));
+      break;
+    // duckduckgo is the default primary as well as the universal fallback below.
   }
+  // Keyless fallbacks, always appended (and the primary for the default config).
+  ladder.push(() => duckduckgo(query, cfg));
+  ladder.push(() => ddgLite(query, cfg));
+
+  let lastErr: Error | undefined;
+  for (const step of ladder) {
+    try {
+      const results = await step();
+      if (results.length > 0) return results;
+    } catch (err) {
+      lastErr = err as Error;
+    }
+  }
+  if (lastErr) throw lastErr;
+  return [];
 }
 
 async function duckduckgo(query: string, cfg: WebConfig): Promise<SearchResult[]> {
-  const res = await fetch("https://html.duckduckgo.com/html/", {
-    method: "POST",
-    headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ q: query }).toString(),
-  });
+  const res = await timedFetch(
+    "https://html.duckduckgo.com/html/",
+    {
+      method: "POST",
+      headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ q: query }).toString(),
+    },
+    cfg
+  );
   const html = await res.text();
 
   // Two passes: titles+links, then snippets, zipped by order.
@@ -211,18 +399,55 @@ function decodeDdgUrl(href: string): string {
   return href.startsWith("//") ? "https:" + href : href;
 }
 
+/**
+ * DuckDuckGo Lite — a far simpler, more stable HTML endpoint than the main one.
+ * Used as a fallback when the primary DDG HTML scrape comes back empty (markup
+ * change / soft rate-limit). Results live in a table: result link rows carry
+ * class "result-link"; the snippet is the following "result-snippet" cell.
+ */
+async function ddgLite(query: string, cfg: WebConfig): Promise<SearchResult[]> {
+  const res = await timedFetch(
+    "https://lite.duckduckgo.com/lite/",
+    {
+      method: "POST",
+      headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ q: query }).toString(),
+    },
+    cfg
+  );
+  const html = await res.text();
+
+  const links: { title: string; url: string }[] = [];
+  const linkRe = /<a[^>]+class="result-link"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  let m: RegExpExecArray | null;
+  while ((m = linkRe.exec(html)) !== null) {
+    const url = decodeDdgUrl(m[1]);
+    const title = htmlToText(m[2]).trim();
+    if (url && title) links.push({ title, url });
+  }
+  const snippets: string[] = [];
+  const snipRe = /class="result-snippet"[^>]*>([\s\S]*?)<\/td>/g;
+  while ((m = snipRe.exec(html)) !== null) snippets.push(htmlToText(m[1]).trim());
+
+  return links.slice(0, cfg.maxResults).map((l, i) => ({ ...l, snippet: snippets[i] || "" }));
+}
+
 async function tavily(query: string, cfg: WebConfig): Promise<SearchResult[]> {
   if (!cfg.apiKey) throw new Error("Tavily requires web.api_key");
-  const res = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      api_key: cfg.apiKey,
-      query,
-      max_results: cfg.maxResults,
-      include_answer: false,
-    }),
-  });
+  const res = await timedFetch(
+    "https://api.tavily.com/search",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: cfg.apiKey,
+        query,
+        max_results: cfg.maxResults,
+        include_answer: false,
+      }),
+    },
+    cfg
+  );
   if (!res.ok) throw new Error(`Tavily HTTP ${res.status}`);
   const json: any = await res.json();
   return (json?.results ?? [])
@@ -233,9 +458,11 @@ async function tavily(query: string, cfg: WebConfig): Promise<SearchResult[]> {
 async function brave(query: string, cfg: WebConfig): Promise<SearchResult[]> {
   if (!cfg.apiKey) throw new Error("Brave requires web.api_key");
   const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${cfg.maxResults}`;
-  const res = await fetch(url, {
-    headers: { Accept: "application/json", "X-Subscription-Token": cfg.apiKey },
-  });
+  const res = await timedFetch(
+    url,
+    { headers: { Accept: "application/json", "X-Subscription-Token": cfg.apiKey } },
+    cfg
+  );
   if (!res.ok) throw new Error(`Brave HTTP ${res.status}`);
   const json: any = await res.json();
   return (json?.web?.results ?? [])
@@ -246,9 +473,11 @@ async function brave(query: string, cfg: WebConfig): Promise<SearchResult[]> {
 async function searxng(query: string, cfg: WebConfig): Promise<SearchResult[]> {
   if (!cfg.searxngUrl) throw new Error("SearXNG requires web.searxng_url");
   const base = cfg.searxngUrl.replace(/\/+$/, "");
-  const res = await fetch(`${base}/search?q=${encodeURIComponent(query)}&format=json`, {
-    headers: { "User-Agent": UA },
-  });
+  const res = await timedFetch(
+    `${base}/search?q=${encodeURIComponent(query)}&format=json`,
+    { headers: { "User-Agent": UA } },
+    cfg
+  );
   if (!res.ok) throw new Error(`SearXNG HTTP ${res.status}`);
   const json: any = await res.json();
   return (json?.results ?? [])

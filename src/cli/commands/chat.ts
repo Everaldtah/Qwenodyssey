@@ -31,11 +31,11 @@ import { SessionStore, deriveTitle, ChatSessionMeta } from "../../core/sessionSt
 import { compactHistory, historyTokens, shouldCompact } from "../../core/compactor";
 import { extractAllJson } from "../../core/parse";
 import { createPlanTool, renderPlan, PlanState } from "../../tools/planTool";
+import { prepareToolCall } from "../../tools/toolCallPrep";
+import { ShellSession } from "../../core/shellSession";
+import { createShellSessionTools, SHELL_SESSION_TOOL_SPECS } from "../../tools/shellSessionTools";
 import type { GenerateResult, Message, ModelInfo, ModelOptions, ToolCall, ToolContext, ToolSpec } from "../../types";
 import type { Session } from "../session";
-
-/** Hard cap on tool calls per user turn, to stop runaway loops. */
-const MAX_TOOL_STEPS = 8;
 
 /** Tool turns run deterministically; temp 0 markedly improves tool adherence. */
 const TOOL_TEMP = 0;
@@ -405,6 +405,8 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     confirmDestructive: false,
     allowShell: s.config.tools.allow_shell,
     sandbox: s.config.tools.sandbox,
+    allowCommands: s.config.tools.allow_commands,
+    denyCommands: s.config.tools.deny_commands,
     selfRoot: s.selfRoot,
     log: (entry) => s.logger.event(entry),
   };
@@ -420,6 +422,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
       searxngUrl: s.config.web.searxng_url,
       maxResults: s.config.web.max_results,
       fetchChars: s.config.web.fetch_chars,
+      fetchTimeoutMs: s.config.web.fetch_timeout_ms,
     }).forEach((t) => chatTools.register(t));
     toolSpecs.push(...WEB_TOOL_SPECS);
   }
@@ -451,6 +454,17 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
       if (r.ok) console.log(chalk.gray(`  ✦ GitHub ready — ${r.output}\n`));
       else console.log(chalk.gray(`  ✦ GitHub tools loaded (not yet authenticated — run \`gh auth login\`)\n`));
     });
+  }
+
+  // Persistent shell session (opt-in): a real pty whose cwd/env/processes survive
+  // across calls, for dependent commands and long-running jobs. Disposed when the
+  // chat exits (see the finally below).
+  let shellSession: ShellSession | undefined;
+  if (s.config.tools.shell_session && s.config.tools.allow_shell) {
+    shellSession = new ShellSession(s.cwd);
+    createShellSessionTools(shellSession).forEach((t) => chatTools.register(t));
+    toolSpecs.push(...SHELL_SESSION_TOOL_SPECS);
+    console.log(chalk.gray("  ✦ persistent shell session enabled (shell_session)\n"));
   }
 
   // In-session plan / TODO tracking (always available) — improves multi-step
@@ -616,6 +630,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   }
   persist();
   prompt.close();
+  shellSession?.dispose(); // tear down the persistent pty, if one was started
   // Exit promptly even if a best-effort background job (LM Studio start / model
   // list) is still pending — there's nothing left to wait for.
   process.exit(0);
@@ -707,35 +722,90 @@ async function runAssistantTurn(
     }
   };
 
-  const runCall = async (call: ToolCall): Promise<void> => {
-    // Loop guard: if the model repeats an IDENTICAL tool call it's stuck (e.g.
-    // calling shell_help over and over). Don't re-run it — return the result it
-    // already has and tell it to take the next action.
-    const sig = call.name + " " + JSON.stringify(call.arguments ?? {});
-    if (seenCalls.has(sig)) {
-      failures.push(`repeated identical call to ${call.name} (loop)`);
-      history.push({
-        role: "tool",
-        tool_call_id: call.id,
-        name: call.name,
-        content:
-          `You ALREADY called ${call.name} with these arguments and its result is above. ` +
-          `Do NOT call it again. Take the NEXT step now: run the actual command with run_shell, ` +
-          `or give your final answer.`,
-      });
-      return;
-    }
-    seenCalls.add(sig);
-    const r = await executeToolCall(s, tools, call, askGuarded);
+  // Execute one already-validated call and build its tool-result message.
+  const runPrepared = async (call: ToolCall, name: string, args: Record<string, any>): Promise<Message> => {
+    const effective: ToolCall = { id: call.id, name, arguments: args };
+    const r = await executeToolCall(s, tools, effective, askGuarded);
     if (!r.ok) {
-      const a = JSON.stringify(call.arguments ?? {}).slice(0, 120);
-      failures.push(`${call.name} ${a} → ${r.content.slice(0, 200)}`);
+      const a = JSON.stringify(args ?? {}).slice(0, 120);
+      failures.push(`${name} ${a} → ${r.content.slice(0, 200)}`);
     }
-    history.push({ role: "tool", tool_call_id: call.id, name: call.name, content: r.content });
+    return { role: "tool", tool_call_id: call.id, name, content: r.content };
   };
 
+  // Run a batch of tool calls. Each is first hardened (fuzzy name resolution +
+  // schema coercion/validation) so a small model's malformed call is corrected
+  // or sent back with a targeted error instead of failing cryptically. Read-only
+  // (non-mutating) calls that sit consecutively are executed CONCURRENTLY; any
+  // mutating call, validation error, or repeated call is handled serially so
+  // ordering and the destructive-confirm gate stay intact.
+  const runCalls = async (calls: ToolCall[]): Promise<void> => {
+    const items = calls.map((call) => {
+      const prep = prepareToolCall(call.name, call.arguments, toolSpecs);
+      const sig = prep.name + " " + JSON.stringify(prep.arguments ?? {});
+      const tool = prep.error ? undefined : tools.get(prep.name);
+      const mutating = !tool || tool.mutating;
+      return { call, prep, sig, mutating };
+    });
+
+    let i = 0;
+    while (i < items.length) {
+      // Greedily gather a run of parallel-safe reads: validated, non-mutating,
+      // and not already executed this turn.
+      const batch: typeof items = [];
+      while (i < items.length) {
+        const it = items[i];
+        if (it.prep.error || it.mutating || seenCalls.has(it.sig)) break;
+        seenCalls.add(it.sig);
+        if (it.prep.note) console.log(chalk.gray(`  (${it.prep.note})`));
+        batch.push(it);
+        i++;
+      }
+      if (batch.length > 0) {
+        if (batch.length > 1) console.log(chalk.gray(`  ⚡ running ${batch.length} read-only tools in parallel`));
+        const msgs = await Promise.all(batch.map((b) => runPrepared(b.call, b.prep.name, b.prep.arguments)));
+        msgs.forEach((m) => history.push(m));
+        continue;
+      }
+
+      // Not parallel-safe — handle exactly one, then re-loop.
+      const it = items[i];
+      i++;
+      const { call, prep, sig } = it;
+      if (prep.note) console.log(chalk.gray(`  (${prep.note})`));
+      if (prep.error) {
+        failures.push(`${call.name} → ${prep.error}`);
+        history.push({ role: "tool", tool_call_id: call.id, name: call.name, content: prep.error });
+        continue;
+      }
+      // Loop guard: an identical (resolved) call already ran — don't re-run it.
+      if (seenCalls.has(sig)) {
+        failures.push(`repeated identical call to ${prep.name} (loop)`);
+        history.push({
+          role: "tool",
+          tool_call_id: call.id,
+          name: prep.name,
+          content:
+            `You ALREADY called ${prep.name} with these arguments and its result is above. ` +
+            `Do NOT call it again. Take the NEXT step now: run the actual command with run_shell, ` +
+            `or give your final answer.`,
+        });
+        continue;
+      }
+      seenCalls.add(sig);
+      history.push(await runPrepared(call, prep.name, prep.arguments));
+    }
+  };
+
+  // Budget only PRODUCTIVE steps (turns that actually ran tools). Corrective
+  // nudges (fenced-command warnings, "you reasoned but didn't act", raw-echo
+  // reminders) don't burn the budget — they just count against a hard iteration
+  // cap so a misbehaving model still can't spin forever.
+  const stepBudget = Math.max(1, s.config.agent.max_tool_steps);
+  const hardCap = stepBudget * 3;
+  let productiveSteps = 0;
   try {
-  for (let step = 0; step < MAX_TOOL_STEPS; step++) {
+  for (let step = 0; productiveSteps < stepBudget && step < hardCap; step++) {
     // Inject any asides the user typed (/btw) since the last step.
     if (pending.length) drainPending();
     // Live status: elapsed time + the session's cumulative input tokens so far
@@ -797,7 +867,8 @@ async function runAssistantTurn(
         content: callsFromText ? "" : splitThinking(res.text).answer || "",
         tool_calls: calls,
       });
-      for (const call of calls) await runCall(call);
+      await runCalls(calls);
+      productiveSteps++;
       continue;
     }
 
@@ -895,13 +966,14 @@ async function runAssistantTurn(
       arguments: { command },
     }));
     history.push({ role: "assistant", content: "", tool_calls: synthetic });
-    for (const call of synthetic) await runCall(call);
+    await runCalls(synthetic);
+    productiveSteps++;
   }
 
-  console.log(chalk.yellow(`[stopped after ${MAX_TOOL_STEPS} tool steps]`) + "\n");
+  console.log(chalk.yellow(`[stopped after ${stepBudget} tool steps]`) + "\n");
   history.push({
     role: "assistant",
-    content: `Reached the ${MAX_TOOL_STEPS}-step tool limit for this turn.`,
+    content: `Reached the ${stepBudget}-step tool limit for this turn.`,
   });
   return { userMessage: "", failures, finalAnswer: "", stepLimitHit: true };
   } finally {
@@ -1650,11 +1722,19 @@ async function executeToolCall(
   const args = call.arguments ?? {};
 
   // Show what the model is doing.
-  if (call.name === "run_shell") {
+  if (call.name === "run_shell" || call.name === "shell_session") {
     const cmd = String(args.command ?? "").trim();
-    console.log(chalk.gray("  $ ") + chalk.cyan(cmd));
+    const tag = call.name === "shell_session" ? "  $⟳ " : "  $ ";
+    console.log(chalk.gray(tag) + chalk.cyan(cmd));
 
-    const cls = classifyCommand(cmd);
+    const cls = classifyCommand(cmd, {
+      allow: s.config.tools.allow_commands,
+      deny: s.config.tools.deny_commands,
+    });
+    if (cls === "blocked") {
+      console.log(chalk.red("  ⛔ refused (hard-blocked / deny-listed)\n"));
+      return { content: `Refused: "${cmd}" is hard-blocked or deny-listed and was not run.`, ok: false };
+    }
     if (cls === "destructive" && s.config.tools.confirm_destructive && !s.autoConfirm) {
       console.log(chalk.yellow("  ⚠ looks destructive — type 'y' to run, anything else to skip:"));
       const reply = (await ask()).trim().toLowerCase();

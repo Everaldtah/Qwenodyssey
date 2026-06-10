@@ -160,6 +160,10 @@ export interface ToolContext {
   confirmDestructive: boolean;
   allowShell: boolean;
   sandbox: boolean;
+  /** Config tools.allow_commands — auto-approved (skip the destructive gate). */
+  allowCommands?: string[];
+  /** Config tools.deny_commands — hard-blocked. */
+  denyCommands?: string[];
   /** Qwenodyssey's own install/source root — writable so the agent can self-modify. */
   selfRoot?: string;
   log: (entry: Record<string, unknown>) => void;

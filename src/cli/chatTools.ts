@@ -39,10 +39,15 @@ export const CHAT_TOOL_SPECS: ToolSpec[] = [
     name: "read_file",
     description:
       "Read a file's contents. The path may be relative to the project dir OR an absolute path " +
-      'like "C:\\Projects\\Overstory\\README.md".',
+      'like "C:\\Projects\\Overstory\\README.md". For large files, pass `offset` (1-based start ' +
+      "line) and `limit` (line count) to read one page at a time; the result tells you the next offset.",
     parameters: {
       type: "object",
-      properties: { path: str("File path — relative to the project, or absolute.") },
+      properties: {
+        path: str("File path — relative to the project, or absolute."),
+        offset: { type: "integer", description: "1-based line to start at (optional; for paging large files)." },
+        limit: { type: "integer", description: "Max lines to return (optional; default pages ~800)." },
+      },
       required: ["path"],
     },
   },
@@ -176,6 +181,22 @@ export const WEB_TOOL_SPECS: ToolSpec[] = [
       properties: {
         query: str("What to research, e.g. \"today's top news headlines\"."),
         pages: { type: "integer", description: "How many top results to read & condense (default 3, max 5)." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "deep_research",
+    description:
+      "Thoroughly research a topic from the LIVE web in ONE call: runs several related searches, reads " +
+      "many sources, de-duplicates them, and returns a single citation-indexed report (key findings with " +
+      "[n] markers + a Sources list). Use for hard/multi-faceted questions where one search isn't enough; " +
+      "for a quick lookup use web_research instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: str("The topic/question to research thoroughly."),
+        depth: { type: "integer", description: "How many related searches to run (1-3, default 2). More = broader." },
       },
       required: ["query"],
     },
