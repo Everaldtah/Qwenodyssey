@@ -9,13 +9,42 @@ import type { Provider, Tool } from "../types";
 import { Swarm, frontierWorkers, synthesize, type SwarmRun } from "../core/swarm";
 import { createProvider, createNvidiaProvider, createOpenRouterProvider, createOllamaProvider } from "../providers";
 
-/** Resolve the synthesizer/judge provider from config ("primary" or a ref). */
+// Ranked preference for the synthesizer/orchestrator: strong general+coding
+// reasoners first. We pick the best one that's actually available (has a key),
+// matched by substring against the worker roster.
+const SYNTH_RANK = [
+  "nemotron-3-ultra", "qwen3-coder-480b", "deepseek-v4", "kimi-k2",
+  "llama-3.3-70b", "qwen3-coder",
+];
+
+/** The strongest available FRONTIER model to lead synthesis, or null if none. */
+function bestFrontier(config: Config): Provider | null {
+  const workers = frontierWorkers(config, { includeLocal: false });
+  if (workers.length === 0) return null;
+  for (const pref of SYNTH_RANK) {
+    const w = workers.find((x) => x.model.toLowerCase().includes(pref));
+    if (w) return w.provider;
+  }
+  return workers[0].provider; // any frontier beats a small local primary
+}
+
+/**
+ * Resolve the synthesizer/judge provider. Default ("auto") ALWAYS uses the best
+ * available frontier model so a small local primary (e.g. qwen2.5-coder:7b) never
+ * does the final data synthesis — that's where swarm quality is won or lost.
+ * "primary" forces the configured chat model; an explicit ref forces that model;
+ * falls back to the primary only when no frontier worker is configured.
+ */
 function leadProvider(config: Config): Provider {
-  const s = (config.swarm.synthesizer || "primary").trim();
-  if (!s || s === "primary") return createProvider(config);
-  if (s.startsWith("nvidia:")) return createNvidiaProvider(config, s.slice("nvidia:".length));
-  if (s.startsWith("openrouter:")) return createOpenRouterProvider(config, s.slice("openrouter:".length));
-  return createOllamaProvider(config, s);
+  const raw = (config.swarm.synthesizer || "auto").trim();
+  const key = raw.toLowerCase();
+  if (key === "primary") return createProvider(config);
+  if (key && key !== "auto") {
+    if (key.startsWith("nvidia:")) return createNvidiaProvider(config, raw.slice("nvidia:".length));
+    if (key.startsWith("openrouter:")) return createOpenRouterProvider(config, raw.slice("openrouter:".length));
+    return createOllamaProvider(config, raw);
+  }
+  return bestFrontier(config) ?? createProvider(config);
 }
 
 function formatRun(run: SwarmRun): string {
