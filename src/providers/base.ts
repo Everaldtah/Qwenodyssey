@@ -181,18 +181,47 @@ export abstract class OpenAICompatibleProvider implements Provider {
     onChunk: (delta: string) => void,
     options: ModelOptions = {}
   ): Promise<GenerateResult> {
-    const res = await this.fetchWithTimeout(`${this.apiBase()}/chat/completions`, {
-      method: "POST",
-      headers: this.headers(),
-      // Ask OpenAI-compatible servers to include a final usage frame in the
-      // stream (vLLM, llama.cpp, LM Studio, OpenRouter all honor this), so we
-      // get EXACT prompt/completion counts even while streaming.
-      body: JSON.stringify({
-        ...this.body(messages, options, true),
-        stream_options: { include_usage: true },
-      }),
-    });
+    // Interruptible stream: a local controller is aborted either by the request
+    // timeout (until headers arrive) or by the caller's Esc-interrupt signal
+    // (for the whole stream). We clear the connect timeout once headers land so a
+    // legitimately long generation isn't killed.
+    const ctrl = new AbortController();
+    const ext = options.signal;
+    const onExt = () => ctrl.abort();
+    if (ext) {
+      if (ext.aborted) ctrl.abort();
+      else ext.addEventListener("abort", onExt);
+    }
+    const ms = this.cfg.requestTimeoutMs;
+    let timer: ReturnType<typeof setTimeout> | null =
+      ms && ms > 0 ? setTimeout(() => ctrl.abort(), ms) : null;
+    let res: Response;
+    try {
+      res = await fetch(`${this.apiBase()}/chat/completions`, {
+        method: "POST",
+        headers: this.headers(),
+        // Ask OpenAI-compatible servers to include a final usage frame in the
+        // stream (vLLM, llama.cpp, LM Studio, OpenRouter all honor this), so we
+        // get EXACT prompt/completion counts even while streaming.
+        body: JSON.stringify({
+          ...this.body(messages, options, true),
+          stream_options: { include_usage: true },
+        }),
+        signal: ctrl.signal,
+      });
+    } catch (err) {
+      if (timer) clearTimeout(timer);
+      if (ext) ext.removeEventListener("abort", onExt);
+      if (ext?.aborted) throw new Error("__interrupted__");
+      if ((err as any)?.name === "AbortError") throw new Error(`${this.name} request timed out after ${ms}ms`);
+      throw err;
+    }
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
     if (!res.ok || !res.body) {
+      if (ext) ext.removeEventListener("abort", onExt);
       const detail = await safeText(res);
       throw new Error(`${this.name} HTTP ${res.status}: ${detail}`);
     }
@@ -205,42 +234,49 @@ export abstract class OpenAICompatibleProvider implements Provider {
     // partial deltas: name on the first frame, arguments byte-by-byte after).
     const toolAcc = new Map<number, { id: string; name: string; args: string }>();
     // Node 18+ fetch body is an async-iterable web stream.
-    for await (const chunk of res.body as any) {
-      buffer += decoder.decode(chunk as Uint8Array, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const payload = trimmed.slice(5).trim();
-        if (payload === "[DONE]") continue;
-        try {
-          const obj = JSON.parse(payload);
-          if (obj?.usage) {
-            promptTokens = obj.usage.prompt_tokens ?? promptTokens;
-            completionTokens = obj.usage.completion_tokens ?? completionTokens;
-          }
-          const choice = obj?.choices?.[0];
-          const delta: string = choice?.delta?.content ?? "";
-          if (delta) {
-            full += delta;
-            onChunk(delta);
-          }
-          const tcs = choice?.delta?.tool_calls;
-          if (Array.isArray(tcs)) {
-            for (const tc of tcs) {
-              const idx = tc.index ?? 0;
-              const cur = toolAcc.get(idx) ?? { id: "", name: "", args: "" };
-              if (tc.id) cur.id = tc.id;
-              if (tc.function?.name) cur.name = tc.function.name;
-              if (tc.function?.arguments) cur.args += tc.function.arguments;
-              toolAcc.set(idx, cur);
+    try {
+      for await (const chunk of res.body as any) {
+        buffer += decoder.decode(chunk as Uint8Array, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === "[DONE]") continue;
+          try {
+            const obj = JSON.parse(payload);
+            if (obj?.usage) {
+              promptTokens = obj.usage.prompt_tokens ?? promptTokens;
+              completionTokens = obj.usage.completion_tokens ?? completionTokens;
             }
+            const choice = obj?.choices?.[0];
+            const delta: string = choice?.delta?.content ?? "";
+            if (delta) {
+              full += delta;
+              onChunk(delta);
+            }
+            const tcs = choice?.delta?.tool_calls;
+            if (Array.isArray(tcs)) {
+              for (const tc of tcs) {
+                const idx = tc.index ?? 0;
+                const cur = toolAcc.get(idx) ?? { id: "", name: "", args: "" };
+                if (tc.id) cur.id = tc.id;
+                if (tc.function?.name) cur.name = tc.function.name;
+                if (tc.function?.arguments) cur.args += tc.function.arguments;
+                toolAcc.set(idx, cur);
+              }
+            }
+          } catch {
+            /* ignore keep-alive / partial frames */
           }
-        } catch {
-          /* ignore keep-alive / partial frames */
         }
       }
+    } catch (err) {
+      if (ext?.aborted) throw new Error("__interrupted__");
+      throw err;
+    } finally {
+      if (ext) ext.removeEventListener("abort", onExt);
     }
     // If the server never sent a usage frame, fall back to a heuristic count so
     // callers still get a non-undefined number (better than nothing for budgets).

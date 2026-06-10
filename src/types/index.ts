@@ -40,6 +40,8 @@ export interface ModelOptions {
   tools?: ToolSpec[];
   /** Ask the model to expose its chain-of-thought (reasoning models via Ollama). */
   think?: boolean;
+  /** Abort the request mid-flight (Esc interrupt). Stops streaming immediately. */
+  signal?: AbortSignal;
 }
 
 export interface GenerateResult {

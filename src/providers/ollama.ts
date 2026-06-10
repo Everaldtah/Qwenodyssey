@@ -119,6 +119,7 @@ export class OllamaProvider extends OpenAICompatibleProvider {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: options.signal, // Esc-interrupt aborts the local stream too
     });
     if (!res.ok || !res.body) {
       let detail = "";
@@ -138,31 +139,36 @@ export class OllamaProvider extends OpenAICompatibleProvider {
     let completionTokens: number | undefined;
     let toolCalls: ToolCall[] | undefined;
 
-    for await (const chunk of res.body as any) {
-      buffer += decoder.decode(chunk as Uint8Array, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const obj: any = JSON.parse(trimmed);
-          const msg = obj?.message ?? {};
-          if (typeof msg.content === "string" && msg.content) {
-            full += msg.content;
-            onChunk(msg.content);
+    try {
+      for await (const chunk of res.body as any) {
+        buffer += decoder.decode(chunk as Uint8Array, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const obj: any = JSON.parse(trimmed);
+            const msg = obj?.message ?? {};
+            if (typeof msg.content === "string" && msg.content) {
+              full += msg.content;
+              onChunk(msg.content);
+            }
+            if (typeof msg.thinking === "string") thinking += msg.thinking;
+            const tc = parseNativeToolCalls(msg.tool_calls);
+            if (tc) toolCalls = tc;
+            if (obj.done) {
+              promptTokens = obj.prompt_eval_count ?? promptTokens;
+              completionTokens = obj.eval_count ?? completionTokens;
+            }
+          } catch {
+            /* partial frame */
           }
-          if (typeof msg.thinking === "string") thinking += msg.thinking;
-          const tc = parseNativeToolCalls(msg.tool_calls);
-          if (tc) toolCalls = tc;
-          if (obj.done) {
-            promptTokens = obj.prompt_eval_count ?? promptTokens;
-            completionTokens = obj.eval_count ?? completionTokens;
-          }
-        } catch {
-          /* partial frame */
         }
       }
+    } catch (err) {
+      if (options.signal?.aborted) throw new Error("__interrupted__");
+      throw err;
     }
     if (completionTokens === undefined && full) completionTokens = this.countTokens(full);
     return {

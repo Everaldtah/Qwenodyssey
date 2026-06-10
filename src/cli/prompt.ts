@@ -93,6 +93,11 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
       let pasteBuf = ""; // raw bytes accumulated during a paste
       const pastes = new Map<number, string>();
       let pasteSeq = 0;
+      // All printable input is accumulated here and flushed on a short timer, so a
+      // paste arriving as a keystroke burst renders ONCE (not per char) — which is
+      // what caused the runaway prompt-line flood on terminals without bracketed paste.
+      let burstBuf = "";
+      let burstTimer: ReturnType<typeof setTimeout> | null = null;
 
       stdin.setRawMode(true);
       stdin.resume();
@@ -131,6 +136,7 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
       };
 
       const finish = (value: string) => {
+        if (burstTimer) clearTimeout(burstTimer);
         process.stdout.write("\r\x1b[0J" + promptLabel + display(buf) + "\n");
         process.stdout.write(BRACKET_OFF);
         stdin.setRawMode(false);
@@ -139,12 +145,13 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
         resolve(value);
       };
 
-      // Fold a finished paste into the buffer: short single-line pastes go in
-      // literally; anything multi-line becomes a collapsed chip.
+      // Fold a chunk of input into the buffer. A short single-line chunk (normal
+      // typing) goes in literally; anything multi-line OR long (a paste) becomes a
+      // collapsed one-line chip so the buffer never wraps the terminal.
       const commitPaste = (raw: string) => {
         const text = raw.replace(/\r\n?/g, "\n");
         if (!text) return;
-        if (text.includes("\n")) {
+        if (text.includes("\n") || text.length > 40) {
           const id = pasteSeq++;
           pastes.set(id, text);
           buf += `\x01${id}\x02`;
@@ -153,6 +160,20 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
         }
         sel = 0;
         render();
+      };
+
+      // Commit any pending typed/pasted burst now (called before acting on a
+      // control key, and by the burst timer when input goes idle).
+      const flushBurst = () => {
+        if (burstTimer) {
+          clearTimeout(burstTimer);
+          burstTimer = null;
+        }
+        if (burstBuf) {
+          const b = burstBuf;
+          burstBuf = "";
+          commitPaste(b);
+        }
       };
 
       const onKey = (str: string | undefined, key: readline.Key) => {
@@ -176,6 +197,20 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
           pasteBuf += seq || str || "";
           return;
         }
+
+        // Printable input → accumulate and render on a short idle timer. A paste
+        // (chars microseconds apart) coalesces into one chunk → one render; normal
+        // typing (gaps far longer than 16ms) flushes each char near-instantly.
+        if (str && !key.ctrl && !key.meta && !/[\x00-\x1f\x7f]/.test(str)) {
+          burstBuf += str;
+          if (burstTimer) clearTimeout(burstTimer);
+          burstTimer = setTimeout(flushBurst, 16);
+          return;
+        }
+
+        // Any other key is a control action — commit pending input first so it's
+        // not lost or reordered.
+        flushBurst();
 
         // Detect a paste on terminals WITHOUT bracketed-paste support: events
         // arrive microseconds apart, so a newline from such a burst is a literal
@@ -242,13 +277,6 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
           if (drawn > 0) sel = (sel + 1) % drawn;
           return render();
         }
-
-        // Printable input (single char, no control chars).
-        if (str && !key.ctrl && !key.meta && !/[\x00-\x1f\x7f]/.test(str)) {
-          buf += str;
-          sel = 0;
-          return render();
-        }
       };
 
       stdin.on("keypress", onKey);
@@ -292,6 +320,8 @@ export function captureInterjections(opts: {
   onSubmit: (text: string) => void;
   onStartTyping?: () => void;
   onStopTyping?: () => void;
+  /** Esc pressed while the model is working → interrupt the current generation. */
+  onInterrupt?: () => void;
 }): Interjector | null {
   const stdin = process.stdin;
   if (!stdin.isTTY) return null;
@@ -377,6 +407,16 @@ export function captureInterjections(opts: {
     if (key && key.ctrl && key.name === "c") {
       detach();
       process.exit(130); // preserve Ctrl-C = interrupt during a turn
+    }
+    if (key && key.name === "escape" && opts.onInterrupt) {
+      // Esc = pause/interrupt the model so the user can redirect. Clear any
+      // half-typed aside line first so it isn't left dangling on screen.
+      if (typing) {
+        process.stdout.write("\r\x1b[2K");
+        endTyping();
+      }
+      opts.onInterrupt();
+      return;
     }
     if (key && (key.name === "return" || key.name === "enter")) {
       if (!typing) return;

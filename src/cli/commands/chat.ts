@@ -675,10 +675,12 @@ async function runAssistantTurn(
   // addresses it without the user waiting for the whole task to finish.
   const pending: string[] = [];
   let currentSpinner: Spinner | undefined;
+  let aborter: AbortController | null = null; // set per stream; Esc aborts it
   const interject = captureInterjections({
     label: chalk.yellow("btw › "),
     onStartTyping: () => currentSpinner?.pause(),
     onStopTyping: () => currentSpinner?.resume(),
+    onInterrupt: () => aborter?.abort(),
     onSubmit: (text) => {
       const t = text.replace(/^\/btw\b\s*/i, "").trim();
       if (!t) return;
@@ -746,15 +748,26 @@ async function runAssistantTurn(
     // buffer the visible text and print it after the spinner clears, so the
     // animated status line and the answer never fight over the same row. The
     // spinner's ↓ counter is the live feedback during generation.
+    aborter = new AbortController();
     try {
       res = await streamWithFallback(s, history, {
         temperature: turnTemperature(s, reasoning),
         tools: toolSpecs,
         think: reasoning,
+        signal: aborter.signal,
       }, spinner);
+    } catch (err) {
+      // Esc-interrupt: stop this turn cleanly and hand control back to the prompt
+      // so the user can redirect — no fallback, no error spew.
+      if (isInterrupt(err)) {
+        console.log(chalk.yellow("\n  ⏸ interrupted — type your next message.\n"));
+        return { userMessage: "", failures, finalAnswer: "", stepLimitHit: false };
+      }
+      throw err;
     } finally {
       spinner.stop();
       currentSpinner = undefined;
+      aborter = null;
     }
     meter.record(res, {
       in: historyTokens(history, s.provider),
@@ -1146,6 +1159,11 @@ async function generateWithFallback(
  * chain). The ↑/↓ totals are reconciled to the model's EXACT usage counts when
  * the stream's final usage frame arrives.
  */
+/** A user Esc-interrupt surfaces as this sentinel from the provider stream. */
+function isInterrupt(err: unknown): boolean {
+  return err instanceof Error && err.message === "__interrupted__";
+}
+
 async function streamWithFallback(
   s: Session,
   history: Message[],
@@ -1197,6 +1215,7 @@ async function streamWithFallback(
   try {
     return await attempt();
   } catch (err) {
+    if (isInterrupt(err)) throw err; // user interrupt — never fall back or retry
     if (!looksUnavailable(err as Error)) {
       // Streaming genuinely failed for a non-availability reason — fall back to
       // the blocking path so the turn still completes.

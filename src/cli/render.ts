@@ -28,7 +28,7 @@ export function banner(info: BannerInfo): string {
     "",
     ...rows,
     dim(`\n   ${info.mode} mode · ${info.provider}:${info.model}`),
-    dim(`   Type a message · @path inlines a file · /models · /help · /exit`),
+    dim(`   Type a message · @path inlines a file · Esc interrupts · /models · /help · /exit`),
     "",
   ].join("\n");
 }
