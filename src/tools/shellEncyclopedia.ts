@@ -76,6 +76,15 @@ export const SHELL_ENCYCLOPEDIA: ShellTopic[] = [
     ],
   },
   {
+    topic: "internet / bandwidth speed",
+    keywords: ["speed", "internet speed", "download speed", "upload speed", "bandwidth", "mbps", "speedtest", "speed test", "how fast", "connection speed", "throughput", "fast is my"],
+    commands: [
+      { cmd: "$b=10000000; $r=[Net.HttpWebRequest]::Create(\"https://speed.cloudflare.com/__down?bytes=$b\"); $r.Timeout=15000; $r.ReadWriteTimeout=15000; try { $t=Measure-Command { $resp=$r.GetResponse(); $st=$resp.GetResponseStream(); $bu=New-Object byte[] 65536; $n=0; while(($k=$st.Read($bu,0,65536)) -gt 0){$n+=$k}; $resp.Close() }; \"{0:N1} Mbps down\" -f ($n*8/$t.TotalSeconds/1e6) } catch { \"download failed (host blocked or no internet): \" + $_.Exception.Message }", desc: "DOWNLOAD speed — ~10MB sample, streamed with a 15s timeout so it fails fast instead of hanging if the host is blocked. Reports Mbps, or a clear error to fall back on latency/link-speed below" },
+      { cmd: "(Test-Connection 1.1.1.1 -Count 4 | Measure-Object -Property ResponseTime -Average).Average", desc: "Average ping latency in ms (to 1.1.1.1)" },
+      { cmd: "Get-NetAdapter | Where-Object Status -eq 'Up' | Format-Table Name, LinkSpeed -Auto", desc: "Adapter link rate — this is the NIC's negotiated speed, NOT your internet speed" },
+    ],
+  },
+  {
     topic: "users & accounts",
     keywords: ["user", "users", "account", "accounts", "whoami", "administrator", "group", "members", "permissions", "privilege"],
     commands: [
@@ -187,6 +196,13 @@ function renderTopic(t: ShellTopic): string {
   const lines = [`## ${t.topic}`];
   if (t.note) lines.push(`note: ${t.note}`);
   for (const c of t.commands) lines.push(`  • ${c.desc}\n    ${c.cmd}`);
+  // Small models tend to "rewrite" these into broken syntax (dropping the $ from
+  // PowerShell variables, Python-style `x = ...`). Tell them to copy exactly.
+  lines.push(
+    "\nRun ONE of these with run_shell EXACTLY as written — copy it character-for-" +
+    "character, keep every $ on PowerShell variables, do not rename, reformat, or " +
+    "convert to another syntax."
+  );
   return lines.join("\n");
 }
 
