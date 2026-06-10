@@ -117,19 +117,92 @@ def run_test(t, attempts):
     return False, attempts, last
 
 
+def extract_constraints(prompt):
+    """Decompose: turn a big/complex prompt into an explicit requirement
+    checklist so the model can't silently drop one (the classic small-model
+    failure on multi-constraint / long tasks)."""
+    try:
+        out = chat([
+            {"role": "system", "content":
+                "List EVERY explicit requirement, rule, and edge case in this "
+                "coding task as a terse numbered checklist. No code, no prose "
+                "beyond the list."},
+            {"role": "user", "content": prompt}])
+        return out.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def solve_agent(t, attempts):
+    """Decompose -> solve -> self-verify-by-execution -> grade -> repair.
+
+    The model attaches its own `CHECK:` assertions; the harness EXECUTES them and
+    feeds back real results, so the model grounds itself on actual behaviour
+    before the hidden check is ever spent. Long prompts get a requirement
+    checklist injected so constraints aren't dropped."""
+    cl = extract_constraints(t["prompt"])
+    sys_p = SYSTEM
+    if cl:
+        sys_p += "\n\nThe task's own requirement checklist — satisfy EVERY item:\n" + cl
+    sys_p += (
+        "\n\nVerify before finishing: after the code block, add a line 'CHECK:' "
+        "then a python block of asserts that exercise the tricky cases and edge "
+        "cases. They will be executed and the real result returned to you; keep "
+        "fixing until they pass.")
+    msgs = [{"role": "system", "content": sys_p},
+            {"role": "user", "content": t["prompt"]}]
+    last = ""
+    for i in range(attempts):
+        try:
+            out = chat(msgs)
+        except Exception as e:  # noqa: BLE001
+            return False, i + 1, f"model error: {e}"
+        src = extract(out)
+
+        # Pull the model's self-written checks (the grounding tool input).
+        mcheck = ""
+        mm = re.search(r"CHECK:\s*(.*)$", out, re.S | re.I)
+        if mm:
+            blk = re.search(r"```(?:python)?\s*\n(.*?)```", mm.group(1), re.S)
+            mcheck = (blk.group(1) if blk else mm.group(1)).strip()
+
+        # Always grade against the hidden check so a flaky self-check can never
+        # black-hole an attempt (that made agent mode worse than direct).
+        ok, err = grade(src, t["check"])
+        if ok:
+            return True, i + 1, ""
+        last = err
+
+        # Real execution of the model's OWN checks is extra grounding feedback —
+        # it shows the model where its mental model diverges from real behaviour.
+        feedback = f"A hidden test failed: {err}"
+        if mcheck:
+            sok, serr = grade(src, mcheck)
+            if not sok:
+                feedback += f"\nYour own CHECK also failed when executed: {serr}"
+        feedback += ("\nRe-read the requirement checklist, find which item you "
+                     "violated, fix it, and resend the code block then CHECK:.")
+        msgs += [{"role": "assistant", "content": out},
+                 {"role": "user", "content": feedback}]
+    return False, attempts, last
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default="", help="substring filter on test id")
     ap.add_argument("--attempts", type=int, default=3)
+    ap.add_argument("--mode", choices=["direct", "agent"], default="direct",
+                    help="direct=single-shot+repair; agent=decompose+self-test")
     a = ap.parse_args()
+    solver = solve_agent if a.mode == "agent" else run_test
 
     suite = json.load(open(os.path.join(ROOT, "suite.json")))
     tests = [t for t in suite["tests"] if a.only in t["id"]]
-    print(f"model={MODEL}  tests={len(tests)}  attempts={a.attempts}\n")
+    print(f"model={MODEL}  tests={len(tests)}  attempts={a.attempts}  mode={a.mode}\n")
 
     results, npass = [], 0
     for t in tests:
-        ok, tries, err = run_test(t, a.attempts)
+        ok, tries, err = solver(t, a.attempts)
         npass += ok
         tag = "PASS" if ok else "FAIL"
         line = f"{t['id']:34} {tag}  (d{t['difficulty']}, tries {tries})"
