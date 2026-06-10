@@ -28,15 +28,44 @@ SYSTEM = (
 )
 
 
-def chat(messages, timeout=180):
+NVIDIA_URL = os.environ.get("NVIDIA_URL", "https://integrate.api.nvidia.com")
+
+
+def _ollama_chat(messages, model, timeout):
     body = json.dumps({
-        "model": MODEL, "messages": messages, "stream": False,
+        "model": model, "messages": messages, "stream": False,
         "options": {"temperature": 0.1, "num_ctx": 8192, "num_predict": 2048},
     }).encode()
     req = urllib.request.Request(OLLAMA + "/api/chat", body,
                                  {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())["message"]["content"]
+
+
+def _nvidia_chat(messages, model, timeout):
+    key = os.environ.get("NVIDIA_API_KEY", "")
+    if not key:
+        raise RuntimeError("NVIDIA_API_KEY not set (export it to use --escalate)")
+    body = json.dumps({
+        "model": model, "messages": messages, "temperature": 0.1,
+        "max_tokens": 4096, "stream": False,
+        # Thinking models on NIM (kimi-k2.6) otherwise leak chain-of-thought into
+        # the answer, which breaks code extraction; ask for a clean reply.
+        "chat_template_kwargs": {"thinking": False},
+    }).encode()
+    req = urllib.request.Request(
+        NVIDIA_URL + "/v1/chat/completions", body,
+        {"Content-Type": "application/json", "Authorization": "Bearer " + key})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())["choices"][0]["message"]["content"]
+
+
+def chat(messages, model=None, timeout=180):
+    """Route to the right backend: 'nvidia:<id>' = NVIDIA NIM cloud, else Ollama."""
+    model = model or MODEL
+    if model.startswith("nvidia:"):
+        return _nvidia_chat(messages, model.split(":", 1)[1], timeout)
+    return _ollama_chat(messages, model, timeout)
 
 
 def extract(text):
@@ -95,13 +124,13 @@ def grade(source, check, timeout=20):
     return status == "ok", msg
 
 
-def run_test(t, attempts):
+def run_test(t, attempts, model=None):
     msgs = [{"role": "system", "content": SYSTEM},
             {"role": "user", "content": t["prompt"]}]
     last = ""
     for i in range(attempts):
         try:
-            out = chat(msgs)
+            out = chat(msgs, model)
         except Exception as e:  # noqa: BLE001
             return False, i + 1, f"model error: {e}"
         src = extract(out)
@@ -117,7 +146,7 @@ def run_test(t, attempts):
     return False, attempts, last
 
 
-def extract_constraints(prompt):
+def extract_constraints(prompt, model=None):
     """Decompose: turn a big/complex prompt into an explicit requirement
     checklist so the model can't silently drop one (the classic small-model
     failure on multi-constraint / long tasks)."""
@@ -127,20 +156,20 @@ def extract_constraints(prompt):
                 "List EVERY explicit requirement, rule, and edge case in this "
                 "coding task as a terse numbered checklist. No code, no prose "
                 "beyond the list."},
-            {"role": "user", "content": prompt}])
+            {"role": "user", "content": prompt}], model)
         return out.strip()
     except Exception:  # noqa: BLE001
         return ""
 
 
-def solve_agent(t, attempts):
+def solve_agent(t, attempts, model=None):
     """Decompose -> solve -> self-verify-by-execution -> grade -> repair.
 
     The model attaches its own `CHECK:` assertions; the harness EXECUTES them and
     feeds back real results, so the model grounds itself on actual behaviour
     before the hidden check is ever spent. Long prompts get a requirement
     checklist injected so constraints aren't dropped."""
-    cl = extract_constraints(t["prompt"])
+    cl = extract_constraints(t["prompt"], model)
     sys_p = SYSTEM
     if cl:
         sys_p += "\n\nThe task's own requirement checklist — satisfy EVERY item:\n" + cl
@@ -154,7 +183,7 @@ def solve_agent(t, attempts):
     last = ""
     for i in range(attempts):
         try:
-            out = chat(msgs)
+            out = chat(msgs, model)
         except Exception as e:  # noqa: BLE001
             return False, i + 1, f"model error: {e}"
         src = extract(out)
@@ -193,25 +222,40 @@ def main():
     ap.add_argument("--attempts", type=int, default=3)
     ap.add_argument("--mode", choices=["direct", "agent"], default="direct",
                     help="direct=single-shot+repair; agent=decompose+self-test")
+    ap.add_argument("--escalate", default="",
+                    help="on local failure, retry with this model "
+                         "(e.g. nvidia:moonshotai/kimi-k2.6). Uses API credit.")
     a = ap.parse_args()
     solver = solve_agent if a.mode == "agent" else run_test
 
     suite = json.load(open(os.path.join(ROOT, "suite.json")))
     tests = [t for t in suite["tests"] if a.only in t["id"]]
-    print(f"model={MODEL}  tests={len(tests)}  attempts={a.attempts}  mode={a.mode}\n")
+    print(f"model={MODEL}  tests={len(tests)}  attempts={a.attempts}  "
+          f"mode={a.mode}  escalate={a.escalate or 'off'}\n")
 
-    results, npass = [], 0
+    results, npass, nesc = [], 0, 0
     for t in tests:
-        ok, tries, err = solver(t, a.attempts)
+        ok, tries, err = solver(t, a.attempts)          # local 7B first
+        via = MODEL
+        if not ok and a.escalate:                       # tier 2: stronger model
+            ok2, tries2, err2 = solver(t, a.attempts, model=a.escalate)
+            if ok2:
+                ok, tries, via = True, tries2, a.escalate
+                nesc += 1
+            else:
+                err = f"7b: {err[:80]} | {a.escalate}: {err2[:80]}"
         npass += ok
         tag = "PASS" if ok else "FAIL"
-        line = f"{t['id']:34} {tag}  (d{t['difficulty']}, tries {tries})"
+        line = f"{t['id']:34} {tag}  (d{t['difficulty']}, tries {tries}"
+        line += f", via {via.split('/')[-1]})" if ok and via != MODEL else ")"
         if not ok:
             line += "  " + err[:140].replace("\n", " ")
         print(line, flush=True)
-        results.append({"id": t["id"], "pass": ok, "tries": tries, "error": err})
+        results.append({"id": t["id"], "pass": ok, "tries": tries,
+                        "via": via if ok else None, "error": err})
 
-    print(f"\n{npass}/{len(tests)} passed")
+    extra = f" ({nesc} via {a.escalate.split('/')[-1]})" if nesc else ""
+    print(f"\n{npass}/{len(tests)} passed{extra}")
     json.dump(results, open(os.path.join(ROOT, "results.json"), "w"), indent=2)
     sys.exit(0 if npass == len(tests) else 1)
 
