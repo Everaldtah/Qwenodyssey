@@ -143,9 +143,18 @@ export class ShellSession {
       const quietAndSettle = () => {
         // Blank the prompt for clean output. Do NOT remove PSReadLine — doing so
         // mid-session wedges the input reader and the next command is lost; its
-        // syntax-highlight ANSI is harmless (stripped on read).
-        if (isWin) this.pty.write("function prompt { '' }\r");
-        else this.pty.write("PS1=''\r");
+        // syntax-highlight ANSI is harmless (stripped on read). Also default
+        // Invoke-WebRequest/RestMethod to -UseBasicParsing + silence progress so
+        // web cmdlets don't stall on the legacy IE engine.
+        if (isWin) {
+          this.pty.write(
+            "function prompt { '' }; $ProgressPreference='SilentlyContinue'; " +
+              "$PSDefaultParameterValues['Invoke-WebRequest:UseBasicParsing']=$true; " +
+              "$PSDefaultParameterValues['Invoke-RestMethod:UseBasicParsing']=$true\r"
+          );
+        } else {
+          this.pty.write("PS1=''\r");
+        }
         setTimeout(resolve, 400); // let the init line run; its output is discarded (no active job)
       };
       if (this.sawData) quietAndSettle();

@@ -98,6 +98,21 @@ function resolveTimeout(args: Record<string, any>, ctx: ToolContext): number {
   return Math.min(Math.max(requested, 1_000), 600_000);
 }
 
+/**
+ * Preamble prepended to every Windows PowerShell command so common web cmdlets
+ * work in our `-NonInteractive` shell. In Windows PowerShell 5.1, an
+ * `Invoke-WebRequest`/`Invoke-RestMethod` WITHOUT `-UseBasicParsing` falls back to
+ * the legacy Internet Explorer DOM engine, which tries to prompt and then dies
+ * with "Windows PowerShell is in NonInteractive mode. Read and Prompt
+ * functionality is not available." Defaulting `-UseBasicParsing` (and silencing
+ * the progress bar) fixes that for any command the model writes, without it
+ * having to remember the flag.
+ */
+export const PS_PREAMBLE =
+  "$ProgressPreference='SilentlyContinue'; " +
+  "$PSDefaultParameterValues['Invoke-WebRequest:UseBasicParsing']=$true; " +
+  "$PSDefaultParameterValues['Invoke-RestMethod:UseBasicParsing']=$true; ";
+
 async function execute(cmd: string, ctx: ToolContext, timeoutMs: number): Promise<ToolResult> {
   const common = { cwd: ctx.cwd, timeout: timeoutMs, reject: false, all: true } as const;
   // On Windows, run through PowerShell (not cmd.exe) so real cmdlets like
@@ -110,7 +125,7 @@ async function execute(cmd: string, ctx: ToolContext, timeoutMs: number): Promis
     process.platform === "win32"
       ? await execa(
           "powershell.exe",
-          ["-NoProfile", "-NonInteractive", "-InputFormat", "None", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+          ["-NoProfile", "-NonInteractive", "-InputFormat", "None", "-ExecutionPolicy", "Bypass", "-Command", PS_PREAMBLE + cmd],
           { ...common, stdin: "ignore", windowsVerbatimArguments: false }
         )
       : await execa(cmd, { ...common, shell: true });

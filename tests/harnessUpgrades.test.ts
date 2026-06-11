@@ -4,7 +4,7 @@ import * as path from "path";
 import * as fs from "fs";
 import { levenshtein, resolveToolName, prepareToolCall } from "../src/tools/toolCallPrep";
 import { ShellSession } from "../src/core/shellSession";
-import { classifyCommand } from "../src/tools/shellTools";
+import { classifyCommand, PS_PREAMBLE } from "../src/tools/shellTools";
 import { readFileTool } from "../src/tools/fileTools";
 import type { ToolContext, ToolSpec } from "../src/types";
 
@@ -102,6 +102,16 @@ describe("classifyCommand — Windows + allow/deny", () => {
   });
   it("tolerates an invalid regex by matching it literally", () => {
     expect(classifyCommand("weird(cmd", { deny: ["weird(cmd"] })).toBe("blocked");
+  });
+});
+
+describe("PowerShell preamble (NonInteractive web-cmdlet fix)", () => {
+  it("defaults Invoke-WebRequest/RestMethod to -UseBasicParsing and silences progress", () => {
+    // In PS 5.1 -NonInteractive, Invoke-WebRequest without -UseBasicParsing dies
+    // with "Read and Prompt functionality is not available"; these defaults fix it.
+    expect(PS_PREAMBLE).toContain("Invoke-WebRequest:UseBasicParsing']=$true");
+    expect(PS_PREAMBLE).toContain("Invoke-RestMethod:UseBasicParsing']=$true");
+    expect(PS_PREAMBLE).toContain("$ProgressPreference='SilentlyContinue'");
   });
 });
 
