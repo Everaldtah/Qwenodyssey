@@ -30,6 +30,10 @@ export interface ProviderConfig {
   /** Nemotron reasoning models: enable_thinking toggle + reasoning_budget. */
   nemotronThinking?: boolean;
   reasoningBudget?: number;
+  /** Anthropic OAuth bearer token (Claude subscription); preferred over apiKey when set. */
+  authToken?: string;
+  /** Re-mint a short-lived OAuth token on a 401 (e.g. via `ant auth print-credentials`). */
+  refreshAuth?: () => string | null;
 }
 
 export abstract class OpenAICompatibleProvider implements Provider {

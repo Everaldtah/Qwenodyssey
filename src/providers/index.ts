@@ -8,6 +8,8 @@ import { VLLMProvider } from "./vllm";
 import { LlamaCppProvider } from "./llamacpp";
 import { NvidiaNimProvider } from "./nvidia";
 import { OpenRouterProvider } from "./openrouter";
+import { AnthropicProvider } from "./anthropic";
+import execa from "execa";
 
 /** Sensible default base URLs per provider when the config leaves it blank. */
 const DEFAULT_BASE: Record<string, string> = {
@@ -18,6 +20,7 @@ const DEFAULT_BASE: Record<string, string> = {
   llamacpp: "http://localhost:8080",
   nvidia: "https://integrate.api.nvidia.com",
   openrouter: "https://openrouter.ai/api",
+  anthropic: "https://api.anthropic.com",
 };
 
 /**
@@ -40,10 +43,69 @@ export function resolveOpenRouterKey(config: Config): string {
   return o.api_key || process.env[envName] || process.env.OPENROUTER_API_KEY || "";
 }
 
+// Cache the `ant` token lookup so the per-turn fallback/picker checks don't spawn
+// a subprocess every time. OAuth tokens live far longer than the TTL; a 401
+// forces a fresh mint (see refreshAuth in createAnthropicProvider).
+let cliTokenCache: { token: string | null; at: number } = { token: null, at: 0 };
+const CLI_TOKEN_TTL_MS = 60_000;
+
+/**
+ * Get an Anthropic OAuth bearer token from the `ant` CLI (the documented way to
+ * use a Claude Pro/Max subscription). `ant auth print-credentials --access-token`
+ * refreshes the token if needed and prints just the bearer. Best-effort: returns
+ * null if `ant` isn't installed or the user isn't logged in. Cached for a minute
+ * unless `force` is set (used on a 401 to re-mint an expired token).
+ */
+export function antPrintCredentials(force = false): string | null {
+  if (!force && Date.now() - cliTokenCache.at < CLI_TOKEN_TTL_MS) return cliTokenCache.token;
+  let token: string | null = null;
+  for (const bin of ["ant", "ant.cmd"]) {
+    try {
+      const r = execa.sync(bin, ["auth", "print-credentials", "--access-token"], { timeout: 15000 });
+      const tok = (r.stdout || "").trim();
+      // A real bearer token is a single whitespace-free string. `ant` exits 0 even
+      // when not logged in (printing a message to stderr), so guard against ever
+      // treating stray output as a credential.
+      if (tok && !/\s/.test(tok) && tok.length >= 20) {
+        token = tok;
+        break;
+      }
+    } catch {
+      /* try the next binary name / fall through */
+    }
+  }
+  cliTokenCache = { token, at: Date.now() };
+  return token;
+}
+
+/**
+ * Resolve Anthropic auth WITHOUT requiring a committed secret. Two modes:
+ *  - OAuth bearer (Claude subscription): explicit config token, then the env var,
+ *    then the `ant` CLI (auto-refreshing) when use_cli_auth is on.
+ *  - API key (console pay-as-you-go): explicit config, then the env var.
+ */
+export function resolveAnthropicAuth(config: Config): { authToken: string; apiKey: string } {
+  const a = config.anthropic;
+  const tokenEnv = a.auth_token_env || "ANTHROPIC_AUTH_TOKEN";
+  const keyEnv = a.api_key_env || "ANTHROPIC_API_KEY";
+  let authToken = a.auth_token || process.env[tokenEnv] || "";
+  if (!authToken && a.use_cli_auth) authToken = antPrintCredentials() || "";
+  const apiKey = a.api_key || process.env[keyEnv] || "";
+  return { authToken, apiKey };
+}
+
+/** Is some Anthropic credential available (OAuth token or API key)? */
+export function anthropicAuthAvailable(config: Config): boolean {
+  if (!config.anthropic.enabled) return false;
+  const { authToken, apiKey } = resolveAnthropicAuth(config);
+  return !!(authToken || apiKey);
+}
+
 export function createProvider(config: Config): Provider {
   const m = config.model;
   if (m.provider === "nvidia") return createNvidiaProvider(config, m.model);
   if (m.provider === "openrouter") return createOpenRouterProvider(config, m.model);
+  if (m.provider === "anthropic") return createAnthropicProvider(config, m.model);
   const cfg: ProviderConfig = {
     model: m.model,
     baseUrl: m.base_url || DEFAULT_BASE[m.provider] || "http://localhost:11434",
@@ -131,6 +193,30 @@ export function createOpenRouterProvider(config: Config, model: string): Provide
     maxTokens: m.max_tokens,
     contextTokens: m.context_tokens,
     requestTimeoutMs: config.openrouter.request_timeout_ms,
+  });
+}
+
+/**
+ * Build an Anthropic (Claude) provider for a specific model, independent of the
+ * configured default provider — usable as the primary brain or a fallback. Auth
+ * is OAuth-first (Claude subscription via the `ant` CLI) with API-key fallback;
+ * the OAuth token auto-refreshes on a 401 via the refreshAuth thunk.
+ */
+export function createAnthropicProvider(config: Config, model: string): Provider {
+  const m = config.model;
+  const { authToken, apiKey } = resolveAnthropicAuth(config);
+  return new AnthropicProvider({
+    model,
+    baseUrl: config.anthropic.base_url || DEFAULT_BASE.anthropic,
+    apiKey,
+    authToken,
+    // Only the CLI source can refresh; a config/env token can't be re-minted here.
+    refreshAuth: config.anthropic.use_cli_auth ? () => antPrintCredentials(true) : undefined,
+    temperature: m.temperature,
+    topP: m.top_p,
+    maxTokens: m.max_tokens,
+    contextTokens: m.context_tokens,
+    requestTimeoutMs: config.anthropic.request_timeout_ms,
   });
 }
 

@@ -11,7 +11,7 @@ export const WORKSPACE_DIR = ".qwenodyssey";
 
 const ModelConfig = z.object({
   provider: z
-    .enum(["ollama", "lmstudio", "openai", "vllm", "llamacpp", "nvidia", "openrouter"])
+    .enum(["ollama", "lmstudio", "openai", "vllm", "llamacpp", "nvidia", "openrouter", "anthropic"])
     .default("ollama"),
   model: z.string().default("qwen2.5:7b"),
   // Ordered fallback chain: tried in turn if `model` isn't installed at launch,
@@ -187,6 +187,35 @@ const OpenRouterConfig = z.object({
   request_timeout_ms: z.number().default(90000),
 });
 
+/**
+ * Anthropic (Claude) cloud endpoint — the NATIVE Messages API
+ * (https://api.anthropic.com/v1/messages). Lets a Claude model (Opus/Sonnet/
+ * Haiku/Fable) act as the primary brain or a fallback. TWO auth modes:
+ *  - **Claude Pro/Max subscription** (OAuth): the agent reads a short-lived bearer
+ *    token from the `ant` CLI (`ant auth print-credentials`) when use_cli_auth is
+ *    on — the same path Claude Code uses — or from the ANTHROPIC_AUTH_TOKEN env var.
+ *  - **API key** (console.anthropic.com, pay-as-you-go): ANTHROPIC_API_KEY.
+ * Secrets are NEVER required in a committed file — leave the fields blank and use
+ * the env vars or `ant auth login`.
+ */
+const AnthropicConfig = z.object({
+  enabled: z.boolean().default(true),
+  base_url: z.string().default("https://api.anthropic.com"),
+  // OAuth bearer token for a Claude subscription. Prefer leaving blank + `ant auth login`.
+  auth_token: z.string().default(""),
+  auth_token_env: z.string().default("ANTHROPIC_AUTH_TOKEN"),
+  // Source (and auto-refresh) the OAuth token from the `ant` CLI when no explicit
+  // token is set. Turn off if you don't have the Anthropic CLI installed.
+  use_cli_auth: z.boolean().default(true),
+  // Developer API key (pay-as-you-go). Prefer the env var.
+  api_key: z.string().default(""),
+  api_key_env: z.string().default("ANTHROPIC_API_KEY"),
+  // Include anthropic:* refs from fallback_models in the runtime fallback chain.
+  include_as_fallback: z.boolean().default(true),
+  // Abort a request after this many ms so a stall fails over to the next model.
+  request_timeout_ms: z.number().default(120000),
+});
+
 /** Webcam vision: capture a frame and describe it with a vision-language model. */
 const VisionConfig = z.object({
   enabled: z.boolean().default(true),
@@ -310,6 +339,7 @@ export const ConfigSchema = z.object({
   lmstudio: LmStudioConfig.default({}),
   nvidia: NvidiaConfig.default({}),
   openrouter: OpenRouterConfig.default({}),
+  anthropic: AnthropicConfig.default({}),
   vision: VisionConfig.default({}),
   audio: AudioConfig.default({}),
   tts: TtsConfig.default({}),

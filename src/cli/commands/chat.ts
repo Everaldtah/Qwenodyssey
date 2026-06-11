@@ -19,9 +19,11 @@ import {
   createLmStudioProvider,
   createNvidiaProvider,
   createOpenRouterProvider,
+  createAnthropicProvider,
   createOllamaProvider,
   resolveNvidiaKey,
   resolveOpenRouterKey,
+  anthropicAuthAvailable,
 } from "../../providers";
 import { KnowledgeBase } from "../../core/knowledge";
 import { EvolutionEngine, TurnSignals } from "../../core/evolution";
@@ -58,7 +60,7 @@ function isReasoningModel(model: string): boolean {
 
 /** Cloud backends, where a hard 0 temperature risks repetition loops. */
 function isCloudProvider(name: string): boolean {
-  return name === "nvidia" || name === "openai" || name === "openrouter";
+  return name === "nvidia" || name === "openai" || name === "openrouter" || name === "anthropic";
 }
 
 /**
@@ -211,6 +213,7 @@ function selfAwareness(
     lmstudio: "a local LM Studio model",
     nvidia: "a cloud model via NVIDIA NIM (integrate.api.nvidia.com)",
     openrouter: "a cloud model via OpenRouter (openrouter.ai)",
+    anthropic: "Anthropic's Claude API (api.anthropic.com)",
     openai: "an OpenAI-compatible endpoint",
     vllm: "a local vLLM server",
     llamacpp: "a local llama.cpp server",
@@ -987,17 +990,18 @@ function lmsPort(baseUrl: string): number {
   return m ? Number(m[1]) : 1234;
 }
 
-type ModelKind = "ollama" | "lmstudio" | "nvidia" | "openrouter";
+type ModelKind = "ollama" | "lmstudio" | "nvidia" | "openrouter" | "anthropic";
 
 /**
  * A fallback/picker entry is "lmstudio:<key>" for LM Studio, "nvidia:<model>" for
- * the NVIDIA NIM cloud endpoint, "openrouter:<model>" for OpenRouter, else a bare
- * Ollama tag.
+ * the NVIDIA NIM cloud endpoint, "openrouter:<model>" for OpenRouter,
+ * "anthropic:<model>" for the Claude API, else a bare Ollama tag.
  */
 function parseModelRef(ref: string): { kind: ModelKind; model: string } {
   if (ref.startsWith("lmstudio:")) return { kind: "lmstudio", model: ref.slice("lmstudio:".length) };
   if (ref.startsWith("nvidia:")) return { kind: "nvidia", model: ref.slice("nvidia:".length) };
   if (ref.startsWith("openrouter:")) return { kind: "openrouter", model: ref.slice("openrouter:".length) };
+  if (ref.startsWith("anthropic:")) return { kind: "anthropic", model: ref.slice("anthropic:".length) };
   return { kind: "ollama", model: ref };
 }
 
@@ -1009,6 +1013,11 @@ function nvidiaKeyPresent(s: Session): boolean {
 /** Is an OpenRouter API key available (config or env)? Cloud refs need it. */
 function openRouterKeyPresent(s: Session): boolean {
   return !!resolveOpenRouterKey(s.config);
+}
+
+/** Is an Anthropic credential available (OAuth subscription token or API key)? */
+function anthropicAuthPresent(s: Session): boolean {
+  return anthropicAuthAvailable(s.config);
 }
 
 /**
@@ -1026,6 +1035,11 @@ async function applyModelRef(s: Session, ref: string): Promise<void> {
   }
   if (kind === "openrouter") {
     s.provider = createOpenRouterProvider(s.config, model);
+    s.refreshIdentity?.();
+    return;
+  }
+  if (kind === "anthropic") {
+    s.provider = createAnthropicProvider(s.config, model);
     s.refreshIdentity?.();
     return;
   }
@@ -1072,19 +1086,24 @@ function fallbackChain(s: Session): string[] {
     s.config.nvidia.enabled && s.config.nvidia.include_as_fallback && nvidiaKeyPresent(s);
   const openRouterOk =
     s.config.openrouter.enabled && s.config.openrouter.include_as_fallback && openRouterKeyPresent(s);
+  const anthropicOk =
+    s.config.anthropic.enabled && s.config.anthropic.include_as_fallback && anthropicAuthPresent(s);
   const activeKind: ModelKind =
     s.provider.name === "nvidia"
       ? "nvidia"
       : s.provider.name === "openrouter"
         ? "openrouter"
-        : s.provider.name === "lmstudio"
-          ? "lmstudio"
-          : "ollama";
+        : s.provider.name === "anthropic"
+          ? "anthropic"
+          : s.provider.name === "lmstudio"
+            ? "lmstudio"
+            : "ollama";
   return refs.filter((ref) => {
     if (!ref) return false;
     const { kind, model } = parseModelRef(ref);
     if (kind === "nvidia" && !nvidiaOk) return false; // cloud needs a key
     if (kind === "openrouter" && !openRouterOk) return false; // cloud needs a key
+    if (kind === "anthropic" && !anthropicOk) return false; // cloud needs auth
     // Drop the currently-active backend+model so we never "fall back" to it.
     if (kind === activeKind && model.toLowerCase() === s.provider.model.toLowerCase()) return false;
     if (seen.has(ref)) return false;
@@ -1119,6 +1138,16 @@ async function resolveStartupModel(s: Session): Promise<void> {
     );
   }
 
+  // Anthropic (Claude) cloud primary: usable as long as we have a credential.
+  if (s.provider.name === "anthropic") {
+    if (anthropicAuthPresent(s)) return;
+    console.log(
+      chalk.yellow(
+        `⚠ "${s.config.model.model}" needs Anthropic auth — log in with \`ant auth login\` (Claude subscription) or set ANTHROPIC_API_KEY. Trying local fallbacks.`
+      )
+    );
+  }
+
   const chain = fallbackChain(s);
   if (!chain.length) return;
 
@@ -1140,6 +1169,7 @@ async function resolveStartupModel(s: Session): Promise<void> {
     if (kind === "lmstudio") return s.lmsModelKeys.includes(model);
     if (kind === "nvidia") return nvidiaKeyPresent(s);
     if (kind === "openrouter") return openRouterKeyPresent(s);
+    if (kind === "anthropic") return anthropicAuthPresent(s);
     return ollamaHas(model);
   };
 
@@ -1852,6 +1882,33 @@ async function gatherModelEntries(s: Session, cached: ModelInfo[]): Promise<Mode
         label: model,
         hint: "openrouter · cloud",
         current: s.provider.name === "openrouter" && model === s.provider.model,
+      });
+    }
+  }
+
+  // Anthropic (Claude) models — shown whenever a credential is available (an OAuth
+  // subscription token from `ant`, or an API key). We seed the current Claude
+  // lineup so the user can pick one directly, plus the configured primary and any
+  // anthropic:* fallbacks. This is "the place to use Anthropic models".
+  if (anthropicAuthAvailable(s.config)) {
+    const claudeModels = new Set<string>([
+      "claude-opus-4-8",
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5",
+      "claude-opus-4-7",
+      "claude-fable-5",
+    ]);
+    if (s.config.model.provider === "anthropic") claudeModels.add(s.config.model.model);
+    for (const ref of s.config.model.fallback_models ?? []) {
+      const t = ref.trim();
+      if (t.startsWith("anthropic:")) claudeModels.add(t.slice("anthropic:".length));
+    }
+    for (const model of claudeModels) {
+      entries.push({
+        ref: `anthropic:${model}`,
+        label: model,
+        hint: "anthropic · claude",
+        current: s.provider.name === "anthropic" && model === s.provider.model,
       });
     }
   }
