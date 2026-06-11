@@ -82,6 +82,11 @@ const ToolsConfig = z.object({
   // override the built-in catastrophic hard-block list.
   allow_commands: z.array(z.string()).default([]),
   deny_commands: z.array(z.string()).default([]),
+  // Default wall-clock timeout for a single run_shell command, in ms. Raised from
+  // the old fixed 120s so ordinary slow jobs (git clone, npm/pip install, a build)
+  // don't get killed. A command can request more via its `timeout_ms` arg (capped
+  // at 10 min); genuinely long-running / interactive work should use shell_session.
+  shell_timeout_ms: z.number().default(240000),
   // Enable the persistent shell-session tools (shell_session / _read / _reset),
   // backed by a real pseudo-terminal (node-pty). Keeps cwd/env/processes alive
   // across calls and lets long-running commands be polled. Opt-in because a live

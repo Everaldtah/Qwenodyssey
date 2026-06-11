@@ -14,12 +14,21 @@ export const CHAT_TOOL_SPECS: ToolSpec[] = [
   {
     name: "run_shell",
     description:
-      "Execute a shell command in the project directory and return its combined stdout/stderr. " +
+      "Execute ONE shell command in the project directory and return its combined stdout/stderr. " +
       "Use this for any real action: checking the OS, network/wifi status, running tests, git, " +
-      "listing processes, installing packages, etc. On Windows the shell is PowerShell/cmd.",
+      "listing processes, installing packages, etc. On Windows the shell is PowerShell. Each call " +
+      "is a FRESH shell (cwd/env do NOT persist between calls — chain with ';' or use shell_session). " +
+      "It blocks until the command finishes or times out (default ~4 min). For a command you expect " +
+      "to be slow, pass a larger `timeout_ms`. For a genuinely long-running or interactive job (cloning " +
+      "a large repo, install, build, a server, a REPL), prefer shell_session — it runs persistently and " +
+      "you poll it with shell_session_read instead of blocking. Be efficient: fetch/clone ONCE; never " +
+      "loop downloading files one-by-one when a single clone, tarball, or API call would do.",
     parameters: {
       type: "object",
-      properties: { command: str("The exact command line to run.") },
+      properties: {
+        command: str("The exact command line to run."),
+        timeout_ms: { type: "integer", description: "Max wall-clock time before abort (default ~240000, max 600000). Raise it for slow commands." },
+      },
       required: ["command"],
     },
   },

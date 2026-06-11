@@ -164,6 +164,8 @@ export interface ToolContext {
   allowCommands?: string[];
   /** Config tools.deny_commands — hard-blocked. */
   denyCommands?: string[];
+  /** Default run_shell timeout in ms (config tools.shell_timeout_ms). */
+  shellTimeoutMs?: number;
   /** Qwenodyssey's own install/source root — writable so the agent can self-modify. */
   selfRoot?: string;
   log: (entry: Record<string, unknown>) => void;

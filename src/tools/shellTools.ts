@@ -92,8 +92,14 @@ export function classifyCommand(
   return "safe";
 }
 
-async function execute(cmd: string, ctx: ToolContext): Promise<ToolResult> {
-  const common = { cwd: ctx.cwd, timeout: 120_000, reject: false, all: true } as const;
+/** Clamp a requested timeout into a sane band (1s … 10min). */
+function resolveTimeout(args: Record<string, any>, ctx: ToolContext): number {
+  const requested = Number(args.timeout_ms) || ctx.shellTimeoutMs || 240_000;
+  return Math.min(Math.max(requested, 1_000), 600_000);
+}
+
+async function execute(cmd: string, ctx: ToolContext, timeoutMs: number): Promise<ToolResult> {
+  const common = { cwd: ctx.cwd, timeout: timeoutMs, reject: false, all: true } as const;
   // On Windows, run through PowerShell (not cmd.exe) so real cmdlets like
   // Get-WinEvent / Get-Process / Get-Service work. We pass the command as a
   // single -Command argument (execa escapes it) rather than -EncodedCommand:
@@ -115,10 +121,18 @@ async function execute(cmd: string, ctx: ToolContext): Promise<ToolResult> {
     exitCode: result.exitCode,
     timedOut: result.timedOut,
   });
+  // On timeout, return the partial output captured so far PLUS a clear pointer to
+  // the right tool — so the model can recover instead of treating it as a dead end.
+  const timeoutNote = result.timedOut
+    ? `\n[timed out after ${Math.round(timeoutMs / 1000)}s — partial output above. ` +
+      `For a slow command, retry run_shell with a larger timeout_ms (up to 600000). ` +
+      `For a genuinely long-running or interactive job (clone of a big repo, install, build, ` +
+      `server), use shell_session (persistent) and poll it with shell_session_read instead.]`
+    : "";
   return {
-    ok: result.exitCode === 0,
-    output: out + (result.timedOut ? "\n[timed out after 120s]" : ""),
-    data: { exitCode: result.exitCode },
+    ok: result.exitCode === 0 && !result.timedOut,
+    output: out + timeoutNote,
+    data: { exitCode: result.exitCode, timedOut: result.timedOut },
   };
 }
 
@@ -150,6 +164,6 @@ export const runShellTool: Tool = {
         return { ok: false, output: "Declined by user." };
       }
     }
-    return execute(cmd, ctx);
+    return execute(cmd, ctx, resolveTimeout(args, ctx));
   },
 };

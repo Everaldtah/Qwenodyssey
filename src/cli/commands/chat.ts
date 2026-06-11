@@ -110,8 +110,22 @@ as text, OR replying "I don't have shell/network access" (you DO — you have ru
 
 Questions about THIS computer right now — speed, time, IP, uptime, disk space, what's
 running — are a command to ACT: call run_shell immediately, never answer from guesswork and
-never deny having access. Prefer FAST commands and never run an unbounded or huge download
-(sample ~10MB); run_shell aborts after 120s, so a slow command returns nothing useful.
+never deny having access.
+
+EFFICIENT, NON-BLOCKING SHELL USE — run_shell blocks until the command finishes or times out
+(~4 min default). To avoid stalls:
+- Be EFFICIENT. Do the work in ONE command, not a slow loop. To measure/inspect a remote repo,
+  clone it ONCE (\`git clone --depth 1\`) or download its tarball ONCE and work locally — never
+  loop fetching files one-by-one over HTTP (that is what just timed out). Use the right tool:
+  git, a single API call, \`Measure-Object\`, \`Get-ChildItem -Recurse\`.
+- For a command you KNOW is slow (clone, npm/pip install, build, big download), pass a larger
+  \`timeout_ms\` (up to 600000) on the run_shell call.
+- For genuinely long-running or interactive work (a server, a watch, a REPL, a multi-minute
+  build), use shell_session — it runs PERSISTENTLY and you poll it with shell_session_read,
+  so it never blocks the turn. If run_shell times out, switch to shell_session rather than
+  retrying the same blocking command.
+- A timeout returns the PARTIAL output plus a hint; read it and adapt — don't treat it as a
+  dead end or repeat the identical command.
 
 This machine runs Windows and run_shell executes through WINDOWS POWERSHELL (5.1) — NOT
 cmd.exe. So use real PowerShell cmdlets: Get-Process, Get-Service, Get-WinEvent,
@@ -142,6 +156,23 @@ ANALYSING A PROJECT (e.g. "explain what this project is about <path>"):
 A directory listing is NOT an analysis: do not stop after one tree/list and summarise the
 file names — read the important files first, then explain the project's purpose, stack, and
 structure. Keep calling tools until you genuinely understand it.`;
+
+/**
+ * Appended ONLY when the persistent shell session is enabled (tools.shell_session),
+ * so the model is never told to use a tool it doesn't have. This is the harness's
+ * answer to "don't stall on long tasks": a real terminal whose state persists and
+ * that you poll instead of blocking.
+ */
+const SHELL_SESSION_SYSTEM = `
+PERSISTENT SHELL — you also have shell_session / shell_session_read / shell_session_reset.
+Unlike run_shell (a fresh, blocking shell each call), shell_session keeps ONE shell alive:
+cwd, env vars, activated venvs and background processes survive between calls.
+- Use it when commands DEPEND on each other: shell_session {command:"cd build"} then
+  shell_session {command:"cmake .."} — the directory persists.
+- Use it for LONG or interactive work: start it (shell_session {command:"npm run build"}),
+  and if it hasn't finished, call shell_session_read to get more output — it never blocks the
+  turn waiting, so a multi-minute job won't time the turn out.
+- shell_session_reset restarts the shell if it gets stuck.`;
 
 /**
  * Teaches the model to track multi-step work with the update_plan tool. Small
@@ -323,6 +354,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   // finishes in the background (so a slow scan doesn't delay the prompt).
   let sys = loadPrompt("system") + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK + "\n" + PLAN_SYSTEM;
   if (memoryEnabled || s.config.web.enabled) sys += "\n" + MEMORY_SYSTEM;
+  if (s.config.tools.shell_session && s.config.tools.allow_shell) sys += "\n" + SHELL_SESSION_SYSTEM;
   if (swarmReady) sys += "\n" + SWARM_SYSTEM;
   sys += "\n" + selfAwareness(s, kb, memoryEnabled, !!evolution);
   const history: Message[] = [{ role: "system", content: sys }];
@@ -410,6 +442,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     sandbox: s.config.tools.sandbox,
     allowCommands: s.config.tools.allow_commands,
     denyCommands: s.config.tools.deny_commands,
+    shellTimeoutMs: s.config.tools.shell_timeout_ms,
     selfRoot: s.selfRoot,
     log: (entry) => s.logger.event(entry),
   };
