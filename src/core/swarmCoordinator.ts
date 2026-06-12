@@ -24,7 +24,14 @@
  */
 import { EventEmitter } from "events";
 import type { Config } from "./config";
-import type { Message, Provider } from "../types";
+import type { Message, Provider, ToolSpec } from "../types";
+import {
+  chooseExecutor,
+  type AgentExecutor,
+  type ExecMode,
+  type PlanComplexity,
+  type BareExecutorOptions,
+} from "./agentExec";
 import {
   frontierWorkers,
   isReasoningModel,
@@ -56,6 +63,20 @@ export const SWARM_AGENT_SYSTEM =
   "or edit files: never emit tool-call syntax (no <tool> tags, no function calls) — output only the " +
   "finished result. When teammates' results are provided as shared context, build directly on them and " +
   "do not redo their work. Be concrete, correct, and self-contained.";
+
+/** Variant used when an execution backend is attached to the run. */
+export function swarmAgentExecSystem(execLabel: string): string {
+  return (
+    "You are an expert AI agent completing ONE part of a larger task as a member of a coordinated team. " +
+    "Produce the actual, finished deliverable for YOUR assigned subtask — real content, not a plan. " +
+    `You have exactly ONE tool: run_shell, which executes a shell command on ${execLabel}. Use it to ` +
+    "create files (e.g. heredocs/Set-Content), install dependencies, build, and VERIFY your work — then " +
+    "state the finished result as text. Workspace is SHARED with your teammates: files they created are " +
+    "already there; put yours alongside them and don't clobber theirs. Keep commands non-interactive and " +
+    "non-destructive. When teammates' results are provided as context, build on them; never redo their work. " +
+    "When you are done, answer with the final deliverable text (and the paths of any files you created)."
+  );
+}
 
 export const SWARM_SYNTH_SYSTEM =
   "You are the LEAD INTEGRATOR of a team of expert AI agents. You merge the team's completed subtask " +
@@ -98,6 +119,14 @@ export interface PlanEvent {
   task: string;
   subtasks: Subtask[];
   roster: { label: string; model: string; backend: string }[];
+  /** Which model produced the plan ("(supplied)" for --divide, "(fallback)" when planning failed). */
+  plannedBy?: string;
+  /** Human-readable diagnostic when planning degraded (e.g. a lead timed out). */
+  note?: string;
+  /** Planner's complexity judgment for the project. */
+  complexity?: PlanComplexity;
+  /** Execution backend label when agents can run commands ("bare metal" / "daytona sandbox"). */
+  exec?: string;
 }
 export interface WaveEvent {
   index: number;
@@ -125,6 +154,7 @@ export interface StatusEvent {
 
 /**
  * Typed EventEmitter facade. Events:
+ *  - "planner"    { model }     — a decompose attempt started on this model
  *  - "plan"       PlanEvent     — decomposition finished, roster known
  *  - "wave"       WaveEvent     — a parallel batch is about to run
  *  - "assign"     AssignEvent   — a subtask was placed on a worker/pane
@@ -204,13 +234,66 @@ export function pickLead(config: Config, workers: SwarmWorker[]): Provider {
 /* ──────────────────────────── Decomposition ──────────────────────────────── */
 
 const PLAN_SCHEMA_HINT =
-  'Return ONLY JSON of the form {"subtasks":[{"id":"slug","title":"…","detail":"…","dependsOn":["otherId"]}]}.';
+  'Return ONLY JSON of the form {"complexity":"simple"|"complex","subtasks":[{"id":"slug","title":"…","detail":"…","dependsOn":["otherId"]}]}. ' +
+  '"complex" = the work needs real project execution (installing dependencies, building/running a multi-file ' +
+  'codebase, long-running processes or services); "simple" = analysis, writing, design, or single-file code.';
+
+export interface DecomposeResult {
+  subtasks: Subtask[];
+  plannedBy: string;
+  note?: string;
+  complexity: PlanComplexity;
+}
+
+/** Read the planner's complexity judgment out of its JSON (defaults to "simple"). */
+export function parseComplexity(text: string): PlanComplexity {
+  const m = text.match(/"complexity"\s*:\s*"(simple|complex)"/i);
+  return m && m[1].toLowerCase() === "complex" ? "complex" : "simple";
+}
 
 /**
- * Ask the lead model to split the task into dependency-aware subtasks sized for the
- * team. Robustly parses the JSON; on any failure, degrades to a single subtask that
- * is the whole task (so the run still proceeds).
+ * Ask a lead model to split the task into dependency-aware subtasks sized for the
+ * team. RESILIENT: tries each candidate planner in order (a slow/timing-out lead —
+ * e.g. nemotron-3-ultra at 90s — must not silently collapse the whole run into one
+ * subtask). Only when EVERY candidate fails does it degrade to a single subtask
+ * that is the whole task, with a note saying so.
  */
+export async function decomposeWith(
+  candidates: Provider[],
+  task: string,
+  workerCount: number,
+  maxTokens: number,
+  signal?: AbortSignal,
+  onAttempt?: (model: string) => void
+): Promise<DecomposeResult> {
+  const errors: string[] = [];
+  for (const lead of candidates) {
+    if (signal?.aborted) break;
+    onAttempt?.(lead.model);
+    try {
+      const { subtasks, complexity } = await decomposeOnce(lead, task, workerCount, maxTokens, signal);
+      if (subtasks.length) {
+        return {
+          subtasks,
+          complexity,
+          plannedBy: lead.model,
+          note: errors.length ? `planner fell back to ${lead.model} (${errors.join("; ")})` : undefined,
+        };
+      }
+      errors.push(`${lead.model}: returned no parseable plan`);
+    } catch (err) {
+      errors.push(`${lead.model}: ${(err as Error).message}`);
+    }
+  }
+  return {
+    subtasks: [{ id: "task", title: task.slice(0, 60), detail: task, dependsOn: [] }],
+    plannedBy: "(fallback)",
+    complexity: "simple",
+    note: `decomposition failed — running as a single task (${errors.join("; ")})`,
+  };
+}
+
+/** Back-compat single-lead wrapper (kept for existing callers/tests). */
 export async function decompose(
   lead: Provider,
   task: string,
@@ -218,6 +301,16 @@ export async function decompose(
   maxTokens: number,
   signal?: AbortSignal
 ): Promise<Subtask[]> {
+  return (await decomposeWith([lead], task, workerCount, maxTokens, signal)).subtasks;
+}
+
+async function decomposeOnce(
+  lead: Provider,
+  task: string,
+  workerCount: number,
+  maxTokens: number,
+  signal?: AbortSignal
+): Promise<{ subtasks: Subtask[]; complexity: PlanComplexity }> {
   const target = Math.max(3, Math.min(workerCount * 2, 8));
   const prompt =
     `Decompose this task for a team of ${workerCount} expert agent(s) working in PARALLEL.\n` +
@@ -237,19 +330,14 @@ export async function decompose(
     { role: "system", content: SWARM_PLANNER_SYSTEM },
     { role: "user", content: prompt },
   ];
-  try {
-    const res = await lead.generate(messages, {
-      temperature: 0.2,
-      max_tokens: Math.min(maxTokens, 1200),
-      json: true,
-      signal,
-    });
-    const parsed = parsePlan(stripThinking(res.text));
-    if (parsed.length) return parsed;
-  } catch {
-    /* fall through to single-subtask degrade */
-  }
-  return [{ id: "task", title: task.slice(0, 60), detail: task, dependsOn: [] }];
+  const res = await lead.generate(messages, {
+    temperature: 0.2,
+    max_tokens: Math.min(maxTokens, 1200),
+    json: true,
+    signal,
+  });
+  const clean = stripThinking(res.text);
+  return { subtasks: parsePlan(clean), complexity: parseComplexity(clean) };
 }
 
 /** Extract a subtasks array from a model response that may wrap JSON in prose/fences. */
@@ -398,6 +486,15 @@ export interface CoordinateOptions {
   /** Pre-supplied subtasks (e.g. from --divide) — skips the decompose call. */
   subtasks?: Subtask[];
   signal?: AbortSignal;
+  /**
+   * Where agents may run commands: "off" (default, text-only), "auto" (bare metal
+   * for simple plans, Daytona sandbox for complex), "bare", "daytona".
+   */
+  execMode?: ExecMode;
+  /** Host-side settings for the bare executor (cwd, allow/deny lists). */
+  bareOpts?: BareExecutorOptions;
+  /** Injectable executor (tests). Overrides execMode routing. */
+  executor?: AgentExecutor;
 }
 
 export class CoordinatedSwarm {
@@ -428,54 +525,98 @@ export class CoordinatedSwarm {
   /** Run the full coordinated flow: plan → waves (with shared context) → synthesize. */
   async run(task: string, opts: CoordinateOptions = {}): Promise<SwarmRun> {
     const synth = opts.synthesize !== false;
-    const subtasks =
-      opts.subtasks && opts.subtasks.length
-        ? opts.subtasks
-        : await decompose(this.lead, task, this.workers.length, this.maxTokens, opts.signal);
+
+    // Planner candidates: roster order (primary first — fast models lead) with the
+    // lead appended; a slow/timing-out lead then costs one attempt, not the plan.
+    const planCands = [
+      ...new Map(
+        [...this.workers.map((w) => w.provider), this.lead].map((p) => [p.model, p])
+      ).values(),
+    ];
+    let subtasks: Subtask[];
+    let plannedBy: string;
+    let note: string | undefined;
+    let complexity: PlanComplexity = "simple";
+    if (opts.subtasks && opts.subtasks.length) {
+      subtasks = opts.subtasks;
+      plannedBy = "(supplied)";
+    } else {
+      const plan = await decomposeWith(
+        planCands,
+        task,
+        this.workers.length,
+        this.maxTokens,
+        opts.signal,
+        (model) => this.events.emit("planner", { model })
+      );
+      subtasks = plan.subtasks;
+      plannedBy = plan.plannedBy;
+      note = plan.note;
+      complexity = plan.complexity;
+    }
+
+    // Execution backend: bare metal for simple projects, an isolated Daytona
+    // sandbox for complex ones (mode "auto"); shared by all agents in the run.
+    let executor: AgentExecutor | null = opts.executor ?? null;
+    if (!executor && opts.execMode && opts.execMode !== "off") {
+      const choice = chooseExecutor(this.config, opts.execMode, complexity, opts.bareOpts);
+      executor = choice.executor;
+      if (choice.note) note = note ? `${note} · ${choice.note}` : choice.note;
+    }
 
     this.events.emit("plan", {
       task,
       subtasks,
       roster: this.roster(),
+      plannedBy,
+      note,
+      complexity,
+      exec: executor?.label,
     } as PlanEvent);
 
     const board = new Blackboard(subtasks);
     const results: CoordinatedResult[] = [];
 
-    let waveIndex = 0;
-    let guard = subtasks.length + 2; // hard stop against any scheduling pathology
-    while (board.pending().length > 0 && guard-- > 0) {
-      let wave = board.ready();
-      if (wave.length === 0) {
-        // Dependency cycle or all-blocked: break it by forcing the pending subtask
-        // with the fewest unmet deps to run anyway (its digest will note the gap).
-        const stuck = board
-          .pending()
-          .sort((a, b) => unmet(board, a) - unmet(board, b))[0];
-        if (!stuck) break;
-        wave = [stuck];
-      }
-
-      this.events.emit("wave", { index: waveIndex, subtaskIds: wave.map((w) => w.id) } as WaveEvent);
-
-      // Run the wave in batches no larger than the roster, so each active subtask
-      // owns exactly one worker/pane at a time.
-      for (let i = 0; i < wave.length; i += this.workers.length) {
-        const batch = wave.slice(i, i + this.workers.length);
-        await Promise.all(
-          batch.map((entry, slot) => this.runSubtask(task, board, entry, slot, opts.signal, results))
-        );
-      }
-      waveIndex++;
-    }
-
     const run: SwarmRun = { mode: "divide", results };
+    try {
+      let waveIndex = 0;
+      let guard = subtasks.length + 2; // hard stop against any scheduling pathology
+      while (board.pending().length > 0 && guard-- > 0) {
+        let wave = board.ready();
+        if (wave.length === 0) {
+          // Dependency cycle or all-blocked: break it by forcing the pending subtask
+          // with the fewest unmet deps to run anyway (its digest will note the gap).
+          const stuck = board
+            .pending()
+            .sort((a, b) => unmet(board, a) - unmet(board, b))[0];
+          if (!stuck) break;
+          wave = [stuck];
+        }
 
-    if (synth && results.some((r) => r.ok)) {
-      this.events.emit("synth", { model: this.lead.model });
-      const synthRun: SwarmRun = { mode: "divide", results };
-      run.synthesis = await this.synthesizeStreamed(task, synthRun, opts.signal);
-      run.synthesizedBy = this.lead.model;
+        this.events.emit("wave", { index: waveIndex, subtaskIds: wave.map((w) => w.id) } as WaveEvent);
+
+        // Run the wave in batches no larger than the roster, so each active subtask
+        // owns exactly one worker/pane at a time.
+        for (let i = 0; i < wave.length; i += this.workers.length) {
+          const batch = wave.slice(i, i + this.workers.length);
+          await Promise.all(
+            batch.map((entry, slot) =>
+              this.runSubtask(task, board, entry, slot, opts.signal, results, executor)
+            )
+          );
+        }
+        waveIndex++;
+      }
+
+      if (synth && results.some((r) => r.ok)) {
+        this.events.emit("synth", { model: this.lead.model });
+        const synthRun: SwarmRun = { mode: "divide", results };
+        run.synthesis = await this.synthesizeStreamed(task, synthRun, opts.signal);
+        run.synthesizedBy = this.lead.model;
+      }
+    } finally {
+      // Tear down the run's sandbox even on abort/failure.
+      await executor?.dispose().catch(() => {});
     }
 
     this.events.emit("done", run);
@@ -489,7 +630,8 @@ export class CoordinatedSwarm {
     entry: BoardEntry,
     pane: number,
     signal: AbortSignal | undefined,
-    sink: CoordinatedResult[]
+    sink: CoordinatedResult[],
+    executor: AgentExecutor | null = null
   ): Promise<void> {
     const worker = this.workers[pane % this.workers.length];
     entry.status = "running";
@@ -516,25 +658,18 @@ export class CoordinatedSwarm {
       `Produce a focused, complete, final result for YOUR subtask. Reference teammates' results where relevant; don't repeat their work.`;
 
     const messages: Message[] = [
-      { role: "system", content: SWARM_AGENT_SYSTEM },
+      { role: "system", content: executor ? swarmAgentExecSystem(executor.label) : SWARM_AGENT_SYSTEM },
       { role: "user", content: prompt },
     ];
 
     const start = Date.now();
     let text = "";
+    const emitDelta = (delta: string) => {
+      text += delta;
+      this.events.emit("delta", { pane, subtaskId: entry.id, delta } as DeltaEvent);
+    };
     try {
-      const res = await worker.provider.stream(
-        messages,
-        (delta) => {
-          text += delta;
-          this.events.emit("delta", { pane, subtaskId: entry.id, delta } as DeltaEvent);
-        },
-        {
-          temperature: isReasoningModel(worker.model) ? 0.6 : 0.3,
-          max_tokens: this.maxTokens,
-          signal,
-        }
-      );
+      const res = await this.agentLoop(worker, messages, emitDelta, signal, executor, pane, entry.id);
       const clean = stripThinking(res.text || text).trim();
       entry.status = "done";
       entry.result = clean;
@@ -588,6 +723,80 @@ export class CoordinatedSwarm {
       } as StatusEvent);
       this.events.emit("result", result);
     }
+  }
+
+  /**
+   * One agent turn — or, when an executor is attached, a bounded tool loop: the
+   * model may call run_shell (executed on the run's backend), sees each result,
+   * and finishes with a text deliverable. Commands and output tails are emitted
+   * as pane deltas so the TUI shows the agent *working*, not just talking.
+   */
+  private async agentLoop(
+    worker: SwarmWorker,
+    messages: Message[],
+    emitDelta: (d: string) => void,
+    signal: AbortSignal | undefined,
+    executor: AgentExecutor | null,
+    pane: number,
+    subtaskId: string
+  ): Promise<{ text: string; promptTokens?: number; completionTokens?: number }> {
+    const opts = {
+      temperature: isReasoningModel(worker.model) ? 0.6 : 0.3,
+      max_tokens: this.maxTokens,
+      signal,
+    };
+    if (!executor) return worker.provider.stream(messages, emitDelta, opts);
+
+    const spec: ToolSpec = {
+      name: "run_shell",
+      description: `Run a non-interactive shell command on ${executor.label}. Returns exit code and output.`,
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "The command to run." },
+          cwd: { type: "string", description: "Working directory (optional)." },
+        },
+        required: ["command"],
+      },
+    };
+    const maxSteps = Math.max(1, this.config.swarm.exec_max_steps);
+    const timeoutMs = Math.max(1, this.config.swarm.exec_timeout_s) * 1000;
+    const convo = [...messages];
+    let allText = "";
+    let promptTokens: number | undefined;
+    let completionTokens: number | undefined;
+
+    for (let step = 0; step <= maxSteps; step++) {
+      // Tools are offered until the last step, which forces a final text answer.
+      const res = await worker.provider.stream(convo, emitDelta, {
+        ...opts,
+        tools: step < maxSteps ? [spec] : undefined,
+      });
+      if (res.text) allText += (allText ? "\n" : "") + res.text;
+      promptTokens = res.promptTokens ?? promptTokens;
+      completionTokens = (completionTokens ?? 0) + (res.completionTokens ?? 0);
+      if (!res.toolCalls?.length) break;
+
+      convo.push({ role: "assistant", content: res.text || "", tool_calls: res.toolCalls });
+      for (const tc of res.toolCalls) {
+        const cmd = String(tc.arguments?.command ?? "").trim();
+        const cwd = tc.arguments?.cwd ? String(tc.arguments.cwd) : undefined;
+        emitDelta(`\n$ ${cmd}\n`);
+        const r = cmd
+          ? await executor.run(cmd, { cwd, timeoutMs })
+          : { ok: false, exitCode: null, output: "run_shell: 'command' is required." };
+        const tail = (r.output || "").slice(-1200);
+        emitDelta(tail + (r.ok ? "\n" : `\n[exit ${r.exitCode ?? "?"}]\n`));
+        this.events.emit("execCmd", { pane, subtaskId, command: cmd, ok: r.ok });
+        convo.push({
+          role: "tool",
+          content: `exit=${r.exitCode ?? "null"} ok=${r.ok}\n${tail}`,
+          tool_call_id: tc.id,
+          name: "run_shell",
+        });
+      }
+    }
+    return { text: allText, promptTokens, completionTokens };
   }
 
   /** Stream the synthesizer so the TUI/log can show the final answer forming. */

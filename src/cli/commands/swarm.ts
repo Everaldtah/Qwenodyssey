@@ -14,9 +14,10 @@
  */
 import chalk from "chalk";
 import { createSession, GlobalOpts } from "../session";
-import { Swarm, frontierWorkers, synthesize } from "../../core/swarm";
+import { Swarm, frontierWorkers, synthesize, type SwarmWorker } from "../../core/swarm";
 import {
   createCoordinatedSwarm,
+  CoordinatedSwarm,
   type Subtask,
   type PlanEvent,
   type AssignEvent,
@@ -26,6 +27,7 @@ import {
 import { SwarmTui } from "../swarmTui";
 import { createProvider } from "../../providers";
 import type { SwarmRun } from "../../core/swarm";
+import type { Provider } from "../../types";
 
 export interface SwarmOpts extends GlobalOpts {
   divide?: string[];
@@ -34,17 +36,24 @@ export interface SwarmOpts extends GlobalOpts {
   list?: boolean; // show the roster and exit (no token spend)
   live?: boolean; // commander sets `live: false` for --no-live
   plain?: boolean; // classic uncoordinated ensemble/divide
+  demo?: boolean; // synthetic workers, no network — verify the TUI instantly
+  exec?: string; // off|auto|bare|daytona — where agents may run commands
 }
 
 export async function swarmCommand(task: string | undefined, opts: SwarmOpts): Promise<void> {
   const s = createSession(opts);
 
-  if (!task && !opts.list) {
+  if (!task && !opts.list && !opts.demo) {
     console.log(chalk.red("A <task> is required (or use --list to just show the roster)."));
     process.exitCode = 1;
     return;
   }
   const taskText = task ?? "";
+
+  // ── demo: synthetic streaming workers, zero network — verifies the TUI ──
+  if (opts.demo) {
+    return demoSwarm(s, opts);
+  }
 
   // ── classic (uncoordinated) path: --plain ──
   if (opts.plain) {
@@ -89,6 +98,15 @@ export async function swarmCommand(task: string | undefined, opts: SwarmOpts): P
           .map((d, i) => ({ id: `s${i + 1}`, title: d.slice(0, 60), detail: d, dependsOn: [] }))
       : undefined;
 
+  // Where agents may run commands: CLI flag overrides config ([swarm] exec).
+  const execMode = (opts.exec ?? s.config.swarm.exec) as import("../../core/agentExec").ExecMode;
+  const bareOpts = {
+    cwd: process.cwd(),
+    allowCommands: s.config.tools.allow_commands,
+    denyCommands: s.config.tools.deny_commands,
+    defaultTimeoutMs: s.config.swarm.exec_timeout_s * 1000,
+  };
+
   const useTui = opts.live !== false && s.config.swarm.live && SwarmTui.supported();
   const started = Date.now();
 
@@ -99,7 +117,12 @@ export async function swarmCommand(task: string | undefined, opts: SwarmOpts): P
 
   let run: SwarmRun;
   if (useTui) {
-    const tui = new SwarmTui(swarm.events, { task: taskText, panes: roster.length, note });
+    const tui = new SwarmTui(swarm.events, {
+      task: taskText,
+      panes: roster.length,
+      note,
+      roster: roster.map((r) => r.label),
+    });
     const onSigint = () => {
       aborted = true;
       ac.abort();
@@ -112,6 +135,8 @@ export async function swarmCommand(task: string | undefined, opts: SwarmOpts): P
         synthesize: opts.synth !== false,
         subtasks: presupplied,
         signal: ac.signal,
+        execMode,
+        bareOpts,
       });
     } finally {
       tui.stop();
@@ -129,6 +154,8 @@ export async function swarmCommand(task: string | undefined, opts: SwarmOpts): P
         synthesize: opts.synth !== false,
         subtasks: presupplied,
         signal: ac.signal,
+        execMode,
+        bareOpts,
       });
     } finally {
       process.removeListener("SIGINT", onSigint);
@@ -147,12 +174,18 @@ export async function swarmCommand(task: string | undefined, opts: SwarmOpts): P
 /** Plain line logger for --no-live / non-TTY: announce plan + each subtask result. */
 function attachPlainLogger(events: import("../../core/swarmCoordinator").SwarmEvents): void {
   events.on("plan", (e: PlanEvent) => {
-    console.log(chalk.bold(`\nPlan — ${e.subtasks.length} subtask(s):`));
+    const by = e.plannedBy && e.plannedBy !== "(supplied)" ? chalk.gray(` (planned by ${e.plannedBy})`) : "";
+    console.log(chalk.bold(`\nPlan — ${e.subtasks.length} subtask(s)`) + by + ":");
     for (const st of e.subtasks) {
       const deps = st.dependsOn.length ? chalk.gray(` ← ${st.dependsOn.join(", ")}`) : "";
       console.log(`  ${chalk.cyan("[" + st.id + "]")} ${st.title}${deps}`);
     }
+    if (e.exec) console.log(chalk.gray(`  complexity: ${e.complexity ?? "?"} · exec: ${e.exec}`));
+    if (e.note) console.log(chalk.yellow(`  ⚠ ${e.note}`));
     console.log("");
+  });
+  events.on("execCmd", (e: { subtaskId: string; command: string; ok: boolean }) => {
+    console.log(chalk.gray(`  $ [${e.subtaskId}] ${e.command.slice(0, 100)}${e.ok ? "" : "  (failed)"}`));
   });
   events.on("assign", (e: AssignEvent) =>
     console.log(chalk.gray(`▸ ${e.model} → [${e.subtaskId}] ${e.title}`))
@@ -179,6 +212,90 @@ function printSummary(run: SwarmRun, elapsedMs: number): void {
     );
   }
   console.log(chalk.gray(`(swarm finished in ${(elapsedMs / 1000).toFixed(1)}s)`));
+}
+
+/* ── demo mode: fake agents streaming through the REAL coordinator + TUI ── */
+
+const DEMO_TEXTS = [
+  "Surveying the landscape: enumerating the key requirements, constraints, and edge cases this design must satisfy before anything is built. ",
+  "Drafting the core architecture: components, interfaces between them, and the data that flows across each boundary, with failure modes called out. ",
+  "Writing concrete examples: a quick-start snippet, a typical production configuration, and one advanced scenario exercising the tricky paths. ",
+  "Integrating the team's results into one coherent deliverable, reconciling overlaps and making the terminology consistent throughout. ",
+];
+
+function demoProvider(model: string, text: string): Provider {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  return {
+    name: "demo",
+    model,
+    async generate() {
+      return { text, model };
+    },
+    async stream(_messages, onChunk, options) {
+      // Word-by-word so the panes visibly stream, ~8s per agent.
+      for (const word of text.repeat(3).split(/(?<=\s)/)) {
+        if (options?.signal?.aborted) throw new Error("__interrupted__");
+        await sleep(55);
+        onChunk(word);
+      }
+      return { text: text.repeat(3), model };
+    },
+    countTokens: (t) => Math.ceil(t.length / 4),
+    async healthCheck() {
+      return { ok: true };
+    },
+  };
+}
+
+/** No-network rehearsal: 4 fake agents run the real plan→waves→synthesis flow. */
+async function demoSwarm(s: ReturnType<typeof createSession>, opts: SwarmOpts): Promise<void> {
+  const models = ["demo/kimi", "demo/nemotron", "demo/llama", "demo/deepseek"];
+  const workers: SwarmWorker[] = models.map((m, i) => ({
+    ref: m,
+    kind: "ollama",
+    model: m,
+    label: m.slice(5),
+    provider: demoProvider(m, DEMO_TEXTS[i % DEMO_TEXTS.length]),
+  }));
+  const lead = demoProvider("demo/lead", DEMO_TEXTS[3]);
+  const swarm = new CoordinatedSwarm(s.config, workers, lead, { maxTokens: 400 });
+
+  const subtasks: Subtask[] = [
+    { id: "requirements", title: "Gather requirements", detail: "demo", dependsOn: [] },
+    { id: "architecture", title: "Draft architecture", detail: "demo", dependsOn: [] },
+    { id: "examples", title: "Write examples", detail: "demo", dependsOn: [] },
+    { id: "integrate", title: "Integrate everything", detail: "demo", dependsOn: ["requirements", "architecture", "examples"] },
+  ];
+
+  const task = "DEMO — four fake agents rehearsing the coordinated swarm (no models called)";
+  console.log(chalk.bold("\n🜂 Swarm demo — no models are called; this rehearses the live TUI.\n"));
+
+  if (opts.live !== false && SwarmTui.supported()) {
+    const tui = new SwarmTui(swarm.events, {
+      task,
+      panes: workers.length,
+      note: "demo mode (no tokens spent)",
+      roster: workers.map((w) => w.label),
+    });
+    tui.start();
+    try {
+      await swarm.run(task, { synthesize: true, subtasks });
+    } finally {
+      tui.stop();
+    }
+    console.log(
+      chalk.green("✓ demo finished.") +
+        chalk.gray(
+          " You should have seen: 3 panes streaming in parallel (wave 1), then 'integrate' streaming in wave 2, then a synthesis line."
+        )
+    );
+  } else {
+    attachPlainLogger(swarm.events);
+    await swarm.run(task, { synthesize: true, subtasks });
+    console.log(
+      chalk.yellow("\n(no TTY here — ran with the plain logger; run from a real terminal to see the panes)")
+    );
+  }
 }
 
 /* ── classic uncoordinated swarm (--plain): preserved from the original command ── */

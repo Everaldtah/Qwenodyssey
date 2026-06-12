@@ -5,6 +5,7 @@ import {
   Blackboard,
   parsePlan,
   decompose,
+  decomposeWith,
   type Subtask,
 } from "../src/core/swarmCoordinator";
 import type { Provider, Message } from "../src/types";
@@ -170,5 +171,65 @@ describe("decompose", () => {
     const subs = await decompose(lead, "the big task", 3, 500);
     expect(subs).toHaveLength(1);
     expect(subs[0].detail).toBe("the big task");
+  });
+});
+
+describe("decomposeWith (planner ladder)", () => {
+  const goodPlan = JSON.stringify({
+    subtasks: [{ id: "x", title: "X", detail: "dx", dependsOn: [] }],
+  });
+
+  it("falls through to the next candidate when the first times out", async () => {
+    const slow = fakeProvider({
+      model: "slow-lead",
+      onGenerate: () => {
+        throw new Error("nvidia request timed out after 90000ms");
+      },
+    });
+    const fast = fakeProvider({ model: "fast-lead", onGenerate: () => goodPlan });
+    const attempts: string[] = [];
+    const res = await decomposeWith([slow, fast], "t", 2, 500, undefined, (m) => attempts.push(m));
+    expect(res.subtasks.map((s) => s.id)).toEqual(["x"]);
+    expect(res.plannedBy).toBe("fast-lead");
+    expect(res.note).toContain("slow-lead");
+    expect(attempts).toEqual(["slow-lead", "fast-lead"]);
+  });
+
+  it("skips a candidate that returns unparseable text", async () => {
+    const vague = fakeProvider({ model: "vague", onGenerate: () => "no json from me" });
+    const fast = fakeProvider({ model: "fast", onGenerate: () => goodPlan });
+    const res = await decomposeWith([vague, fast], "t", 2, 500);
+    expect(res.plannedBy).toBe("fast");
+  });
+
+  it("degrades to a single subtask with a note when every candidate fails", async () => {
+    const bad1 = fakeProvider({
+      model: "b1",
+      onGenerate: () => {
+        throw new Error("boom1");
+      },
+    });
+    const bad2 = fakeProvider({ model: "b2", onGenerate: () => "nope" });
+    const res = await decomposeWith([bad1, bad2], "whole task", 2, 500);
+    expect(res.subtasks).toHaveLength(1);
+    expect(res.subtasks[0].detail).toBe("whole task");
+    expect(res.plannedBy).toBe("(fallback)");
+    expect(res.note).toContain("boom1");
+  });
+});
+
+describe("plan event diagnostics", () => {
+  it("reports plannedBy '(supplied)' for pre-supplied subtasks", async () => {
+    const cfg = defaultConfig();
+    const lead = fakeProvider({ model: "lead", onStream: () => "X" });
+    const w = fakeProvider({ model: "w1", onStream: () => "ok" });
+    const swarm = new CoordinatedSwarm(cfg, [worker(w)], lead, { maxTokens: 200 });
+    let plannedBy = "";
+    swarm.events.on("plan", (e: any) => (plannedBy = e.plannedBy));
+    await swarm.run("t", {
+      synthesize: false,
+      subtasks: [{ id: "a", title: "A", detail: "da", dependsOn: [] }],
+    });
+    expect(plannedBy).toBe("(supplied)");
   });
 });

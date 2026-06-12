@@ -46,6 +46,8 @@ export interface SwarmTuiOptions {
   panes: number;
   /** Label note, e.g. "(local fallback — no frontier key)". */
   note?: string;
+  /** Worker labels, so idle panes show who's who from the very first frame. */
+  roster?: string[];
 }
 
 export class SwarmTui {
@@ -60,12 +62,18 @@ export class SwarmTui {
   private synthModel?: string;
   private synthChars = 0;
   private running = false;
+  /** Model currently decomposing the task; cleared when the plan lands. */
+  private planningWith?: string;
+  private planNote?: string;
+  private planned = false;
+  /** Execution backend label ("bare metal" / "daytona sandbox"), when agents can run commands. */
+  private execLabel?: string;
   private readonly out = process.stdout;
 
   constructor(private events: SwarmEvents, private opts: SwarmTuiOptions) {
-    this.panes = Array.from({ length: Math.max(1, opts.panes) }, () => ({
+    this.panes = Array.from({ length: Math.max(1, opts.panes) }, (_, i) => ({
       title: "",
-      model: "",
+      model: opts.roster?.[i] ?? "",
       status: "idle" as const,
       buffer: "",
       startedAt: 0,
@@ -82,7 +90,8 @@ export class SwarmTui {
     this.running = true;
     this.startedAt = Date.now();
     this.wire();
-    this.out.write(ALT_SCREEN_ON + HIDE_CURSOR);
+    // Explicit clear+home after entering the alt screen: some hosts don't blank it.
+    this.out.write(ALT_SCREEN_ON + HIDE_CURSOR + "\x1b[2J\x1b[H");
     this.draw();
     this.timer = setInterval(() => this.draw(), 100);
     this.timer.unref?.();
@@ -100,8 +109,15 @@ export class SwarmTui {
   /* ── event wiring ── */
 
   private wire(): void {
+    this.events.on("planner", (e: { model: string }) => {
+      this.planningWith = e.model;
+    });
     this.events.on("plan", (e: PlanEvent) => {
       this.subtaskCount = e.subtasks.length;
+      this.planningWith = undefined;
+      this.planned = true;
+      if (e.exec) this.execLabel = e.exec;
+      if (e.note) this.planNote = e.note;
       // Seed pane model labels from the roster so idle panes still show who's who.
       e.roster.forEach((r, i) => {
         if (this.panes[i]) this.panes[i].model = r.label;
@@ -177,22 +193,33 @@ export class SwarmTui {
     lines.push(this.footer(width));
 
     // Paint: home, then each line cleared to EOL. Trim to terminal height.
+    // Explicit \r\n (not bare \n): don't rely on the console's output processing
+    // to supply the carriage return.
     const visible = lines.slice(0, height);
-    this.out.write(HOME + visible.map((l) => l + CLEAR_EOL).join("\n"));
+    this.out.write(HOME + visible.map((l) => l + CLEAR_EOL).join("\r\n"));
   }
 
   private header(width: number): string {
     const elapsed = Math.floor((Date.now() - this.startedAt) / 1000);
     const left = chalk.bold("🜂 swarm") + chalk.gray(`  ${this.opts.task}`);
-    const right = chalk.gray(`wave ${this.waveIndex + 1} · ${fmtElapsed(elapsed)}`);
+    // Before the plan lands the run is in the decompose phase — show that, never a
+    // dead-looking screen (a slow planner used to look like a hung black screen).
+    const phase = this.planned
+      ? `wave ${this.waveIndex + 1}`
+      : `${SPIN[this.frame % SPIN.length]} planning split` +
+        (this.planningWith ? ` with ${this.planningWith}` : "") +
+        "…";
+    const right = chalk.gray(`${phase} · ${fmtElapsed(elapsed)}`);
     return padBetween(stripToWidth(left, width - stripAnsi(right).length - 1, true), right, width);
   }
 
   private footer(width: number): string {
-    const note = this.opts.note ? chalk.yellow(` ${this.opts.note}`) : "";
+    const notes = [this.opts.note, this.planNote].filter(Boolean).join(" · ");
+    const note = notes ? chalk.yellow(` ⚠ ${notes}`) : "";
+    const exec = this.execLabel ? chalk.cyan(` · exec: ${this.execLabel}`) : "";
     const fails = this.failCount ? chalk.red(` · ${this.failCount} failed`) : "";
     const prog = chalk.gray(`${this.doneCount}/${this.subtaskCount || this.panes.length} done`);
-    return truncVisible(prog + fails + note + chalk.gray("   Ctrl-C aborts"), width);
+    return truncVisible(prog + fails + exec + note + chalk.gray("   Ctrl-C aborts"), width);
   }
 
   private synthLine(width: number): string {
