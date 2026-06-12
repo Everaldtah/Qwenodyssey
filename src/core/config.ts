@@ -296,6 +296,15 @@ const SwarmConfig = z.object({
   synthesizer: z.string().default("primary"),
   // Per-worker (and synthesis) output token budget.
   max_tokens: z.number().default(1500),
+  // COORDINATED mode: a lead model splits the task into dependency-aware subtasks
+  // and the agents share a blackboard (each sees its dependencies' results), so the
+  // team builds on each other instead of answering blind. On by default for the CLI
+  // `swarm` command and the agent_swarm tool; the plain ensemble/divide path is still
+  // reachable via --plain / mode:"ensemble".
+  coordinate: z.boolean().default(true),
+  // Show the live split-pane TUI (one streaming terminal per agent) when the CLI
+  // `swarm` command runs in a TTY. Falls back to a plain line log when off / non-TTY.
+  live: z.boolean().default(true),
 });
 
 /**

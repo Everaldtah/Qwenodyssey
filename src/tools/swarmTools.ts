@@ -7,6 +7,11 @@
 import type { Config } from "../core/config";
 import type { Provider, Tool } from "../types";
 import { Swarm, frontierWorkers, synthesize, type SwarmRun } from "../core/swarm";
+import {
+  createCoordinatedSwarm,
+  type Subtask,
+  type CoordinatedResult,
+} from "../core/swarmCoordinator";
 import { createProvider, createNvidiaProvider, createOpenRouterProvider, createOllamaProvider } from "../providers";
 
 // Ranked preference for the synthesizer/orchestrator: strong general+coding
@@ -64,6 +69,25 @@ function formatRun(run: SwarmRun): string {
   return lines.join("\n");
 }
 
+/** Format a coordinated run: the plan/subtask results plus the integrated answer. */
+function formatCoordinated(run: SwarmRun): string {
+  const lines: string[] = [];
+  const results = run.results as CoordinatedResult[];
+  const okCount = results.filter((r) => r.ok).length;
+  lines.push(`🜂 coordinated swarm — ${results.length} subtask(s), ${okCount} ok`);
+  for (const r of results) {
+    const deps = r.dependsOn?.length ? ` (after ${r.dependsOn.join(", ")})` : "";
+    const head = `[${r.id}] ${r.title} — ${r.model} ${(r.ms / 1000).toFixed(1)}s${deps}` + (r.ok ? "" : " — FAILED");
+    lines.push("\n" + head);
+    lines.push(r.ok ? r.text : `  error: ${r.error}`);
+  }
+  if (run.synthesis) {
+    lines.push(`\n=== integrated answer${run.synthesizedBy ? ` (by ${run.synthesizedBy})` : ""} ===`);
+    lines.push(run.synthesis);
+  }
+  return lines.join("\n");
+}
+
 export function createSwarmTools(config: Config): Tool[] {
   const agentSwarm: Tool = {
     name: "agent_swarm",
@@ -74,9 +98,46 @@ export function createSwarmTools(config: Config): Tool[] {
     async run(args, ctx) {
       const task = String(args.task ?? "").trim();
       if (!task) return { ok: false, output: "agent_swarm: 'task' is required." };
-      const mode = args.mode === "divide" ? "divide" : "ensemble";
       const doSynth = args.synthesize !== false; // default true
+      // Default mode honors config.swarm.coordinate; explicit mode overrides.
+      const mode =
+        args.mode === "ensemble"
+          ? "ensemble"
+          : args.mode === "divide" || args.mode === "coordinate"
+            ? "coordinate"
+            : config.swarm.coordinate
+              ? "coordinate"
+              : "ensemble";
 
+      // ── Coordinated: lead splits the task, agents share a blackboard ──
+      if (mode === "coordinate") {
+        const built = createCoordinatedSwarm(config);
+        if (!built) {
+          return {
+            ok: false,
+            output:
+              "agent_swarm: no workers available. Configure cloud models in model.fallback_models " +
+              "(e.g. nvidia:… / openrouter:…) and set the matching API key(s), or a local primary.",
+          };
+        }
+        const presupplied: Subtask[] | undefined = Array.isArray(args.subtasks)
+          ? args.subtasks
+              .map((sub: unknown) => String(sub))
+              .filter((sub: string) => sub.trim())
+              .map((sub: string, i: number) => ({ id: `s${i + 1}`, title: sub.slice(0, 60), detail: sub, dependsOn: [] }))
+          : undefined;
+        ctx.log({
+          tool: "agent_swarm",
+          mode,
+          local: built.local,
+          workers: built.swarm.roster().map((r) => r.model),
+        });
+        const run = await built.swarm.run(task, { synthesize: doSynth, subtasks: presupplied });
+        const anyOk = run.results.some((r) => r.ok);
+        return { ok: anyOk, output: formatCoordinated(run) };
+      }
+
+      // ── Ensemble: every model answers the same task, then merge ──
       const workers = frontierWorkers(config, {
         maxWorkers: config.swarm.max_workers,
         includeLocal: config.swarm.include_local,
@@ -94,19 +155,7 @@ export function createSwarmTools(config: Config): Tool[] {
       const swarm = new Swarm(workers, { maxTokens: config.swarm.max_tokens });
       ctx.log({ tool: "agent_swarm", mode, workers: swarm.roster().map((r) => r.model) });
 
-      let run: SwarmRun;
-      if (mode === "divide") {
-        const subtasks: string[] = Array.isArray(args.subtasks)
-          ? args.subtasks.map((s: unknown) => String(s)).filter((s: string) => s.trim())
-          : [];
-        if (subtasks.length === 0) {
-          return { ok: false, output: "agent_swarm: 'divide' mode needs a non-empty 'subtasks' array." };
-        }
-        run = await swarm.divide(subtasks, task);
-      } else {
-        run = await swarm.ensemble(task);
-      }
-
+      const run = await swarm.ensemble(task);
       if (doSynth && run.results.some((r) => r.ok)) {
         const lead = leadProvider(config);
         run.synthesis = await synthesize(lead, task, run, config.swarm.max_tokens);
