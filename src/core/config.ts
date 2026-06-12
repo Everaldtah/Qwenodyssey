@@ -305,6 +305,32 @@ const SwarmConfig = z.object({
   // Show the live split-pane TUI (one streaming terminal per agent) when the CLI
   // `swarm` command runs in a TTY. Falls back to a plain line log when off / non-TTY.
   live: z.boolean().default(true),
+  // Where swarm agents may RUN COMMANDS: "off" = text-only agents (default — safe
+  // for cloners); "auto" = bare metal for simple plans, a Daytona sandbox for
+  // complex plans (when [daytona] is configured); "bare" / "daytona" = forced.
+  exec: z.enum(["off", "auto", "bare", "daytona"]).default("off"),
+  // Max run_shell tool steps per agent subtask, and per-command timeout.
+  exec_max_steps: z.number().default(5),
+  exec_timeout_s: z.number().default(120),
+});
+
+/**
+ * Daytona (https://daytona.io) — isolated cloud sandboxes where swarm agents run
+ * commands for COMPLEX projects (dependency installs, multi-file builds, servers)
+ * without touching the host. One sandbox per swarm run, auto-deleted afterwards.
+ * Key is a SECRET: leave `api_key` blank and set the env var instead.
+ */
+const DaytonaConfig = z.object({
+  enabled: z.boolean().default(true),
+  base_url: z.string().default("https://app.daytona.io/api"),
+  api_key: z.string().default(""),
+  api_key_env: z.string().default("DAYTONA_API_KEY"),
+  // Optional snapshot/image name and target region for new sandboxes.
+  snapshot: z.string().default(""),
+  target: z.string().default(""),
+  // Sandbox lifecycle backstops (minutes): auto-stop when idle, auto-delete after.
+  auto_stop_minutes: z.number().default(15),
+  auto_delete_minutes: z.number().default(120),
 });
 
 /**
@@ -390,6 +416,7 @@ export const ConfigSchema = z.object({
   mcp: McpConfig.default({}),
   github: GithubConfig.default({}),
   swarm: SwarmConfig.default({}),
+  daytona: DaytonaConfig.default({}),
   evolution: EvolutionConfig.default({}),
   lmstudio: LmStudioConfig.default({}),
   nvidia: NvidiaConfig.default({}),

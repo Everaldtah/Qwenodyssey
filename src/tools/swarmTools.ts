@@ -126,13 +126,27 @@ export function createSwarmTools(config: Config): Tool[] {
               .filter((sub: string) => sub.trim())
               .map((sub: string, i: number) => ({ id: `s${i + 1}`, title: sub.slice(0, 60), detail: sub, dependsOn: [] }))
           : undefined;
+        // Agents may run commands only when this chat session itself is allowed to
+        // (allow_shell) and the config enables swarm exec.
+        const execMode = ctx.allowShell ? config.swarm.exec : "off";
         ctx.log({
           tool: "agent_swarm",
           mode,
           local: built.local,
+          exec: execMode,
           workers: built.swarm.roster().map((r) => r.model),
         });
-        const run = await built.swarm.run(task, { synthesize: doSynth, subtasks: presupplied });
+        const run = await built.swarm.run(task, {
+          synthesize: doSynth,
+          subtasks: presupplied,
+          execMode,
+          bareOpts: {
+            cwd: ctx.cwd,
+            allowCommands: ctx.allowCommands,
+            denyCommands: ctx.denyCommands,
+            defaultTimeoutMs: config.swarm.exec_timeout_s * 1000,
+          },
+        });
         const anyOk = run.results.some((r) => r.ok);
         return { ok: anyOk, output: formatCoordinated(run) };
       }
