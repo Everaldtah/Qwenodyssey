@@ -238,6 +238,36 @@ More in [`docs/examples.md`](docs/examples.md).
 
 ---
 
+## MCP servers (Model Context Protocol)
+
+Qwenodyssey can connect to external [MCP](https://modelcontextprotocol.io) servers
+and surface their tools to the agent — filesystem, git, Postgres, Puppeteer, Slack,
+or any of the growing ecosystem — with no bespoke integration. Each server's tools
+appear to the model namespaced as `mcp__<server>__<tool>`.
+
+It's opt-in. Add an `[mcp]` block to your config (`~/.qwenodyssey/config.toml` for
+machine-wide, or a project's `.qwenodyssey/config.toml`):
+
+```toml
+[mcp]
+enabled = true
+
+[mcp.servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\evera"]
+
+[mcp.servers.git]
+command = "uvx"
+args = ["mcp-server-git"]
+# env = { SOME_TOKEN = "..." }   # extra env the server needs
+```
+
+On launch Qwenodyssey spawns each enabled server over stdio, completes the MCP
+handshake, discovers its tools, and prints e.g. `✦ MCP filesystem: 11 tools`. A
+server that fails to start is skipped with a one-line reason — it never blocks the
+others or chat startup. Servers are shut down cleanly when you exit. Transport is
+stdio (the common case); HTTP/SSE servers aren't supported yet.
+
 ## Safety
 
 - Dangerous shell commands (`rm -rf /`, `mkfs`, `dd`, fork bombs, `shutdown`…) are
@@ -253,7 +283,7 @@ More in [`docs/examples.md`](docs/examples.md).
 - [ ] VS Code & Cursor integration
 - [ ] Claude Code compatibility mode
 - [ ] OpenClaw plugin
-- [ ] MCP (Model Context Protocol) support
+- [x] MCP (Model Context Protocol) support — stdio servers (see [MCP servers](#mcp-servers-model-context-protocol))
 - [ ] Browser/research tool
 - [ ] Vector-database memory (semantic recall)
 - [ ] Multi-model debate mode

@@ -36,6 +36,8 @@ import { createPlanTool, renderPlan, PlanState } from "../../tools/planTool";
 import { prepareToolCall } from "../../tools/toolCallPrep";
 import { ShellSession } from "../../core/shellSession";
 import { createShellSessionTools, SHELL_SESSION_TOOL_SPECS } from "../../tools/shellSessionTools";
+import { createMcpTools } from "../../tools/mcpTools";
+import type { McpServerSpec } from "../../tools/mcpClient";
 import type { GenerateResult, Message, ModelInfo, ModelOptions, ToolCall, ToolContext, ToolSpec } from "../../types";
 import type { Session } from "../session";
 
@@ -248,6 +250,20 @@ or use the normal tools. Reach for agent_swarm when the task is hard or naturall
 Call it at most once per turn; you get back every worker's answer plus the merged result.`;
 
 /**
+ * Appended only when ≥1 MCP server connected, listing the namespaces that are
+ * live so the model knows the external tools are real and how they're named.
+ */
+function mcpSystem(servers: string[]): string {
+  return `
+MCP TOOLS — you are connected to external Model Context Protocol server(s): ${servers.join(", ")}.
+Their tools appear with names like mcp__<server>__<tool> and behave like your other tools — call
+them directly (no narration) when the task matches what that server provides (e.g. a filesystem,
+git, database, browser, or SaaS server). Their arguments follow each tool's own JSON schema. Treat
+their output as real results from that system. Prefer a purpose-built MCP tool over a generic shell
+command when one clearly fits.`;
+}
+
+/**
  * Tells the model the concrete truth about itself: where its persistent memory
  * lives, that its own source code is on disk and editable, and that it learns
  * from mistakes. Paths are real so it can answer "do you remember / where?"
@@ -370,12 +386,36 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     : [];
   const swarmReady = swarmWorkers.length >= 2;
 
+  // MCP servers (opt-in): connect + discover tools up front so the system prompt
+  // and advertised tool set agree. Connecting here (before selfAwareness is added
+  // to `sys`) keeps the MCP block ahead of the SELF-AWARENESS section, so a live
+  // /model switch (replaceSelfAwareness) never clips it.
+  const mcpSpecs: McpServerSpec[] = s.config.mcp.enabled
+    ? Object.entries(s.config.mcp.servers)
+        .filter(([, def]) => def.enabled && def.command)
+        .map(([name, def]) => ({
+          name,
+          command: def.command,
+          args: def.args,
+          env: def.env,
+          cwd: def.cwd || undefined,
+        }))
+    : [];
+  const mcp = mcpSpecs.length
+    ? await createMcpTools(mcpSpecs, {
+        initTimeoutMs: s.config.mcp.init_timeout_ms,
+        callTimeoutMs: s.config.mcp.call_timeout_ms,
+      })
+    : null;
+  const mcpServers = mcp ? [...new Set(mcp.tools.map((t) => t.name.split("__")[1]))] : [];
+
   // Base system prompt now; the PROJECT summary is appended once the repo scan
   // finishes in the background (so a slow scan doesn't delay the prompt).
   let sys = loadPrompt("system") + "\n" + CONVERSATION_GUARD + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK + "\n" + PLAN_SYSTEM;
   if (memoryEnabled || s.config.web.enabled) sys += "\n" + MEMORY_SYSTEM;
   if (s.config.tools.shell_session && s.config.tools.allow_shell) sys += "\n" + SHELL_SESSION_SYSTEM;
   if (swarmReady) sys += "\n" + SWARM_SYSTEM;
+  if (mcpServers.length) sys += "\n" + mcpSystem(mcpServers);
   sys += "\n" + selfAwareness(s, kb, memoryEnabled, !!evolution);
   const history: Message[] = [{ role: "system", content: sys }];
 
@@ -510,6 +550,14 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
       if (r.ok) console.log(chalk.gray(`  ✦ GitHub ready — ${r.output}\n`));
       else console.log(chalk.gray(`  ✦ GitHub tools loaded (not yet authenticated — run \`gh auth login\`)\n`));
     });
+  }
+
+  // MCP: register the tools discovered above and advertise their schemas. The
+  // status line reports every server (connected with a tool count, or why it failed).
+  if (mcp) {
+    mcp.tools.forEach((t) => chatTools.register(t));
+    toolSpecs.push(...mcp.specs);
+    if (mcp.infos.length) console.log(chalk.gray("  ✦ " + mcp.infos.join("\n  ✦ ") + "\n"));
   }
 
   // Persistent shell session (opt-in): a real pty whose cwd/env/processes survive
@@ -693,6 +741,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   persist();
   prompt.close();
   shellSession?.dispose(); // tear down the persistent pty, if one was started
+  mcp?.clients.forEach((c) => c.dispose()); // stop any MCP server processes
   // Exit promptly even if a best-effort background job (LM Studio start / model
   // list) is still pending — there's nothing left to wait for.
   process.exit(0);

@@ -318,6 +318,46 @@ const GithubConfig = z.object({
   api_base: z.string().default("https://api.github.com"),
 });
 
+/**
+ * Model Context Protocol (MCP) servers. Each entry under [mcp.servers.<name>]
+ * launches a stdio MCP server (e.g. `npx -y @modelcontextprotocol/server-filesystem`)
+ * and surfaces ITS tools to the agent, namespaced `mcp__<name>__<tool>`. This is
+ * how Qwenodyssey plugs into the wider MCP ecosystem (filesystem, git, Slack,
+ * Postgres, Puppeteer, …) without bespoke integrations.
+ *
+ * Example (~/.qwenodyssey/config.toml):
+ *   [mcp]
+ *   enabled = true
+ *   [mcp.servers.filesystem]
+ *   command = "npx"
+ *   args = ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\evera"]
+ *   [mcp.servers.git]
+ *   command = "uvx"
+ *   args = ["mcp-server-git"]
+ */
+const McpServerConfig = z.object({
+  // Skip this server when false (keep the definition without launching it).
+  enabled: z.boolean().default(true),
+  // Executable to spawn (npx, uvx, node, python, or an absolute path).
+  command: z.string().default(""),
+  args: z.array(z.string()).default([]),
+  // Extra env vars merged over the process env (e.g. API tokens the server needs).
+  env: z.record(z.string()).default({}),
+  // Working directory for the server; blank = current dir.
+  cwd: z.string().default(""),
+});
+
+const McpConfig = z.object({
+  // Master switch. Off by default — MCP launches external server processes, so
+  // it's opt-in. Turn on and define at least one [mcp.servers.*] to use it.
+  enabled: z.boolean().default(false),
+  servers: z.record(McpServerConfig).default({}),
+  // Timeout for the initialize handshake + tools/list of each server.
+  init_timeout_ms: z.number().default(20000),
+  // Timeout for a single tools/call.
+  call_timeout_ms: z.number().default(60000),
+});
+
 /** Internet search + page fetch. */
 const WebConfig = z.object({
   enabled: z.boolean().default(true),
@@ -338,6 +378,7 @@ export const ConfigSchema = z.object({
   memory: MemoryConfig.default({}),
   knowledge: KnowledgeConfig.default({}),
   web: WebConfig.default({}),
+  mcp: McpConfig.default({}),
   github: GithubConfig.default({}),
   swarm: SwarmConfig.default({}),
   evolution: EvolutionConfig.default({}),
