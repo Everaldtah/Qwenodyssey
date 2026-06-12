@@ -662,10 +662,15 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
 
     let userContent = expandFileRefs(line, s.cwd);
 
+    // Trivial greeting/smalltalk → answer directly with NO tools and NO memory
+    // cruff. Disabling tools for the turn is a hard backstop so eager models
+    // can't fan out read_file/web_search on a bare "hi".
+    const smalltalk = isSmalltalk(line);
+
     // Auto-recall: prepend relevant long-term-memory notes to the USER message
     // (not as a separate system message — multiple system messages break some
     // model prompt templates, e.g. LM Studio's qwen3.5: "No user query found").
-    if (memoryEnabled && s.config.knowledge.auto_recall) {
+    if (memoryEnabled && s.config.knowledge.auto_recall && !smalltalk) {
       const recalled = await recallKnowledge(kb, line, s.config.knowledge.recall_k);
       if (recalled) userContent = `${recalled}\n\n———\n\n${userContent}`;
     }
@@ -673,7 +678,8 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     history.push({ role: "user", content: userContent });
 
     try {
-      const signals = await runAssistantTurn(s, chatTools, toolSpecs, history, meter, ask);
+      const turnSpecs = smalltalk ? [] : toolSpecs;
+      const signals = await runAssistantTurn(s, chatTools, turnSpecs, history, meter, ask);
       // Evolution: reflect on rough turns and bank a lesson for next time.
       if (evolution) {
         const learned = await evolution.reflect({ ...signals, userMessage: line });
@@ -713,6 +719,39 @@ async function recallKnowledge(
     "with knowledge_read; update them with knowledge_save if you learn more):\n\n" +
     blocks.join("\n\n")
   );
+}
+
+/**
+ * True for trivial conversational messages (greetings, thanks, acks) that need
+ * NO tools. These turns run with tools DISABLED so an eager model physically
+ * can't fire read_file/web_search/shell on a bare "hi" — a deterministic backstop
+ * to the CONVERSATION_GUARD prompt, which some models still ignore. Conservative
+ * on purpose: anything with a path, code, URL, "?", or real length is NOT caught,
+ * so genuine requests always keep their tools.
+ */
+const GREET_FIRST = new Set([
+  "hi", "hii", "hiya", "hey", "heya", "hello", "helo", "yo", "sup", "wsup",
+  "wassup", "howdy", "gm", "gn", "morning", "evening", "greetings", "yt",
+]);
+function isSmalltalk(raw: string): boolean {
+  const t = raw.trim().toLowerCase();
+  if (!t || t.length > 40) return false;
+  // A path, file ref, code, URL, or question mark means real work — never skip tools.
+  if (/[\\/@`?]|https?:|\.\w{1,4}\b/.test(t)) return false;
+  const w = t.replace(/[!.…,~\s]+$/g, "").trim(); // strip trailing punctuation
+  const EXACT = new Set([
+    "hi", "hii", "hiya", "hey", "heya", "hello", "helo", "hello there", "hi there",
+    "hey there", "yo", "sup", "wsup", "wassup", "whats up", "what's up", "howdy",
+    "how are you", "how are u", "how r u", "hru", "gm", "good morning",
+    "good afternoon", "good evening", "good night", "gn", "thanks", "thank you",
+    "thx", "ty", "cheers", "ok", "okay", "k", "kk", "cool", "nice", "great",
+    "lol", "lmao", "haha", "hehe", "morning", "evening", "greetings", "test", "ping",
+  ]);
+  if (EXACT.has(w)) return true;
+  // Greeting word + a short address ("sup buddy", "hey man", "yo there friend").
+  const words = w.split(/\s+/);
+  if (words.length <= 3 && GREET_FIRST.has(words[0])) return true;
+  return false;
 }
 
 /**
@@ -878,7 +917,7 @@ async function runAssistantTurn(
     try {
       res = await streamWithFallback(s, history, {
         temperature: turnTemperature(s, reasoning),
-        tools: toolSpecs,
+        tools: toolSpecs.length ? toolSpecs : undefined,
         think: reasoning,
         signal: aborter.signal,
       }, spinner);
