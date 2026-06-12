@@ -87,6 +87,26 @@ mistakes. For any non-trivial request, work through it step by step instead of
 guessing, and prefer verifying with a tool over assuming. Only give your final
 answer once you are confident it is correct and complete.`;
 
+/**
+ * Placed FIRST in the assembled system prompt (before all the "you MUST call a
+ * tool" sections) so it has primacy. Without this, an eager model reads the
+ * tool-forcing rules below and fires read_file / web_search / shell on a bare
+ * "hi" — exactly the runaway this prevents. Tools are for ACTING on the machine,
+ * live data, or the codebase; ordinary conversation gets a plain reply.
+ */
+const CONVERSATION_GUARD = `
+BEFORE ANYTHING ELSE — decide whether the user's message actually requires a tool.
+DO NOT call any tool for: greetings and smalltalk ("hi", "hello", "sup", "yo",
+"how are you", "thanks", "lol", "ok"), acknowledgements, opinions, or general
+questions you can answer from your own knowledge. For these, reply DIRECTLY in one
+or two friendly sentences and STOP — no run_shell, no read_file/list_files/tree,
+no web_search, no knowledge_search, no plan. A greeting is NOT a task.
+ONLY reach for a tool when the message genuinely needs it: acting on THIS machine
+(files, shell, git, processes), live/time-sensitive data from the web, or reading
+this codebase. The rules that follow describe HOW to use tools once you've decided
+a tool is actually needed — they do NOT mean "always use a tool". When in doubt on
+a casual message, just talk.`;
+
 /** Appended to the base system prompt so the model knows it can really act. */
 const TOOL_SYSTEM = `
 You are running inside a real terminal on the user's machine and have ACTUAL tools.
@@ -352,7 +372,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
 
   // Base system prompt now; the PROJECT summary is appended once the repo scan
   // finishes in the background (so a slow scan doesn't delay the prompt).
-  let sys = loadPrompt("system") + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK + "\n" + PLAN_SYSTEM;
+  let sys = loadPrompt("system") + "\n" + CONVERSATION_GUARD + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK + "\n" + PLAN_SYSTEM;
   if (memoryEnabled || s.config.web.enabled) sys += "\n" + MEMORY_SYSTEM;
   if (s.config.tools.shell_session && s.config.tools.allow_shell) sys += "\n" + SHELL_SESSION_SYSTEM;
   if (swarmReady) sys += "\n" + SWARM_SYSTEM;
