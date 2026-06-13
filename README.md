@@ -110,9 +110,10 @@ qwenodyssey config set model.model moonshotai/kimi-k2.6
 (auth/quota/network/**timeout**), Qwenodyssey transparently falls back to the next
 model in the chain.
 
-Notes on NIM models: **reliable** picks are `nvidia/nemotron-3-ultra-550b-a55b`
-(reasoning, tool-capable), `qwen/qwen3-coder-480b-a35b-instruct` (coding-focused),
-and `meta/llama-3.3-70b-instruct`. Reasoning is handled per family:
+Notes on NIM models: NIM's catalog churns (models reach end-of-life and start
+returning HTTP 410), so verify before relying on one. **Reliable** picks as of
+2026-06: `moonshotai/kimi-k2.6`, `nvidia/nemotron-3-ultra-550b-a55b` (reasoning,
+tool-capable), and `meta/llama-3.3-70b-instruct`. Reasoning is handled per family:
 - **Nemotron** uses `chat_template_kwargs.enable_thinking` + `reasoning_budget`
   (`[nvidia].nemotron_thinking` / `reasoning_budget`) and returns its chain-of-thought
   in a separate `reasoning_content` field, which Qwenodyssey drops — answers stay clean.
@@ -172,6 +173,7 @@ on NIM. In this mode audio and frames go to the cloud. Test pieces independently
 | `qwenodyssey init` | Create the `.qwenodyssey` workspace |
 | `qwenodyssey chat` | Interactive pair-coding chat (streaming); `-c/--continue` resumes the last session, `--resume [id]` picks one |
 | `qwenodyssey code "task"` | Full pipeline: plan → edit → review → test |
+| `qwenodyssey swarm "task"` | Coordinated multi-model team with a live split-pane TUI (see [Agent swarm](#agent-swarm-coordinated-multi-model)) |
 | `qwenodyssey edit <file> "instruction"` | Edit a single file |
 | `qwenodyssey plan "goal"` | Produce a plan without editing |
 | `qwenodyssey review` | Review the current git diff |
@@ -268,6 +270,79 @@ server that fails to start is skipped with a one-line reason — it never blocks
 others or chat startup. Servers are shut down cleanly when you exit. Transport is
 stdio (the common case); HTTP/SSE servers aren't supported yet.
 
+## Agent swarm (coordinated multi-model)
+
+`qwenodyssey swarm "<task>"` runs a **team of frontier models in parallel** that
+actually coordinate — instead of one model doing everything, a lead model splits
+the task, the agents share results, and you watch them all work live.
+
+```bash
+cd ~                       # run from home so it uses your configured cloud roster
+qwenodyssey swarm "Design a production rate-limiter: algorithm, storage, and API, then integrate."
+qwenodyssey swarm --demo   # rehearse the live TUI with fake agents — no models called, no cost
+```
+
+**How it works**
+
+1. **Plan** — a lead model decomposes the task into dependency-aware subtasks
+   (`{id, title, detail, dependsOn[]}`) and judges the project `simple` or `complex`.
+   A *planner ladder* tries each roster model in turn, so one slow/timed-out lead
+   never collapses the whole run.
+2. **Waves** — independent subtasks run **in parallel**; dependent ones wait for the
+   results they need (topological scheduling).
+3. **Shared blackboard** — every agent's prompt is injected with its dependencies'
+   actual outputs plus a roster of what teammates are doing, so later agents *build
+   on* earlier ones instead of working blind.
+4. **Integrate** — a lead model merges the whole board into one coherent deliverable.
+
+**Live TUI** — one pane per agent, each a mini Qwenodyssey dashboard streaming its
+work in real time:
+
+```
+┌ ⠴ kimi-k2.6 · subtask 1                    8s ┐ ┌ ✓ nemotron-3-ultra · subtask 2        12s ┐
+│ ▟█▜▛█▙   Qwenodyssey v0.3.0                   │ │ ▟█▜▛█▙   Qwenodyssey v0.3.0                │
+│ ▜█▟▙█▛   moonshotai/kimi-k2.6 · nvidia        │ │ ▜█▟▙█▛   nvidia/nemotron-3-ultra · nvidia  │
+│  ▀▘▝▀    C:\Users\evera                       │ │  ▀▘▝▀    C:\Users\evera                    │
+│───────────────────────────────────────────────│ │────────────────────────────────────────────│
+│ choosing a sliding-window-log algorithm with…  │ │ # Storage schema  CREATE TABLE url_maps…   │
+└                                                ┘ └                                            ┘
+2/4 done · exec: daytona sandbox   Ctrl-C aborts
+```
+
+The TUI needs a **real terminal** (run it in Windows Terminal / a normal shell, not
+inside `qwenodyssey chat`). It falls back to a plain line log over a pipe or with
+`--no-live`.
+
+**Execution backends** — by default swarm agents are text-only. Let them *run
+commands* to build and verify real projects with `[swarm] exec`:
+
+| `exec` | Behavior |
+|--------|----------|
+| `off` (default) | Agents produce text only. |
+| `bare` | Commands run on **your machine** through the same hard-block/destructive guardrails as `run_shell` (destructive commands are refused — a swarm has no interactive confirm). |
+| `daytona` | Commands run in an **isolated [Daytona](https://daytona.io) sandbox** — one per run, shared by all agents so their files compose, deleted afterwards. |
+| `auto` | **Bare metal for `simple` plans, a Daytona sandbox for `complex` ones** (falls back to bare metal, with a note, when no `DAYTONA_API_KEY` is set). |
+
+```toml
+[swarm]
+exec = "auto"            # or off / bare / daytona ; CLI: --exec <mode>
+
+[daytona]
+enabled = true           # key comes from the DAYTONA_API_KEY env var
+```
+```powershell
+setx DAYTONA_API_KEY "dtn_..."   # get one at app.daytona.io → API keys
+```
+
+The **roster is frontier-first**: it uses the cloud models in `model.fallback_models`
+that have keys, falling back to local models only when none are available. Useful
+flags: `--list` (show the roster, no calls), `--divide "a" "b" …` (supply subtasks
+yourself), `--plain` (classic uncoordinated ensemble), `--no-synth`.
+
+The same capability is available to the chat agent as the `agent_swarm` tool.
+
+---
+
 ## Safety
 
 - Dangerous shell commands (`rm -rf /`, `mkfs`, `dd`, fork bombs, `shutdown`…) are
@@ -286,9 +361,9 @@ stdio (the common case); HTTP/SSE servers aren't supported yet.
 - [x] MCP (Model Context Protocol) support — stdio servers (see [MCP servers](#mcp-servers-model-context-protocol))
 - [ ] Browser/research tool
 - [ ] Vector-database memory (semantic recall)
-- [ ] Multi-model debate mode
+- [x] Multi-model debate mode — coordinated [agent swarm](#agent-swarm-coordinated-multi-model)
 - [ ] Qwen 14B/32B profiles
-- [ ] Remote sandbox workers
+- [x] Remote sandbox workers — [Daytona](https://daytona.io) execution backend for the swarm
 - [ ] Tree-sitter symbol extraction for sharper context
 
 See [`docs/architecture.md`](docs/architecture.md) for the design and current

@@ -79,13 +79,13 @@ function parseRef(ref: string): ParsedRef {
 }
 
 /** Short label for display (drop the org/ prefix). */
-function shortLabel(model: string): string {
+export function shortLabel(model: string): string {
   const tail = model.includes("/") ? model.slice(model.lastIndexOf("/") + 1) : model;
   return tail;
 }
 
 /** Reasoning/thinking models need heat — at temp 0 they loop. (Mirrors chat.ts.) */
-function isReasoningModel(model: string): boolean {
+export function isReasoningModel(model: string): boolean {
   return (
     /(^|[-_/:.])(r1|qwq|o1|o3|thinking|reason|kimi|k2|nemotron)/i.test(model) ||
     /deepseek-r1/i.test(model)
@@ -238,7 +238,7 @@ export class Swarm {
 }
 
 /** Drop a reasoning model's <think>…</think> block, keeping the final answer. */
-function stripThinking(text: string): string {
+export function stripThinking(text: string): string {
   const closed = text.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "");
   // Close-only shape (templates pre-fill the opening tag).
   const closeOnly = closed.match(/^[\s\S]*?<\/think(?:ing)?>\s*([\s\S]*)$/i);

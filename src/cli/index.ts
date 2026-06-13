@@ -113,16 +113,32 @@ program
 
 program
   .command("swarm")
-  .description("Run a complex task across a parallel swarm of frontier models (one per cloud key)")
+  .description("Run a complex task across a COORDINATED team of frontier agents (live split-pane TUI)")
   .argument("[task]", "the task/question for the swarm (omit only with --list)")
-  .option("--divide <subtasks...>", "shard these independent subtasks across the models instead")
-  .option("--no-synth", "don't synthesize a final answer; just show each model's output")
-  .option("--local", "also enlist local fallback models, not just cloud ones")
+  .option("--divide <subtasks...>", "supply the subtasks yourself instead of auto-decomposing")
+  .option("--no-synth", "don't integrate a final answer; just show each agent's output")
+  .option("--no-live", "coordinated, but log plain lines instead of the live TUI")
+  .option("--plain", "classic uncoordinated mode (ensemble, or --divide shards), no shared context")
+  .option("--local", "(plain mode) also enlist local fallback models, not just cloud ones")
   .option("--list", "show the swarm roster and exit (no models are called)")
+  .option("--demo", "rehearse the live TUI with fake streaming agents (no models called)")
+  .option(
+    "--exec <mode>",
+    "let agents run commands: off | auto (bare metal for simple plans, daytona sandbox for complex) | bare | daytona"
+  )
   .action((task, _o, cmd) =>
     swarmCommand(
       task,
-      globals(cmd, { divide: cmd.opts().divide, synth: cmd.opts().synth, local: cmd.opts().local, list: cmd.opts().list })
+      globals(cmd, {
+        divide: cmd.opts().divide,
+        synth: cmd.opts().synth,
+        live: cmd.opts().live,
+        plain: cmd.opts().plain,
+        local: cmd.opts().local,
+        list: cmd.opts().list,
+        demo: cmd.opts().demo,
+        exec: cmd.opts().exec,
+      })
     )
   );
 

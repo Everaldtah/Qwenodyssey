@@ -13,3 +13,7 @@ dist/
 !examples/.qwenodyssey/config.toml
 
 stress/results.json
+
+# swarm TUI probe captures
+scripts/*_capture.*
+scripts/daytona_openapi.json

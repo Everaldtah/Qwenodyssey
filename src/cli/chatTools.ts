@@ -412,25 +412,28 @@ export const SWARM_TOOL_SPECS: ToolSpec[] = [
     name: "agent_swarm",
     description:
       "Spin up a SWARM of frontier models that run IN PARALLEL — each worker is a different cloud " +
-      "model on its own API key, all executing at the same time. Use for genuinely COMPLEX tasks: " +
-      "hard reasoning/design/debugging where multiple strong perspectives help (mode 'ensemble'), or " +
-      "a big job that splits into independent parts you can parallelize (mode 'divide'). For simple " +
-      "questions answer directly instead. Returns each worker's answer plus a single synthesized result.",
+      "model on its own API key. Use for genuinely COMPLEX tasks. Modes: 'coordinate' (default) — a " +
+      "lead model splits the task into dependency-aware subtasks and the agents SHARE A BLACKBOARD so " +
+      "each sees its dependencies' results and builds on them (best for multi-part jobs that need to " +
+      "fit together); 'ensemble' — every model answers the SAME task and the answers are merged (best " +
+      "for hard reasoning/design where multiple perspectives help). For simple questions answer " +
+      "directly instead. Returns the plan, each subtask's result, and one integrated answer.",
     parameters: {
       type: "object",
       properties: {
-        task: str("The overall task/question for the swarm (always required, even in divide mode — it frames the subtasks)."),
+        task: str("The overall task/question for the swarm (always required — it frames the whole run)."),
         mode: {
           type: "string",
-          enum: ["ensemble", "divide"],
+          enum: ["coordinate", "ensemble", "divide"],
           description:
-            "'ensemble' (default): every model answers the SAME task, then their answers are merged into the best one. " +
-            "'divide': shard `subtasks` across the models, one per worker, all at once.",
+            "'coordinate' (default): a lead model decomposes the task; agents share results via a blackboard and run in dependency order. " +
+            "'ensemble': every model answers the SAME task, then answers are merged. " +
+            "'divide': like coordinate but you supply `subtasks` yourself (skips auto-decomposition).",
         },
         subtasks: {
           type: "array",
           items: { type: "string" },
-          description: "Independent subtasks to parallelize (required for mode 'divide').",
+          description: "Your own subtasks (used by mode 'divide'; optional otherwise — the lead will decompose).",
         },
         synthesize: {
           type: "boolean",

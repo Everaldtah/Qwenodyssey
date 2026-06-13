@@ -3,9 +3,17 @@
  * prevented from escaping the project root.
  */
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import fg from "fast-glob";
 import type { Tool, ToolContext, ToolResult } from "../types";
+
+/** Expand a leading "~" (or "~/") to the user's home directory. */
+export function expandHome(p: string): string {
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
 
 /** Resolve a path for WRITES/DELETES: must stay inside the project root. */
 export function resolveInside(cwd: string, p: string): string {
@@ -24,7 +32,28 @@ export function resolveInside(cwd: string, p: string): string {
  * names even when it's outside the launch dir. Use resolveInside() for writes.
  */
 export function resolveReadable(cwd: string, p?: string): string {
-  return path.resolve(cwd, p && String(p).trim() ? String(p) : ".");
+  const raw = p && String(p).trim() ? String(p) : ".";
+  return path.resolve(cwd, expandHome(raw));
+}
+
+/**
+ * resolveReadable plus a HOME fallback. Small models frequently emit home-relative
+ * paths in shapes that don't resolve where they meant: "~/.foo", a leading-slash
+ * dotfile like "/.qwenodyssey/config.toml" (which on Windows resolves to the drive
+ * root C:\.qwenodyssey, not home), or a bare ".foo" when the cwd isn't home. When
+ * the primary resolution doesn't exist, retry the same tail rooted at the user's
+ * home dir and use that if it exists. Only ever redirects to an EXISTING file, so a
+ * correct absolute path is never overridden.
+ */
+export function resolveReadableSmart(cwd: string, p?: string): string {
+  const primary = resolveReadable(cwd, p);
+  if (!p || !String(p).trim() || fs.existsSync(primary)) return primary;
+  const tail = String(p).trim().replace(/^~/, "").replace(/^[\\/]+/, "");
+  if (tail) {
+    const homeTry = path.resolve(os.homedir(), tail);
+    if (homeTry !== primary && fs.existsSync(homeTry)) return homeTry;
+  }
+  return primary;
 }
 
 /**
@@ -47,7 +76,7 @@ export const readFileTool: Tool = {
   description: "Read the contents of a file, optionally a line range (offset/limit) for large files.",
   mutating: false,
   async run(args, ctx): Promise<ToolResult> {
-    const abs = resolveReadable(ctx.cwd, String(args.path));
+    const abs = resolveReadableSmart(ctx.cwd, String(args.path));
     if (!fs.existsSync(abs)) return { ok: false, output: `Not found: ${args.path}` };
     if (fs.statSync(abs).isDirectory())
       return { ok: false, output: `${args.path} is a directory — use tree or list_files for it.` };
@@ -122,7 +151,7 @@ export const listFilesTool: Tool = {
   description: "List files matching an optional glob (default: all tracked-ish files).",
   mutating: false,
   async run(args, ctx): Promise<ToolResult> {
-    const base = resolveReadable(ctx.cwd, args.path ? String(args.path) : ".");
+    const base = resolveReadableSmart(ctx.cwd, args.path ? String(args.path) : ".");
     if (!fs.existsSync(base)) return { ok: false, output: `Directory not found: ${base}` };
     const pattern = String(args.pattern || "**/*");
     const files = await fg(pattern, {
@@ -146,7 +175,7 @@ export const treeTool: Tool = {
   description: "Show a compact directory tree (depth-limited).",
   mutating: false,
   async run(args, ctx): Promise<ToolResult> {
-    const base = resolveReadable(ctx.cwd, args.path ? String(args.path) : ".");
+    const base = resolveReadableSmart(ctx.cwd, args.path ? String(args.path) : ".");
     if (!fs.existsSync(base)) return { ok: false, output: `Directory not found: ${base}` };
     if (!fs.statSync(base).isDirectory())
       return { ok: false, output: `${base} is a file, not a directory — use read_file.` };

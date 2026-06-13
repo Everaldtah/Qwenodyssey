@@ -5,7 +5,7 @@ import * as fs from "fs";
 import * as path from "path";
 import fg from "fast-glob";
 import type { Tool, ToolContext, ToolResult } from "../types";
-import { IGNORE, resolveReadable } from "./fileTools";
+import { IGNORE, resolveReadableSmart } from "./fileTools";
 
 export const grepTool: Tool = {
   name: "grep",
@@ -14,7 +14,7 @@ export const grepTool: Tool = {
   async run(args, ctx): Promise<ToolResult> {
     const pattern = String(args.pattern || "");
     if (!pattern) return { ok: false, output: "No pattern given" };
-    const base = resolveReadable(ctx.cwd, args.path ? String(args.path) : ".");
+    const base = resolveReadableSmart(ctx.cwd, args.path ? String(args.path) : ".");
     if (!fs.existsSync(base)) return { ok: false, output: `Directory not found: ${base}` };
     const glob = String(args.glob || "**/*");
     let re: RegExp;
