@@ -30,10 +30,32 @@ const CLEAR_EOL = "\x1b[K";
 
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/** The Qwenodyssey block-glyph mark (3 rows), shared with the launch banner. */
+const MARK = [" ▟█▜▛█▙ ", " ▜█▟▙█▛ ", "  ▀▘▝▀  "];
+
+/** App version for the per-pane dashboard (best-effort; matches the launch banner). */
+const VERSION: string = (() => {
+  try {
+    return require("../../package.json").version || "0.3.0";
+  } catch {
+    return "0.3.0";
+  }
+})();
+
+export interface RosterEntry {
+  label: string;
+  model?: string;
+  backend?: string;
+}
+
 interface PaneState {
   subtaskId?: string;
   title: string;
+  /** Short label shown in the title bar. */
   model: string;
+  /** Full model id for the dashboard line (e.g. "moonshotai/kimi-k2.6"). */
+  fullModel?: string;
+  backend?: string;
   status: SubtaskStatus | "idle";
   buffer: string;
   startedAt: number;
@@ -46,8 +68,10 @@ export interface SwarmTuiOptions {
   panes: number;
   /** Label note, e.g. "(local fallback — no frontier key)". */
   note?: string;
-  /** Worker labels, so idle panes show who's who from the very first frame. */
-  roster?: string[];
+  /** Worker roster, so each pane shows its model/backend from the very first frame. */
+  roster?: RosterEntry[];
+  /** Shown on each pane's dashboard (defaults to cwd). */
+  cwd?: string;
 }
 
 export class SwarmTui {
@@ -71,13 +95,18 @@ export class SwarmTui {
   private readonly out = process.stdout;
 
   constructor(private events: SwarmEvents, private opts: SwarmTuiOptions) {
-    this.panes = Array.from({ length: Math.max(1, opts.panes) }, (_, i) => ({
-      title: "",
-      model: opts.roster?.[i] ?? "",
-      status: "idle" as const,
-      buffer: "",
-      startedAt: 0,
-    }));
+    this.panes = Array.from({ length: Math.max(1, opts.panes) }, (_, i) => {
+      const r = opts.roster?.[i];
+      return {
+        title: "",
+        model: r?.label ?? "",
+        fullModel: r?.model ?? r?.label,
+        backend: r?.backend,
+        status: "idle" as const,
+        buffer: "",
+        startedAt: 0,
+      };
+    });
   }
 
   /** Whether a live TUI can run in this environment. */
@@ -118,9 +147,13 @@ export class SwarmTui {
       this.planned = true;
       if (e.exec) this.execLabel = e.exec;
       if (e.note) this.planNote = e.note;
-      // Seed pane model labels from the roster so idle panes still show who's who.
+      // Seed pane identity from the roster so idle panes still show who's who.
       e.roster.forEach((r, i) => {
-        if (this.panes[i]) this.panes[i].model = r.label;
+        const p = this.panes[i];
+        if (!p) return;
+        p.model = r.label;
+        p.fullModel = r.model || r.label;
+        p.backend = r.backend;
       });
     });
     this.events.on("wave", (e: WaveEvent) => {
@@ -131,6 +164,7 @@ export class SwarmTui {
       p.subtaskId = e.subtaskId;
       p.title = e.title;
       p.model = e.workerLabel || p.model;
+      p.fullModel = e.model || p.fullModel;
       p.status = "running";
       p.buffer = "";
       p.startedAt = Date.now();
@@ -247,14 +281,37 @@ export class SwarmTui {
     const titleColored = colorTitle(titleFit, p.status) + chalk.gray(elapTag);
     const top = chalk.gray("┌") + titleColored + chalk.gray("┐");
 
+    const bar = chalk.gray("│");
+    const wrap = (content: string) => bar + content + bar;
+    const lines: string[] = [top];
     const bodyH = paneH - 1;
-    const bodyLines = tailWrap(p.buffer, inner, bodyH);
-    const body: string[] = [];
-    for (let i = 0; i < bodyH; i++) {
-      const text = bodyLines[i] ?? "";
-      body.push(chalk.gray("│") + chalk.dim(padTrunc(text, inner)) + chalk.gray("│"));
+    let outRows = bodyH;
+
+    // Per-pane Qwenodyssey dashboard (logo + model · backend + cwd), like the
+    // launch banner, when the pane is tall enough (3 logo + 1 rule + ≥1 output).
+    if (bodyH >= 5) {
+      for (const line of this.paneDashboard(p, inner)) lines.push(wrap(line));
+      lines.push(wrap(chalk.gray("─".repeat(inner))));
+      outRows = bodyH - (MARK.length + 1);
     }
-    return [top, ...body];
+
+    const bodyLines = tailWrap(p.buffer, inner, outRows);
+    for (let i = 0; i < outRows; i++) {
+      lines.push(wrap(chalk.dim(padTrunc(bodyLines[i] ?? "", inner))));
+    }
+    return lines;
+  }
+
+  /** The 3-line block-glyph dashboard for one pane (each line `inner` wide). */
+  private paneDashboard(p: PaneState, inner: number): string[] {
+    const model = p.fullModel || p.model || "—";
+    const backend = p.backend ? chalk.gray(` · ${p.backend}`) : "";
+    const texts = [
+      chalk.bold("Qwenodyssey") + " " + chalk.gray("v" + VERSION),
+      chalk.white(model) + backend,
+      chalk.gray(this.opts.cwd ?? process.cwd()),
+    ];
+    return MARK.map((m, i) => fitColored(chalk.cyanBright(m) + "  " + texts[i], inner));
   }
 }
 
@@ -311,6 +368,17 @@ function padTrunc(s: string, w: number): string {
 /** Truncate a possibly-colored string to `w` visible columns (best-effort). */
 function truncVisible(s: string, w: number): string {
   return stripAnsi(s).length <= w ? s : stripAnsi(s).slice(0, w);
+}
+
+/**
+ * Fit a colored string to EXACTLY `w` visible columns: pad with spaces (colors
+ * preserved) when short, or hard-truncate (dropping color) when it overflows.
+ */
+function fitColored(s: string, w: number): string {
+  const vis = stripAnsi(s).length;
+  if (vis === w) return s;
+  if (vis < w) return s + " ".repeat(w - vis);
+  return stripAnsi(s).slice(0, w);
 }
 
 /** Left text + right text justified to width (right is ANSI-colored, measured plain). */

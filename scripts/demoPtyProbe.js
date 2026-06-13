@@ -25,6 +25,9 @@ const finish = (exitCode) => {
   console.log("bytes:", out.length);
   console.log("alt-screen on/off:", has("\x1b[?1049h"), has("\x1b[?1049l"));
   console.log("pane borders:", has("┌"), has("│"));
+  console.log("dashboard logo (▟█▜▛█▙):", has("▟█▜▛█▙"));
+  console.log("dashboard 'Qwenodyssey':", has("Qwenodyssey"));
+  console.log("per-pane model lines:", (out.match(/demo\/(kimi|nemotron|llama|deepseek)/g) || []).length);
   console.log("agent labels:", has("kimi"), has("nemotron"), has("llama"), has("deepseek"));
   console.log("wave 1 header:", has("wave 1"));
   console.log("wave 2 header:", has("wave 2"));

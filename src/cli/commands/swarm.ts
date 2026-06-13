@@ -121,7 +121,8 @@ export async function swarmCommand(task: string | undefined, opts: SwarmOpts): P
       task: taskText,
       panes: roster.length,
       note,
-      roster: roster.map((r) => r.label),
+      roster: roster.map((r) => ({ label: r.label, model: r.model, backend: r.backend })),
+      cwd: process.cwd(),
     });
     const onSigint = () => {
       aborted = true;
@@ -275,7 +276,8 @@ async function demoSwarm(s: ReturnType<typeof createSession>, opts: SwarmOpts): 
       task,
       panes: workers.length,
       note: "demo mode (no tokens spent)",
-      roster: workers.map((w) => w.label),
+      roster: workers.map((w) => ({ label: w.label, model: w.model, backend: w.kind })),
+      cwd: process.cwd(),
     });
     tui.start();
     try {
