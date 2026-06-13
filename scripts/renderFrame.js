@@ -53,11 +53,20 @@ const FULL = ["moonshotai/kimi-k2.6", "nvidia/nemotron-3-ultra-550b-a55b", "meta
 });
 
 setTimeout(() => {
+  // Drive a synthesis + completion so the results pane is populated.
+  ev.emit("synth", { model: "nvidia/nemotron-3-ultra-550b-a55b" });
+  ev.emit("synthDelta", { delta: "# Final report\nBuilt the rate limiter. " });
+  tui.complete({
+    mode: "divide",
+    results: [{ id: "s1", title: "subtask 1", ok: true, text: "ok", ms: 1000, model: "m", backend: "nvidia", task: "", dependsOn: [] }],
+    synthesis: "# Final report\n\nBuilt a production rate-limiter (sliding-window + token bucket).\n\n```python\nclass RateLimiter: ...\n```\n\nRun: `python app.py`.",
+    synthesizedBy: "nvidia/nemotron-3-ultra-550b-a55b",
+    artifacts: { location: "bare metal: C:\\Users\\evera", files: ["C:\\Users\\evera\\ratelimiter.py", "C:\\Users\\evera\\test_rl.py"] },
+  });
   captured = "";
   setTimeout(() => {
     tui.stop();
     Object.defineProperty(process, "stdout", realDesc);
-    // Strip ANSI, split on cursor-home, take the last frame, print it.
     const frames = captured.split("\x1b[H");
     const last = (frames[frames.length - 1] || "")
       .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")

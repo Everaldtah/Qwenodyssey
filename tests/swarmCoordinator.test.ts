@@ -6,6 +6,8 @@ import {
   parsePlan,
   decompose,
   decomposeWith,
+  parseSpecialToolCalls,
+  cleanAgentText,
   type Subtask,
 } from "../src/core/swarmCoordinator";
 import type { Provider, Message } from "../src/types";
@@ -215,6 +217,43 @@ describe("decomposeWith (planner ladder)", () => {
     expect(res.subtasks[0].detail).toBe("whole task");
     expect(res.plannedBy).toBe("(fallback)");
     expect(res.note).toContain("boom1");
+  });
+});
+
+describe("parseSpecialToolCalls (Kimi-on-NIM format)", () => {
+  it("parses <|tool_call_begin|>functions.NAME:idx<|...|>{json}<|tool_call_end|>", () => {
+    const text =
+      'Sure.<|tool_calls_section_begin|> <|tool_call_begin|> functions.run_shell:5 ' +
+      '<|tool_call_argument_begin|> {"command": "echo hi"} <|tool_call_end|> <|tool_calls_section_end|>';
+    const calls = parseSpecialToolCalls(text);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe("run_shell");
+    expect(calls[0].arguments.command).toBe("echo hi");
+  });
+
+  it("returns [] for normal text", () => {
+    expect(parseSpecialToolCalls("just a normal answer")).toEqual([]);
+  });
+
+  it("parses multiple calls", () => {
+    const t =
+      '<|tool_call_begin|>functions.a:1<|tool_call_argument_begin|>{"x":1}<|tool_call_end|>' +
+      '<|tool_call_begin|>functions.b:2<|tool_call_argument_begin|>{"y":2}<|tool_call_end|>';
+    const calls = parseSpecialToolCalls(t);
+    expect(calls.map((c) => c.name)).toEqual(["a", "b"]);
+  });
+});
+
+describe("cleanAgentText", () => {
+  it("strips special control tokens and think blocks", () => {
+    const dirty =
+      "<think>planning</think>Hello <|tool_calls_section_begin|><|tool_call_begin|>functions.x:1" +
+      '<|tool_call_argument_begin|>{"a":1}<|tool_call_end|><|tool_calls_section_end|> world<|im_end|>';
+    const clean = cleanAgentText(dirty);
+    expect(clean).not.toMatch(/<\|/);
+    expect(clean).not.toContain("<think>");
+    expect(clean).toContain("Hello");
+    expect(clean).toContain("world");
   });
 });
 

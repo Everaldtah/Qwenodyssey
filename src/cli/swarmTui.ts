@@ -1,25 +1,31 @@
 /**
- * Live split-pane TUI for the coordinated swarm. Subscribes to a SwarmEvents
- * emitter and paints one terminal pane per agent, each streaming that agent's
- * tokens in real time (status glyph + model + current subtask + elapsed). A header
- * shows the overall task/wave; a footer shows progress. On finish it restores the
- * terminal (leaves the alternate screen) so the normal scrollback is intact and the
- * caller can print the durable text summary.
+ * Live split-pane TUI for the coordinated swarm.
  *
- * Dependency-free: raw ANSI + chalk, modeled on src/cli/render.ts's Spinner. TTY-
- * gated — when stdout is not a TTY (piped/redirected/tests) start() is a no-op and
- * the caller falls back to a plain line logger.
+ * - One fully-boxed pane per agent (2×N grid) + a full-width SYNTHESIZER pane that
+ *   shows the final integrated result, so the deliverable lives on the lead model's
+ *   screen rather than being dumped raw to the terminal.
+ * - Each pane is a mini Qwenodyssey dashboard (logo + model · backend + cwd) with a
+ *   live token counter on its bottom border (↑ prompt ↓ completion · tok/s).
+ * - The panes STAY UP when the run finishes (alt-screen review mode); you can focus
+ *   any pane (Tab / 1-5) and scroll its full session history (↑/↓, PgUp/PgDn, g/G),
+ *   then press q to leave. Nothing is printed raw to the scrollback.
+ *
+ * Dependency-free: raw ANSI + chalk. TTY-gated — when stdout is not a TTY, start()
+ * is a no-op and the caller falls back to a plain line logger.
  */
 import chalk from "chalk";
-import type {
-  SwarmEvents,
-  PlanEvent,
-  AssignEvent,
-  DeltaEvent,
-  StatusEvent,
-  WaveEvent,
-  SubtaskStatus,
+import {
+  cleanAgentText,
+  type SwarmEvents,
+  type PlanEvent,
+  type AssignEvent,
+  type DeltaEvent,
+  type StatusEvent,
+  type WaveEvent,
+  type SubtaskStatus,
+  type CoordinatedResult,
 } from "../core/swarmCoordinator";
+import type { SwarmRun, SwarmArtifacts } from "../core/swarm";
 
 const ALT_SCREEN_ON = "\x1b[?1049h";
 const ALT_SCREEN_OFF = "\x1b[?1049l";
@@ -29,11 +35,10 @@ const HOME = "\x1b[H";
 const CLEAR_EOL = "\x1b[K";
 
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 /** The Qwenodyssey block-glyph mark (3 rows), shared with the launch banner. */
 const MARK = [" ▟█▜▛█▙ ", " ▜█▟▙█▛ ", "  ▀▘▝▀  "];
+const MAX_BUFFER = 200_000; // per-pane scrollback cap (chars)
 
-/** App version for the per-pane dashboard (best-effort; matches the launch banner). */
 const VERSION: string = (() => {
   try {
     return require("../../package.json").version || "0.3.0";
@@ -48,34 +53,45 @@ export interface RosterEntry {
   backend?: string;
 }
 
+type PaneKind = "agent" | "synth";
+
 interface PaneState {
+  kind: PaneKind;
   subtaskId?: string;
   title: string;
-  /** Short label shown in the title bar. */
   model: string;
-  /** Full model id for the dashboard line (e.g. "moonshotai/kimi-k2.6"). */
   fullModel?: string;
   backend?: string;
   status: SubtaskStatus | "idle";
   buffer: string;
   startedAt: number;
   ms?: number;
+  // token accounting
+  outChars: number;
+  firstTokenAt: number;
+  upTokens?: number;
+  outTokens?: number; // exact completion tokens once known
+  // scrolling
+  scrollOffset: number; // lines from the bottom; 0 = follow tail
+  // wrap cache
+  _cacheW?: number;
+  _cacheLen?: number;
+  _cacheLines?: string[];
 }
 
 export interface SwarmTuiOptions {
   task: string;
-  /** Number of worker slots (panes). */
   panes: number;
-  /** Label note, e.g. "(local fallback — no frontier key)". */
   note?: string;
-  /** Worker roster, so each pane shows its model/backend from the very first frame. */
   roster?: RosterEntry[];
-  /** Shown on each pane's dashboard (defaults to cwd). */
   cwd?: string;
+  /** Called when the user requests abort (Ctrl-C/q) while the run is still going. */
+  onAbort?: () => void;
 }
 
 export class SwarmTui {
   private panes: PaneState[];
+  private synth: PaneState;
   private timer?: ReturnType<typeof setInterval>;
   private startedAt = 0;
   private frame = 0;
@@ -83,33 +99,39 @@ export class SwarmTui {
   private subtaskCount = 0;
   private doneCount = 0;
   private failCount = 0;
-  private synthModel?: string;
-  private synthChars = 0;
   private running = false;
-  /** Model currently decomposing the task; cleared when the plan lands. */
+  private phase: "planning" | "running" | "complete" = "planning";
   private planningWith?: string;
   private planNote?: string;
   private planned = false;
-  /** Execution backend label ("bare metal" / "daytona sandbox"), when agents can run commands. */
   private execLabel?: string;
+  private artifacts?: SwarmArtifacts;
+  /** Focused pane index; this.panes.length === the synth pane. */
+  private focus = 0;
+  private quitRequested = false;
+  private exitResolve?: () => void;
+  private onKey?: (d: string) => void;
   private readonly out = process.stdout;
 
   constructor(private events: SwarmEvents, private opts: SwarmTuiOptions) {
-    this.panes = Array.from({ length: Math.max(1, opts.panes) }, (_, i) => {
-      const r = opts.roster?.[i];
-      return {
-        title: "",
-        model: r?.label ?? "",
-        fullModel: r?.model ?? r?.label,
-        backend: r?.backend,
-        status: "idle" as const,
-        buffer: "",
-        startedAt: 0,
-      };
+    const mk = (kind: PaneKind, r?: RosterEntry): PaneState => ({
+      kind,
+      title: "",
+      model: r?.label ?? "",
+      fullModel: r?.model ?? r?.label,
+      backend: r?.backend,
+      status: "idle",
+      buffer: "",
+      startedAt: 0,
+      outChars: 0,
+      firstTokenAt: 0,
+      scrollOffset: 0,
     });
+    this.panes = Array.from({ length: Math.max(1, opts.panes) }, (_, i) => mk("agent", opts.roster?.[i]));
+    this.synth = mk("synth");
+    this.synth.title = "results";
   }
 
-  /** Whether a live TUI can run in this environment. */
   static supported(): boolean {
     return !!process.stdout.isTTY && (process.stdout.columns ?? 0) >= 40;
   }
@@ -117,25 +139,162 @@ export class SwarmTui {
   start(): void {
     if (!SwarmTui.supported()) return;
     this.running = true;
+    this.phase = "planning";
     this.startedAt = Date.now();
     this.wire();
-    // Explicit clear+home after entering the alt screen: some hosts don't blank it.
+    this.attachKeys();
     this.out.write(ALT_SCREEN_ON + HIDE_CURSOR + "\x1b[2J\x1b[H");
     this.draw();
     this.timer = setInterval(() => this.draw(), 100);
     this.timer.unref?.();
   }
 
-  /** Stop painting and restore the normal screen. Safe to call once. */
+  /** Mark the run finished and surface the final output + files on the RESULTS pane. */
+  complete(run: SwarmRun): void {
+    this.phase = "complete";
+    this.synth.status = run.results.some((r) => r.ok) ? "done" : "failed";
+    this.synth.model = run.synthesizedBy || this.synth.model || "results";
+    this.synth.fullModel = run.synthesizedBy || this.synth.fullModel;
+    if (run.artifacts) this.artifacts = run.artifacts;
+
+    const okResults = (run.results as CoordinatedResult[]).filter((r) => r.ok);
+    const out =
+      run.synthesis ||
+      (okResults.length ? okResults.map((r) => `## ${r.title}\n${r.text}`).join("\n\n") : "All agents failed — no result.");
+
+    const parts = [out];
+    const arts = this.artifacts;
+    if (arts && arts.files.length) {
+      parts.push(
+        "\n\n──────── Files generated ────────\n" +
+          `Location: ${arts.location}\n` +
+          arts.files.map((f) => `  • ${f}`).join("\n")
+      );
+    } else if (arts) {
+      parts.push(`\n\n──────── Files generated ────────\nLocation: ${arts.location}\n  (no new files detected)`);
+    }
+    this.synth.buffer = parts.join("");
+    this.invalidate(this.synth);
+    this.focus = this.panes.length; // focus the results pane
+    this.synth.scrollOffset = Number.MAX_SAFE_INTEGER; // show it from the top
+    if (this.running) this.draw();
+  }
+
+  /** Resolves when the user leaves review mode (q / Ctrl-C), or immediately if no TTY. */
+  waitForExit(): Promise<void> {
+    if (this.quitRequested || !process.stdin.isTTY) return Promise.resolve();
+    return new Promise((res) => (this.exitResolve = res));
+  }
+
   stop(): void {
     if (!this.running) return;
     this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    this.detachKeys();
     this.out.write(SHOW_CURSOR + ALT_SCREEN_OFF);
   }
 
+  /** The final integrated result text (for the caller to persist to a file). */
+  finalResult(): string {
+    return this.synth.buffer;
+  }
+
+  /* ── keyboard ── */
+
+  private attachKeys(): void {
+    const stdin = process.stdin;
+    if (!stdin.isTTY) return;
+    try {
+      stdin.setRawMode(true);
+    } catch {
+      /* ignore */
+    }
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    this.onKey = (d: string) => this.handleKey(d);
+    stdin.on("data", this.onKey);
+  }
+
+  private detachKeys(): void {
+    const stdin = process.stdin;
+    if (this.onKey) stdin.removeListener("data", this.onKey);
+    this.onKey = undefined;
+    if (stdin.isTTY) {
+      try {
+        stdin.setRawMode(false);
+      } catch {
+        /* ignore */
+      }
+    }
+    stdin.pause();
+  }
+
+  private quit(): void {
+    this.quitRequested = true;
+    if (this.phase !== "complete") this.opts.onAbort?.();
+    this.exitResolve?.();
+    this.exitResolve = undefined;
+  }
+
+  private focusPanes(): PaneState[] {
+    return [...this.panes, this.synth];
+  }
+
+  private handleKey(d: string): void {
+    const all = this.focusPanes();
+    const cur = all[Math.min(this.focus, all.length - 1)];
+    const bodyRows = 6; // approximate page size; exact rows vary, this is fine for paging
+    switch (d) {
+      case "q":
+      case "Q":
+      case "\x03": // Ctrl-C
+        this.quit();
+        return;
+      case "\t": // Tab
+        this.focus = (this.focus + 1) % all.length;
+        break;
+      case "\x1b[Z": // Shift-Tab
+        this.focus = (this.focus - 1 + all.length) % all.length;
+        break;
+      case "\x1b[A": // Up
+      case "k":
+        cur.scrollOffset += 1;
+        break;
+      case "\x1b[B": // Down
+      case "j":
+        cur.scrollOffset = Math.max(0, cur.scrollOffset - 1);
+        break;
+      case "\x1b[5~": // PgUp
+        cur.scrollOffset += bodyRows;
+        break;
+      case "\x1b[6~": // PgDn
+        cur.scrollOffset = Math.max(0, cur.scrollOffset - bodyRows);
+        break;
+      case "g":
+      case "\x1b[H": // Home
+        cur.scrollOffset = Number.MAX_SAFE_INTEGER;
+        break;
+      case "G":
+      case "\x1b[F": // End
+        cur.scrollOffset = 0;
+        break;
+      default:
+        if (/^[1-9]$/.test(d)) {
+          const idx = parseInt(d, 10) - 1;
+          if (idx < all.length) this.focus = idx;
+        } else {
+          return; // unknown key, no redraw
+        }
+    }
+    if (this.running) this.draw();
+  }
+
   /* ── event wiring ── */
+
+  private invalidate(p: PaneState): void {
+    p._cacheLines = undefined;
+  }
 
   private wire(): void {
     this.events.on("planner", (e: { model: string }) => {
@@ -145,9 +304,9 @@ export class SwarmTui {
       this.subtaskCount = e.subtasks.length;
       this.planningWith = undefined;
       this.planned = true;
+      this.phase = "running";
       if (e.exec) this.execLabel = e.exec;
       if (e.note) this.planNote = e.note;
-      // Seed pane identity from the roster so idle panes still show who's who.
       e.roster.forEach((r, i) => {
         const p = this.panes[i];
         if (!p) return;
@@ -156,9 +315,7 @@ export class SwarmTui {
         p.backend = r.backend;
       });
     });
-    this.events.on("wave", (e: WaveEvent) => {
-      this.waveIndex = e.index;
-    });
+    this.events.on("wave", (e: WaveEvent) => (this.waveIndex = e.index));
     this.events.on("assign", (e: AssignEvent) => {
       const p = this.panes[e.pane % this.panes.length];
       p.subtaskId = e.subtaskId;
@@ -167,14 +324,18 @@ export class SwarmTui {
       p.fullModel = e.model || p.fullModel;
       p.status = "running";
       p.buffer = "";
+      p.outChars = 0;
+      p.firstTokenAt = 0;
+      p.outTokens = undefined;
+      p.upTokens = undefined;
+      p.scrollOffset = 0;
       p.startedAt = Date.now();
       p.ms = undefined;
+      this.invalidate(p);
     });
     this.events.on("delta", (e: DeltaEvent) => {
       const p = this.panes[e.pane % this.panes.length];
-      p.buffer += e.delta;
-      // Keep the buffer from growing unbounded; we only ever render the tail.
-      if (p.buffer.length > 8000) p.buffer = p.buffer.slice(-6000);
+      this.appendDelta(p, e.delta);
     });
     this.events.on("status", (e: StatusEvent) => {
       const p = this.panes[e.pane % this.panes.length];
@@ -183,13 +344,32 @@ export class SwarmTui {
       if (e.status === "done") this.doneCount++;
       if (e.status === "failed") this.failCount++;
     });
+    this.events.on("result", (r: CoordinatedResult) => {
+      const p = this.panes.find((x) => x.subtaskId === r.id);
+      if (!p) return;
+      if (r.promptTokens != null) p.upTokens = r.promptTokens;
+      if (r.completionTokens != null) p.outTokens = r.completionTokens;
+    });
     this.events.on("synth", (e: { model: string }) => {
-      this.synthModel = e.model;
-      this.synthChars = 0;
+      this.synth.status = "running";
+      this.synth.model = e.model;
+      this.synth.fullModel = e.model;
+      this.synth.startedAt = Date.now();
+      this.synth.buffer = "";
+      this.synth.outChars = 0;
+      this.synth.firstTokenAt = 0;
+      this.invalidate(this.synth);
     });
-    this.events.on("synthDelta", (e: { delta: string }) => {
-      this.synthChars += e.delta.length;
-    });
+    this.events.on("synthDelta", (e: { delta: string }) => this.appendDelta(this.synth, e.delta));
+    this.events.on("artifacts", (a: SwarmArtifacts) => (this.artifacts = a));
+  }
+
+  private appendDelta(p: PaneState, delta: string): void {
+    if (p.outChars === 0) p.firstTokenAt = Date.now();
+    p.buffer += delta;
+    p.outChars += delta.length;
+    if (p.buffer.length > MAX_BUFFER) p.buffer = p.buffer.slice(-MAX_BUFFER);
+    this.invalidate(p);
   }
 
   /* ── rendering ── */
@@ -199,36 +379,39 @@ export class SwarmTui {
     this.frame++;
     const width = this.out.columns || 80;
     const height = this.out.rows || 24;
-    const lines: string[] = [];
+    const all = this.focusPanes();
+    const lines: string[] = [this.header(width)];
 
-    lines.push(this.header(width));
-
-    // Grid geometry.
     const n = this.panes.length;
-    const cols = Math.max(1, Math.min(n, Math.floor(width / 30) || 1, Math.ceil(Math.sqrt(n))));
-    const rows = Math.ceil(n / cols);
-    const gridHeight = Math.max(rows * 3, height - 2 - (this.synthModel ? 1 : 0));
-    const paneH = Math.max(3, Math.floor(gridHeight / rows));
+    const cols = Math.max(1, Math.min(n, Math.floor(width / 24) || 1, Math.ceil(Math.sqrt(n))));
+    const gridRows = Math.ceil(n / cols);
     const gap = 1;
     const paneW = Math.max(20, Math.floor((width - gap * (cols - 1)) / cols));
+    const fullW = paneW * cols + gap * (cols - 1);
 
-    for (let r = 0; r < rows; r++) {
-      const rowPanes: string[][] = [];
+    const avail = Math.max(8, height - 2); // minus header + footer
+    const synthH = Math.max(4, Math.min(avail - gridRows * 3, Math.floor(avail * 0.32)));
+    const gridArea = avail - synthH;
+    const paneH = Math.max(3, Math.floor(gridArea / gridRows));
+
+    // Agent grid.
+    for (let r = 0; r < gridRows; r++) {
+      const rowBoxes: string[][] = [];
       for (let c = 0; c < cols; c++) {
         const idx = r * cols + c;
-        rowPanes.push(idx < n ? this.renderPane(this.panes[idx], paneW, paneH) : blankPane(paneW, paneH));
+        rowBoxes.push(
+          idx < n ? this.renderBox(this.panes[idx], paneW, paneH, this.focus === idx) : blankBox(paneW, paneH)
+        );
       }
-      for (let k = 0; k < paneH; k++) {
-        lines.push(rowPanes.map((p) => p[k]).join(" ".repeat(gap)));
-      }
+      for (let k = 0; k < paneH; k++) lines.push(rowBoxes.map((b) => b[k]).join(" ".repeat(gap)));
     }
 
-    if (this.synthModel) lines.push(this.synthLine(width));
+    // Synthesizer pane (full width).
+    const synthBox = this.renderBox(this.synth, fullW, synthH, this.focus === n);
+    for (const l of synthBox) lines.push(l);
+
     lines.push(this.footer(width));
 
-    // Paint: home, then each line cleared to EOL. Trim to terminal height.
-    // Explicit \r\n (not bare \n): don't rely on the console's output processing
-    // to supply the carriage return.
     const visible = lines.slice(0, height);
     this.out.write(HOME + visible.map((l) => l + CLEAR_EOL).join("\r\n"));
   }
@@ -236,13 +419,14 @@ export class SwarmTui {
   private header(width: number): string {
     const elapsed = Math.floor((Date.now() - this.startedAt) / 1000);
     const left = chalk.bold("🜂 swarm") + chalk.gray(`  ${this.opts.task}`);
-    // Before the plan lands the run is in the decompose phase — show that, never a
-    // dead-looking screen (a slow planner used to look like a hung black screen).
-    const phase = this.planned
-      ? `wave ${this.waveIndex + 1}`
-      : `${SPIN[this.frame % SPIN.length]} planning split` +
-        (this.planningWith ? ` with ${this.planningWith}` : "") +
-        "…";
+    const phase =
+      this.phase === "complete"
+        ? chalk.green("✓ complete")
+        : this.planned
+          ? `wave ${this.waveIndex + 1}`
+          : `${SPIN[this.frame % SPIN.length]} planning split` +
+            (this.planningWith ? ` with ${this.planningWith}` : "") +
+            "…";
     const right = chalk.gray(`${phase} · ${fmtElapsed(elapsed)}`);
     return padBetween(stripToWidth(left, width - stripAnsi(right).length - 1, true), right, width);
   }
@@ -253,56 +437,79 @@ export class SwarmTui {
     const exec = this.execLabel ? chalk.cyan(` · exec: ${this.execLabel}`) : "";
     const fails = this.failCount ? chalk.red(` · ${this.failCount} failed`) : "";
     const prog = chalk.gray(`${this.doneCount}/${this.subtaskCount || this.panes.length} done`);
-    return truncVisible(prog + fails + exec + note + chalk.gray("   Ctrl-C aborts"), width);
+    const keys =
+      this.phase === "complete"
+        ? chalk.gray("   ") + chalk.cyan("Tab") + chalk.gray(" focus · ") + chalk.cyan("↑↓/PgUp/PgDn/g/G") + chalk.gray(" scroll · ") + chalk.cyan("q") + chalk.gray(" quit")
+        : chalk.gray("   Tab focus · ↑↓ scroll · Ctrl-C abort");
+    return truncVisible(prog + fails + exec + note + keys, width);
   }
 
-  private synthLine(width: number): string {
-    const g = SPIN[this.frame % SPIN.length];
-    return truncVisible(
-      chalk.magenta(`${g} synthesizing`) +
-        chalk.gray(` with ${this.synthModel} · ${this.synthChars} chars`),
-      width
-    );
-  }
+  /** Render one fully-boxed pane: exactly `w`×`h`, each line `w` visible columns. */
+  private renderBox(p: PaneState, w: number, h: number, focused: boolean): string[] {
+    const bc = focused ? chalk.cyanBright : chalk.gray;
+    const inner = w - 2;
+    const lines: string[] = [bc("┌") + this.titleBar(p, inner) + bc("┐")];
 
-  /** Produce exactly paneH lines, each visually paneW wide. */
-  private renderPane(p: PaneState, paneW: number, paneH: number): string[] {
-    const glyph = statusGlyph(p.status, this.frame);
-    const elapsed = p.status === "running" && p.startedAt
-      ? fmtElapsed(Math.floor((Date.now() - p.startedAt) / 1000))
-      : p.ms != null
-        ? fmtElapsed(Math.round(p.ms / 1000))
-        : "";
-    const titlePlain = ` ${stripAnsi(glyph)} ${p.model || "—"}${p.title ? " · " + p.title : ""} `;
-    // Title bar: ┌ … ┐ with elapsed pinned right.
-    const inner = paneW - 2;
-    const elapTag = elapsed ? `${elapsed} ` : "";
-    const titleFit = padTrunc(titlePlain.replace(/\s+$/, ""), Math.max(0, inner - elapTag.length));
-    const titleColored = colorTitle(titleFit, p.status) + chalk.gray(elapTag);
-    const top = chalk.gray("┌") + titleColored + chalk.gray("┐");
-
-    const bar = chalk.gray("│");
-    const wrap = (content: string) => bar + content + bar;
-    const lines: string[] = [top];
-    const bodyH = paneH - 1;
-    let outRows = bodyH;
-
-    // Per-pane Qwenodyssey dashboard (logo + model · backend + cwd), like the
-    // launch banner, when the pane is tall enough (3 logo + 1 rule + ≥1 output).
-    if (bodyH >= 5) {
-      for (const line of this.paneDashboard(p, inner)) lines.push(wrap(line));
-      lines.push(wrap(chalk.gray("─".repeat(inner))));
-      outRows = bodyH - (MARK.length + 1);
+    let bodyRows = h - 2; // minus top + bottom borders
+    // Per-agent Qwenodyssey dashboard when tall enough.
+    if (p.kind === "agent" && bodyRows >= MARK.length + 2) {
+      for (const dl of this.paneDashboard(p, inner)) lines.push(bc("│") + dl + bc("│"));
+      lines.push(bc("├") + bc("─".repeat(inner)) + bc("┤"));
+      bodyRows -= MARK.length + 1;
     }
 
-    const bodyLines = tailWrap(p.buffer, inner, outRows);
-    for (let i = 0; i < outRows; i++) {
-      lines.push(wrap(chalk.dim(padTrunc(bodyLines[i] ?? "", inner))));
+    const wrapped = this.wrappedLines(p, inner);
+    const total = wrapped.length;
+    const maxOff = Math.max(0, total - bodyRows);
+    if (p.scrollOffset > maxOff) p.scrollOffset = maxOff;
+    const end = total - p.scrollOffset;
+    const start = Math.max(0, end - bodyRows);
+    const windowLines = wrapped.slice(start, end);
+    for (let i = 0; i < bodyRows; i++) {
+      lines.push(bc("│") + chalk.dim(padTrunc(windowLines[i] ?? "", inner)) + bc("│"));
     }
+
+    lines.push(bc("└") + this.bottomBar(p, inner, start > 0, p.scrollOffset > 0) + bc("┘"));
     return lines;
   }
 
-  /** The 3-line block-glyph dashboard for one pane (each line `inner` wide). */
+  private titleBar(p: PaneState, inner: number): string {
+    const glyph = statusGlyph(p.status, this.frame);
+    const elapsed =
+      p.status === "running" && p.startedAt
+        ? fmtElapsed(Math.floor((Date.now() - p.startedAt) / 1000))
+        : p.ms != null
+          ? fmtElapsed(Math.round(p.ms / 1000))
+          : "";
+    const name =
+      p.kind === "synth"
+        ? `📋 results${this.phase === "complete" ? "" : this.synth.status === "running" ? " · compiling" : " · waiting"}${p.model ? " · " + p.model : ""}`
+        : p.model || "—";
+    const titlePlain = ` ${stripAnsi(glyph)} ${name}${p.title && p.kind === "agent" ? " · " + p.title : ""} `;
+    const elapTag = elapsed ? `${elapsed} ` : "";
+    const titleFit = padTrunc(titlePlain.replace(/\s+$/, ""), Math.max(0, inner - elapTag.length));
+    return colorTitle(titleFit, p.status) + chalk.gray(elapTag);
+  }
+
+  /** Bottom border carries the live token counter + a scroll indicator. */
+  private bottomBar(p: PaneState, inner: number, moreAbove: boolean, scrolledUp: boolean): string {
+    const up = p.upTokens != null ? `↑ ${fmtTok(p.upTokens)} ` : "";
+    const outTok = p.outTokens != null ? p.outTokens : Math.ceil(p.outChars / 4);
+    const down = outTok > 0 || p.status !== "idle" ? `↓ ${fmtTok(outTok)} ` : "";
+    let rate = 0;
+    if (p.firstTokenAt && p.status === "running") {
+      const secs = (Date.now() - p.firstTokenAt) / 1000;
+      if (secs > 0.3) rate = outTok / secs;
+    }
+    const rateTag = rate > 0 ? `· ${rate >= 10 ? Math.round(rate) : rate.toFixed(1)} tok/s ` : "";
+    const left = `─ ${up}${down}${rateTag}`;
+    const scroll = scrolledUp ? ` ⇡scroll ` : moreAbove ? ` ▲more ` : "";
+    const leftVis = stripAnsi(left).length;
+    const rightVis = scroll.length;
+    const fill = Math.max(0, inner - leftVis - rightVis);
+    return chalk.gray(left) + chalk.gray("─".repeat(fill)) + chalk.yellow(scroll);
+  }
+
   private paneDashboard(p: PaneState, inner: number): string[] {
     const model = p.fullModel || p.model || "—";
     const backend = p.backend ? chalk.gray(` · ${p.backend}`) : "";
@@ -312,6 +519,17 @@ export class SwarmTui {
       chalk.gray(this.opts.cwd ?? process.cwd()),
     ];
     return MARK.map((m, i) => fitColored(chalk.cyanBright(m) + "  " + texts[i], inner));
+  }
+
+  /** Cleaned + wrapped lines for a pane's full buffer (cached per width/length). */
+  private wrappedLines(p: PaneState, inner: number): string[] {
+    if (p._cacheLines && p._cacheW === inner && p._cacheLen === p.buffer.length) return p._cacheLines;
+    const cleaned = cleanAgentText(p.buffer);
+    const lines = wrapAll(cleaned, inner);
+    p._cacheLines = lines;
+    p._cacheW = inner;
+    p._cacheLen = p.buffer.length;
+    return lines;
   }
 }
 
@@ -337,16 +555,17 @@ function colorTitle(s: string, status: PaneState["status"]): string {
   return chalk.gray(s);
 }
 
-function blankPane(w: number, h: number): string[] {
-  return Array.from({ length: h }, (_, i) =>
-    i === 0 ? chalk.gray("┌" + "─".repeat(Math.max(0, w - 2)) + "┐") : chalk.gray("│" + " ".repeat(Math.max(0, w - 2)) + "│")
-  );
+function blankBox(w: number, h: number): string[] {
+  const top = chalk.gray("┌" + "─".repeat(Math.max(0, w - 2)) + "┐");
+  const mid = chalk.gray("│" + " ".repeat(Math.max(0, w - 2)) + "│");
+  const bot = chalk.gray("└" + "─".repeat(Math.max(0, w - 2)) + "┘");
+  return [top, ...Array.from({ length: Math.max(0, h - 2) }, () => mid), bot];
 }
 
-/** Split a buffer into wrapped lines and return the last `count` of them. */
-function tailWrap(buffer: string, width: number, count: number): string[] {
-  if (!buffer) return [];
-  const raw = stripAnsi(buffer).replace(/\r/g, "");
+/** Wrap a multi-line string to `width`, returning ALL visual lines. */
+function wrapAll(text: string, width: number): string[] {
+  if (!text || width < 1) return [];
+  const raw = text.replace(/\r/g, "");
   const out: string[] = [];
   for (const ln of raw.split("\n")) {
     if (ln.length === 0) {
@@ -355,25 +574,19 @@ function tailWrap(buffer: string, width: number, count: number): string[] {
     }
     for (let i = 0; i < ln.length; i += width) out.push(ln.slice(i, i + width));
   }
-  return out.slice(-count);
+  return out;
 }
 
-/** Pad or truncate a PLAIN string to exactly `w` visible columns. */
 function padTrunc(s: string, w: number): string {
   const plain = s.replace(/\n/g, " ");
   if (plain.length >= w) return plain.slice(0, w);
   return plain + " ".repeat(w - plain.length);
 }
 
-/** Truncate a possibly-colored string to `w` visible columns (best-effort). */
 function truncVisible(s: string, w: number): string {
   return stripAnsi(s).length <= w ? s : stripAnsi(s).slice(0, w);
 }
 
-/**
- * Fit a colored string to EXACTLY `w` visible columns: pad with spaces (colors
- * preserved) when short, or hard-truncate (dropping color) when it overflows.
- */
 function fitColored(s: string, w: number): string {
   const vis = stripAnsi(s).length;
   if (vis === w) return s;
@@ -381,7 +594,6 @@ function fitColored(s: string, w: number): string {
   return stripAnsi(s).slice(0, w);
 }
 
-/** Left text + right text justified to width (right is ANSI-colored, measured plain). */
 function padBetween(left: string, right: string, width: number): string {
   const lp = stripAnsi(left).length;
   const rp = stripAnsi(right).length;
@@ -402,4 +614,9 @@ function stripAnsi(s: string): string {
 
 function fmtElapsed(seconds: number): string {
   return seconds >= 60 ? `${Math.floor(seconds / 60)}m${seconds % 60}s` : `${seconds}s`;
+}
+
+function fmtTok(n: number): string {
+  if (n < 1000) return String(n);
+  return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
 }

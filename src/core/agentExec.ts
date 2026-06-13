@@ -17,8 +17,11 @@
  * Mode "auto" = bare for simple plans, daytona for complex plans when a key is
  * configured (falls back to bare with a note when not).
  */
+import * as fs from "fs";
+import * as path from "path";
 import execa from "execa";
 import type { Config } from "./config";
+import type { SwarmArtifacts } from "./swarm";
 import { classifyCommand, PS_PREAMBLE } from "../tools/shellTools";
 
 export type ExecKind = "bare" | "daytona";
@@ -36,6 +39,8 @@ export interface AgentExecutor {
   /** Short label for UI ("bare metal" / "daytona sandbox"). */
   readonly label: string;
   run(command: string, opts?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult>;
+  /** Files created/modified during this run, for the results pane. Call before dispose(). */
+  artifacts(): Promise<SwarmArtifacts>;
   /** Release resources (delete the sandbox). Safe to call more than once. */
   dispose(): Promise<void>;
 }
@@ -52,6 +57,7 @@ export interface BareExecutorOptions {
 export class BareExecutor implements AgentExecutor {
   readonly kind = "bare" as const;
   readonly label = "bare metal";
+  private readonly startedAt = Date.now();
 
   constructor(private opts: BareExecutorOptions = {}) {}
 
@@ -89,6 +95,35 @@ export class BareExecutor implements AgentExecutor {
     } catch (err) {
       return { ok: false, exitCode: null, output: (err as Error).message };
     }
+  }
+
+  /** Files under cwd modified since this executor was created (depth-limited). */
+  async artifacts(): Promise<SwarmArtifacts> {
+    const root = path.resolve(this.opts.cwd ?? process.cwd());
+    const skip = new Set(["node_modules", ".git", "dist", ".qwenodyssey", "__pycache__", ".venv"]);
+    const files: string[] = [];
+    const walk = (dir: string, depth: number) => {
+      if (depth > 3 || files.length >= 60) return;
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        if (files.length >= 60) break;
+        if (e.name.startsWith(".") || skip.has(e.name)) continue;
+        const full = path.join(dir, e.name);
+        try {
+          if (e.isDirectory()) walk(full, depth + 1);
+          else if (fs.statSync(full).mtimeMs >= this.startedAt - 1000) files.push(full);
+        } catch {
+          /* ignore unreadable entries */
+        }
+      }
+    };
+    walk(root, 0);
+    return { location: `bare metal: ${root}`, files: files.sort() };
   }
 
   async dispose(): Promise<void> {
@@ -177,6 +212,15 @@ export class DaytonaExecutor implements AgentExecutor {
           }
         }
         if (state !== "started") throw new Error("daytona sandbox start timed out (120s)");
+        // Drop a sentinel so artifacts() can list files created after this point.
+        try {
+          await this.api("POST", `/toolbox/${id}/toolbox/process/execute`, {
+            command: "touch /tmp/.qod_swarm_start",
+            timeout: 10,
+          });
+        } catch {
+          /* non-fatal */
+        }
         this.sandboxId = id;
         return id;
       })();
@@ -200,6 +244,25 @@ export class DaytonaExecutor implements AgentExecutor {
       return { ok: exitCode === 0, exitCode, output: String(res.result ?? "") };
     } catch (err) {
       return { ok: false, exitCode: null, output: (err as Error).message };
+    }
+  }
+
+  /** List files created in the sandbox since the sentinel (before it's deleted). */
+  async artifacts(): Promise<SwarmArtifacts> {
+    const id = this.sandboxId;
+    if (!id) return { location: "daytona sandbox", files: [] };
+    try {
+      const r = await this.run(
+        "find . ~ -maxdepth 3 -type f -newer /tmp/.qod_swarm_start -not -path '*/.*' 2>/dev/null | sort -u | head -60",
+        { timeoutMs: 30_000 }
+      );
+      const files = (r.output || "")
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      return { location: `daytona sandbox ${id}`, files };
+    } catch {
+      return { location: `daytona sandbox ${id}`, files: [] };
     }
   }
 

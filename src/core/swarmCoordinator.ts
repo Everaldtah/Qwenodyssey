@@ -24,7 +24,7 @@
  */
 import { EventEmitter } from "events";
 import type { Config } from "./config";
-import type { Message, Provider, ToolSpec } from "../types";
+import type { Message, Provider, ToolSpec, ToolCall } from "../types";
 import {
   chooseExecutor,
   type AgentExecutor,
@@ -398,6 +398,46 @@ function extractJson(text: string): string | null {
   return null;
 }
 
+/* ───────────── model-output cleanup / non-standard (Kimi) tool calls ────────── */
+
+/**
+ * Some hosted models — notably Kimi K2.x on NVIDIA NIM — emit tool calls as SPECIAL
+ * TOKENS inside the text instead of OpenAI-style `tool_calls`:
+ *   <|tool_calls_section_begin|><|tool_call_begin|>functions.run_shell:5
+ *   <|tool_call_argument_begin|>{"command":"..."}<|tool_call_end|><|tool_calls_section_end|>
+ * Without parsing, these leak as raw text AND the commands never run. Convert them
+ * to real ToolCalls so the exec loop executes them.
+ */
+export function parseSpecialToolCalls(text: string): ToolCall[] {
+  const calls: ToolCall[] = [];
+  const re =
+    /<\|tool_call_begin\|>\s*(?:functions\.)?([A-Za-z0-9_.\-]+?)(?::(\d+))?\s*<\|tool_call_argument_begin\|>\s*(\{[\s\S]*?\})\s*<\|tool_call_end\|>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    const rawName = m[1];
+    const name = rawName.includes(".") ? rawName.slice(rawName.lastIndexOf(".") + 1) : rawName;
+    let args: Record<string, any> = {};
+    try {
+      args = JSON.parse(m[3]);
+    } catch {
+      args = { _raw: m[3] };
+    }
+    calls.push({ id: `special_${m[2] ?? calls.length}`, name, arguments: args });
+  }
+  return calls;
+}
+
+/**
+ * Strip a model's chain-of-thought and any special control/tool tokens so streamed
+ * and stored agent text stays human-readable (no `<|tool_call…|>` noise in panes).
+ */
+export function cleanAgentText(text: string): string {
+  return stripThinking(text)
+    .replace(/<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/g, "")
+    .replace(/<\|[a-zA-Z0-9_]+\|>/g, "")
+    .trimEnd();
+}
+
 /* ─────────────────────────── Shared blackboard ───────────────────────────── */
 
 /** The shared store every agent reads context from and writes results to. */
@@ -614,6 +654,16 @@ export class CoordinatedSwarm {
         run.synthesis = await this.synthesizeStreamed(task, synthRun, opts.signal);
         run.synthesizedBy = this.lead.model;
       }
+
+      // Collect generated files (before the sandbox is torn down) for the results pane.
+      if (executor) {
+        try {
+          run.artifacts = await executor.artifacts();
+          this.events.emit("artifacts", run.artifacts);
+        } catch {
+          /* non-fatal */
+        }
+      }
     } finally {
       // Tear down the run's sandbox even on abort/failure.
       await executor?.dispose().catch(() => {});
@@ -670,7 +720,7 @@ export class CoordinatedSwarm {
     };
     try {
       const res = await this.agentLoop(worker, messages, emitDelta, signal, executor, pane, entry.id);
-      const clean = stripThinking(res.text || text).trim();
+      const clean = cleanAgentText(res.text || text).trim();
       entry.status = "done";
       entry.result = clean;
       entry.ms = Date.now() - start;
@@ -772,13 +822,20 @@ export class CoordinatedSwarm {
         ...opts,
         tools: step < maxSteps ? [spec] : undefined,
       });
-      if (res.text) allText += (allText ? "\n" : "") + res.text;
+      // Honor OpenAI tool_calls OR special-token tool calls (Kimi on NIM).
+      let toolCalls = res.toolCalls;
+      if (!toolCalls?.length) {
+        const special = parseSpecialToolCalls(res.text);
+        if (special.length) toolCalls = special;
+      }
+      const cleanText = cleanAgentText(res.text);
+      if (cleanText) allText += (allText ? "\n" : "") + cleanText;
       promptTokens = res.promptTokens ?? promptTokens;
       completionTokens = (completionTokens ?? 0) + (res.completionTokens ?? 0);
-      if (!res.toolCalls?.length) break;
+      if (!toolCalls?.length) break;
 
-      convo.push({ role: "assistant", content: res.text || "", tool_calls: res.toolCalls });
-      for (const tc of res.toolCalls) {
+      convo.push({ role: "assistant", content: cleanText, tool_calls: toolCalls });
+      for (const tc of toolCalls) {
         const cmd = String(tc.arguments?.command ?? "").trim();
         const cwd = tc.arguments?.cwd ? String(tc.arguments.cwd) : undefined;
         emitDelta(`\n$ ${cmd}\n`);
@@ -818,10 +875,14 @@ export class CoordinatedSwarm {
         role: "user",
         content:
           `OVERALL TASK:\n${task}\n\n` +
-          `A team of agents completed the subtasks below, sharing context as they went. Integrate their ` +
-          `outputs into ONE coherent, correct, complete result that fulfills the overall task. Keep each ` +
-          `subtask's substance, reconcile overlaps, and resolve any contradictions. Do not mention the team.\n\n` +
-          `${blocks}\n\n--- Write the single integrated final result below. ---`,
+          `A team of agents completed the subtasks below, sharing context as they went. Write ONE clear, ` +
+          `human-readable final report in Markdown that integrates their work:\n` +
+          `- a short summary of what was built/decided;\n` +
+          `- the files or artifacts produced, with their paths;\n` +
+          `- the key code in fenced \`\`\` code blocks (real newlines — NEVER a raw JSON object of escaped file contents);\n` +
+          `- how to run or use it.\n` +
+          `Reconcile overlaps and contradictions; do not mention the team or the process.\n\n` +
+          `${blocks}\n\n--- Write the integrated Markdown report below. ---`,
       },
     ];
     try {

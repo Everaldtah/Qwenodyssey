@@ -15,7 +15,19 @@ const child = pty.spawn(
 );
 
 let out = "";
-child.onData((d) => (out += d));
+let sawComplete = false;
+child.onData((d) => {
+  out += d;
+  // Once the run completes (results pane focused), exercise scroll then quit.
+  if (!sawComplete && out.includes("✓ complete")) {
+    sawComplete = true;
+    setTimeout(() => child.write("\x1b[5~"), 300); // PgUp on results pane
+    setTimeout(() => child.write("\t"), 600); // Tab focus
+    setTimeout(() => child.write("q"), 1000); // quit review mode
+  }
+});
+// Safety: quit after 30s even if "✓ complete" never matched.
+setTimeout(() => child.write("q"), 30000);
 
 const finish = (exitCode) => {
   fs.writeFileSync(path.join(repo, "scripts", "demo_capture.txt"), out, "utf8");
@@ -24,16 +36,14 @@ const finish = (exitCode) => {
   console.log("exitCode:", exitCode);
   console.log("bytes:", out.length);
   console.log("alt-screen on/off:", has("\x1b[?1049h"), has("\x1b[?1049l"));
-  console.log("pane borders:", has("┌"), has("│"));
+  console.log("box borders ┌│└┘:", has("┌"), has("│"), has("└"), has("┘"));
   console.log("dashboard logo (▟█▜▛█▙):", has("▟█▜▛█▙"));
-  console.log("dashboard 'Qwenodyssey':", has("Qwenodyssey"));
-  console.log("per-pane model lines:", (out.match(/demo\/(kimi|nemotron|llama|deepseek)/g) || []).length);
+  console.log("results pane:", has("results"));
+  console.log("token counter (↑/↓):", has("↑"), has("↓"));
+  console.log("complete state:", has("✓ complete"));
+  console.log("scroll/quit keys hint:", has("quit"));
   console.log("agent labels:", has("kimi"), has("nemotron"), has("llama"), has("deepseek"));
-  console.log("wave 1 header:", has("wave 1"));
-  console.log("wave 2 header:", has("wave 2"));
-  console.log("streamed text:", has("Drafting the core architecture"));
-  console.log("done glyph ✓:", has("✓"));
-  console.log("synthesizing line:", has("synthesizing"));
+  console.log("wave 1 / wave 2:", has("wave 1"), has("wave 2"));
   console.log("frames painted:", (out.match(/\x1b\[H/g) || []).length);
   console.log("clean finish:", has("demo finished"));
   process.exit(0);

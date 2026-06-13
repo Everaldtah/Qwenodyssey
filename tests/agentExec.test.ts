@@ -123,6 +123,9 @@ describe("agent tool loop (executor wired into the swarm)", () => {
         log.push(cmd);
         return { ok: true, exitCode: 0, output: `OUT(${cmd})` };
       },
+      async artifacts() {
+        return { location: "fake", files: ["a.py"] };
+      },
       async dispose() {
         log.push("__disposed__");
       },

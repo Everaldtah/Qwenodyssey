@@ -12,6 +12,8 @@
  *
  * Roster is FRONTIER-FIRST: cloud models when keys exist, else local, else primary.
  */
+import * as fs from "fs";
+import * as path from "path";
 import chalk from "chalk";
 import { createSession, GlobalOpts } from "../session";
 import { Swarm, frontierWorkers, synthesize, type SwarmWorker } from "../../core/swarm";
@@ -109,67 +111,97 @@ export async function swarmCommand(task: string | undefined, opts: SwarmOpts): P
 
   const useTui = opts.live !== false && s.config.swarm.live && SwarmTui.supported();
   const started = Date.now();
-
-  // Ctrl-C aborts in-flight model calls and restores the screen cleanly instead of
-  // leaving the terminal stuck in the alternate-screen / hidden-cursor state.
   const ac = new AbortController();
   let aborted = false;
+  const runOpts = {
+    synthesize: opts.synth !== false,
+    subtasks: presupplied,
+    signal: ac.signal,
+    execMode,
+    bareOpts,
+  };
 
-  let run: SwarmRun;
+  let run: SwarmRun | undefined;
   if (useTui) {
+    // Ctrl-C/q are handled by the TUI (raw mode) → onAbort; the panes stay up at the
+    // end in review mode (scrollable) until the user presses q.
     const tui = new SwarmTui(swarm.events, {
       task: taskText,
       panes: roster.length,
       note,
       roster: roster.map((r) => ({ label: r.label, model: r.model, backend: r.backend })),
       cwd: process.cwd(),
+      onAbort: () => {
+        aborted = true;
+        ac.abort();
+      },
     });
-    const onSigint = () => {
-      aborted = true;
-      ac.abort();
-      tui.stop();
-    };
-    process.once("SIGINT", onSigint);
     tui.start();
     try {
-      run = await swarm.run(taskText, {
-        synthesize: opts.synth !== false,
-        subtasks: presupplied,
-        signal: ac.signal,
-        execMode,
-        bareOpts,
-      });
+      run = await swarm.run(taskText, runOpts);
     } finally {
+      if (run) tui.complete(run);
+      await tui.waitForExit(); // hold the split-screen review until the user quits
       tui.stop();
-      process.removeListener("SIGINT", onSigint);
     }
-  } else {
-    const onSigint = () => {
-      aborted = true;
-      ac.abort();
-    };
-    process.once("SIGINT", onSigint);
-    attachPlainLogger(swarm.events);
-    try {
-      run = await swarm.run(taskText, {
-        synthesize: opts.synth !== false,
-        subtasks: presupplied,
-        signal: ac.signal,
-        execMode,
-        bareOpts,
-      });
-    } finally {
-      process.removeListener("SIGINT", onSigint);
+    // No raw dump to the terminal — persist the result to a file instead.
+    const file = run ? saveResult(run, taskText) : undefined;
+    if (aborted) console.log(chalk.yellow("(swarm aborted)"));
+    else if (run) {
+      const ok = run.results.filter((r) => r.ok).length;
+      console.log(
+        chalk.green("✓ swarm complete") +
+          chalk.gray(
+            ` · ${ok}/${run.results.length} subtasks · ${((Date.now() - started) / 1000).toFixed(0)}s` +
+              (run.artifacts?.files.length ? ` · ${run.artifacts.files.length} files` : "")
+          )
+      );
+      if (file) console.log(chalk.gray("  full result + file list saved to ") + chalk.cyan(file));
     }
+    return;
   }
 
+  // Plain / non-TTY path: line logger + durable text summary.
+  const onSigint = () => {
+    aborted = true;
+    ac.abort();
+  };
+  process.once("SIGINT", onSigint);
+  attachPlainLogger(swarm.events);
+  try {
+    run = await swarm.run(taskText, runOpts);
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+  }
   if (aborted) {
     console.log(chalk.yellow("\n(swarm aborted by Ctrl-C)"));
     process.exitCode = 130;
   }
-
-  // Durable summary (printed to normal scrollback after the TUI restores the screen).
   printSummary(run, Date.now() - started);
+}
+
+/** Persist the final result + per-agent details + generated-file list to a Markdown file. */
+function saveResult(run: SwarmRun, task: string): string | undefined {
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const file = path.join(process.cwd(), `swarm-result-${ts}.md`);
+    const parts: string[] = [`# Swarm result\n\n**Task:** ${task}\n`];
+    if (run.synthesis) parts.push(`\n## Integrated result\n\n${run.synthesis}\n`);
+    if (run.artifacts) {
+      parts.push(`\n## Files generated\n\nLocation: ${run.artifacts.location}\n`);
+      parts.push(run.artifacts.files.length ? run.artifacts.files.map((f) => `- ${f}`).join("\n") : "_(none detected)_");
+      parts.push("");
+    }
+    parts.push(`\n---\n\n## Per-agent results\n`);
+    for (const r of run.results as CoordinatedResult[]) {
+      const head = `### [${r.id}] ${r.title} — ${r.model} ${(r.ms / 1000).toFixed(1)}s${r.ok ? "" : " (FAILED)"}`;
+      parts.push(`\n${head}\n\n${r.ok ? r.text : "error: " + r.error}\n`);
+    }
+    fs.writeFileSync(file, parts.join("\n"), "utf8");
+    return file;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Plain line logger for --no-live / non-TTY: announce plan + each subtask result. */
@@ -280,16 +312,17 @@ async function demoSwarm(s: ReturnType<typeof createSession>, opts: SwarmOpts): 
       cwd: process.cwd(),
     });
     tui.start();
+    let drun: SwarmRun | undefined;
     try {
-      await swarm.run(task, { synthesize: true, subtasks });
+      drun = await swarm.run(task, { synthesize: true, subtasks });
     } finally {
+      if (drun) tui.complete(drun);
+      await tui.waitForExit();
       tui.stop();
     }
     console.log(
       chalk.green("✓ demo finished.") +
-        chalk.gray(
-          " You should have seen: 3 panes streaming in parallel (wave 1), then 'integrate' streaming in wave 2, then a synthesis line."
-        )
+        chalk.gray(" 4 agent panes + a results pane; Tab/↑↓ scroll, q to quit.")
     );
   } else {
     attachPlainLogger(swarm.events);
