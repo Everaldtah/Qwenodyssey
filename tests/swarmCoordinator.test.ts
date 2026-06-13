@@ -8,6 +8,7 @@ import {
   decomposeWith,
   parseSpecialToolCalls,
   cleanAgentText,
+  preflightWorkers,
   type Subtask,
 } from "../src/core/swarmCoordinator";
 import type { Provider, Message } from "../src/types";
@@ -65,11 +66,58 @@ describe("parsePlan", () => {
   });
 });
 
+describe("preflightWorkers", () => {
+  const mkWorker = (model: string, ok: boolean, detail?: string): SwarmWorker => ({
+    ref: model,
+    kind: "nvidia",
+    model,
+    label: model,
+    provider: {
+      name: "fake",
+      model,
+      async generate() {
+        return { text: "", model };
+      },
+      async stream() {
+        return { text: "", model };
+      },
+      countTokens: (t) => t.length,
+      async healthCheck() {
+        return { ok, detail };
+      },
+    },
+  });
+
+  it("reports each worker's key as functional or broken", async () => {
+    const workers = [mkWorker("good", true), mkWorker("bad", false, "HTTP 401")];
+    const results = await preflightWorkers(workers);
+    expect(results.find((r) => r.model === "good")!.ok).toBe(true);
+    const bad = results.find((r) => r.model === "bad")!;
+    expect(bad.ok).toBe(false);
+    expect(bad.detail).toBe("HTTP 401");
+  });
+
+  it("CoordinatedSwarm.preflight drops broken workers but keeps the good ones", async () => {
+    const cfg = defaultConfig();
+    const lead = mkWorker("good", true).provider;
+    const swarm = new CoordinatedSwarm(cfg, [mkWorker("good", true), mkWorker("bad", false)], lead);
+    await swarm.preflight();
+    expect(swarm.roster().map((r) => r.model)).toEqual(["good"]);
+  });
+});
+
 describe("Blackboard", () => {
   const subs: Subtask[] = [
     { id: "a", title: "A", detail: "da", dependsOn: [] },
     { id: "b", title: "B", detail: "db", dependsOn: ["a"] },
   ];
+
+  it("treats a STOPPED dependency as resolved so dependents still run", () => {
+    const board = new Blackboard(subs);
+    const a = board.get("a")!;
+    a.status = "stopped";
+    expect(board.ready().map((e) => e.id)).toEqual(["b"]);
+  });
 
   it("only releases a subtask once its dependencies are resolved", () => {
     const board = new Blackboard(subs);

@@ -312,6 +312,8 @@ const SwarmConfig = z.object({
   // Max run_shell tool steps per agent subtask, and per-command timeout.
   exec_max_steps: z.number().default(5),
   exec_timeout_s: z.number().default(120),
+  // Health-check each agent's API key/endpoint before the run (drops broken ones).
+  preflight: z.boolean().default(true),
 });
 
 /**

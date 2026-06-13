@@ -48,41 +48,62 @@ import { createProvider } from "../providers";
  * swarm agent has no tools and no edit loop, it just produces a deliverable. Using
  * the harness prompt makes models emit <tool> call syntax as text and behave like
  * they're in a file-editing session — so the swarm uses focused, tool-free prompts.
+ *
+ * The rigor below ADAPTS the orchestration doctrine from openclaw's AGENTS.md
+ * (github.com/openclaw/openclaw) — evidence-driven, exhaustive, best-fix work;
+ * complete production-grade output; verify-when-feasible; no memory-only guesses —
+ * to push small models toward more accurate, fleshed-out code. (Design ideas only;
+ * no source copied.)
  */
+
+/** Shared standards every swarm agent is held to (openclaw-AGENTS.md-inspired). */
+const SWARM_STANDARDS =
+  "Standards:\n" +
+  "- Deliver COMPLETE, production-grade work: full implementations with edge cases, error handling, input " +
+  "validation, and sensible defaults. NO stubs, NO TODOs, NO placeholders, NO '...'.\n" +
+  "- Be the BEST solution, not merely a plausible one: choose the approach a senior engineer would defend.\n" +
+  "- Ground every decision in the task and the shared context, not assumptions or memory. If a fact is " +
+  "genuinely unknown, state the assumption explicitly instead of guessing silently.\n" +
+  "- Code must be runnable as written: correct imports, types, names, and signatures consistent with teammates' work.\n" +
+  "- Prefer correctness and completeness over brevity; include what's needed to actually use it.";
+
 export const SWARM_PLANNER_SYSTEM =
-  "You are the LEAD PLANNER of a team of expert AI agents working in parallel. You break a task into a " +
-  "small set of concrete, separable subtasks that the team executes simultaneously and then integrate. " +
-  "You do NOT execute the task or write any solution content yourself — you ONLY produce the plan as " +
-  "strict JSON. You have no tools. Split along natural seams so subtasks can run in parallel, and use " +
-  "dependsOn only when one subtask genuinely needs another's RESULT first.";
+  "You are the LEAD PLANNER of a team of expert AI engineers working in parallel. Break the task into a " +
+  "small set of concrete, separable subtasks whose UNION fully covers the task with NO gaps, then they " +
+  "integrate. Each subtask must name a clear, verifiable deliverable. Split along natural seams so subtasks " +
+  "run in parallel; use dependsOn only when one genuinely needs another's RESULT first; include an " +
+  "integration (and, for buildable work, a verification/test) subtask. You do NOT solve the task — you ONLY " +
+  "produce the plan as strict JSON. You have no tools.";
 
 export const SWARM_AGENT_SYSTEM =
-  "You are an expert AI agent completing ONE part of a larger task as a member of a coordinated team. " +
-  "Produce the actual, finished deliverable for YOUR assigned subtask — write the real content (design, " +
-  "code, prose, analysis), not a plan to do it later. You have NO tools and cannot run commands, browse, " +
-  "or edit files: never emit tool-call syntax (no <tool> tags, no function calls) — output only the " +
-  "finished result. When teammates' results are provided as shared context, build directly on them and " +
-  "do not redo their work. Be concrete, correct, and self-contained.";
+  "You are an expert AI engineer completing ONE part of a larger task as a member of a coordinated team. " +
+  "Produce the actual, finished deliverable for YOUR assigned subtask — the real content (design, code, " +
+  "prose, analysis), not a plan to do it later. You have NO tools and cannot run commands, browse, or edit " +
+  "files: never emit tool-call syntax (no <tool> tags, no function calls) — output only the finished result. " +
+  "When teammates' results are provided as shared context, build directly on them and do not redo their work.\n\n" +
+  SWARM_STANDARDS;
 
 /** Variant used when an execution backend is attached to the run. */
 export function swarmAgentExecSystem(execLabel: string): string {
   return (
-    "You are an expert AI agent completing ONE part of a larger task as a member of a coordinated team. " +
-    "Produce the actual, finished deliverable for YOUR assigned subtask — real content, not a plan. " +
-    `You have exactly ONE tool: run_shell, which executes a shell command on ${execLabel}. Use it to ` +
-    "create files (e.g. heredocs/Set-Content), install dependencies, build, and VERIFY your work — then " +
-    "state the finished result as text. Workspace is SHARED with your teammates: files they created are " +
-    "already there; put yours alongside them and don't clobber theirs. Keep commands non-interactive and " +
-    "non-destructive. When teammates' results are provided as context, build on them; never redo their work. " +
-    "When you are done, answer with the final deliverable text (and the paths of any files you created)."
+    "You are an expert AI engineer completing ONE part of a larger task as a member of a coordinated team. " +
+    "Produce the actual, finished deliverable for YOUR assigned subtask — real content, not a plan.\n" +
+    `You have exactly ONE tool: run_shell, which executes a shell command on ${execLabel}. Use it to create ` +
+    "the real files, install dependencies, build, and — critically — ACTUALLY RUN and VERIFY your work " +
+    "(execute the program, run the tests) before claiming success. Only state 'done' after verification passes. " +
+    "Workspace is SHARED with teammates: their files are already present; place yours alongside and don't clobber " +
+    "theirs. Keep commands non-interactive and non-destructive. Build on teammates' context; never redo their work. " +
+    "When done, answer with the final deliverable text and the paths of the files you created/verified.\n\n" +
+    SWARM_STANDARDS
   );
 }
 
 export const SWARM_SYNTH_SYSTEM =
-  "You are the LEAD INTEGRATOR of a team of expert AI agents. You merge the team's completed subtask " +
-  "results into ONE coherent, correct, complete deliverable that fulfills the overall task. Reconcile " +
-  "overlaps and contradictions, keep each part's substance, and do not mention the team or the process. " +
-  "You have no tools; output only the final integrated result.";
+  "You are the LEAD INTEGRATOR of a team of expert AI engineers. Merge the team's completed subtask results " +
+  "into ONE coherent, correct, COMPLETE deliverable that fully fulfills the overall task. Reconcile overlaps " +
+  "and contradictions, close any gaps between parts, and keep each part's substance. The result must be " +
+  "production-grade with no stubs, TODOs, or placeholders. Do not mention the team or the process. You have " +
+  "no tools; output only the final integrated result.";
 
 /* ───────────────────────── Plan / blackboard types ───────────────────────── */
 
@@ -94,7 +115,7 @@ export interface Subtask {
   dependsOn: string[];
 }
 
-export type SubtaskStatus = "pending" | "running" | "done" | "failed";
+export type SubtaskStatus = "pending" | "running" | "done" | "failed" | "stopped";
 
 /** Live state of one subtask on the shared blackboard. */
 export interface BoardEntry extends Subtask {
@@ -151,9 +172,21 @@ export interface StatusEvent {
   ms?: number;
   error?: string;
 }
+export interface PreflightResult {
+  pane: number;
+  label: string;
+  model: string;
+  backend: string;
+  ok: boolean;
+  detail?: string;
+  ms: number;
+}
 
 /**
  * Typed EventEmitter facade. Events:
+ *  - "preflightStart" { count }      — about to health-check the roster's keys
+ *  - "preflight"  PreflightResult    — one worker's key/endpoint checked (ok/broken)
+ *  - "preflightDone" { ok, broken }  — health-check finished
  *  - "planner"    { model }     — a decompose attempt started on this model
  *  - "plan"       PlanEvent     — decomposition finished, roster known
  *  - "wave"       WaveEvent     — a parallel batch is about to run
@@ -229,6 +262,38 @@ export function pickLead(config: Config, workers: SwarmWorker[]): Provider {
     if (w) return w.provider;
   }
   return workers[0]?.provider ?? createProvider(config);
+}
+
+/**
+ * Health-check every worker's provider in PARALLEL before the run, so a broken or
+ * expired API key / dead endpoint is caught up front instead of failing a subtask
+ * mid-flight. Each provider's healthCheck() hits its /models (or equivalent) WITH
+ * the configured key, so a 401/403 or network error surfaces here.
+ */
+export async function preflightWorkers(
+  workers: SwarmWorker[],
+  onResult?: (r: PreflightResult) => void,
+  timeoutMs = 15000
+): Promise<PreflightResult[]> {
+  return Promise.all(
+    workers.map(async (w, pane): Promise<PreflightResult> => {
+      const start = Date.now();
+      const base = { pane, label: w.label, model: w.model, backend: w.kind };
+      try {
+        const timeout = new Promise<{ ok: boolean; detail?: string }>((_, rej) =>
+          setTimeout(() => rej(new Error(`health check timed out after ${timeoutMs}ms`)), timeoutMs)
+        );
+        const h = await Promise.race([w.provider.healthCheck(), timeout]);
+        const r: PreflightResult = { ...base, ok: h.ok, detail: h.detail, ms: Date.now() - start };
+        onResult?.(r);
+        return r;
+      } catch (err) {
+        const r: PreflightResult = { ...base, ok: false, detail: (err as Error).message, ms: Date.now() - start };
+        onResult?.(r);
+        return r;
+      }
+    })
+  );
 }
 
 /* ──────────────────────────── Decomposition ──────────────────────────────── */
@@ -318,6 +383,8 @@ async function decomposeOnce(
     `TASK:\n${task}\n\n` +
     `Rules:\n` +
     `- Split into the natural, separable parts of the task (e.g. distinct components, layers, files, or questions). If the task names several parts, make each its own subtask.\n` +
+    `- The subtasks' UNION must FULLY cover the task with no gaps. Include an integration subtask, and a verification/test subtask for buildable work.\n` +
+    `- Each subtask's "detail" names a CONCRETE, VERIFIABLE deliverable (what file/output proves it's done).\n` +
     `- Return AT LEAST 2 subtasks unless the task is genuinely atomic and cannot be divided.\n` +
     `- Each subtask is concrete, self-contained, and independently executable by one agent.\n` +
     `- Use "dependsOn" to list the ids of subtasks whose RESULTS a subtask needs first (foundational work has no deps). This is how the team shares context.\n` +
@@ -458,14 +525,15 @@ export class Blackboard {
     return [...this.entries.values()];
   }
 
-  /** Subtasks whose deps are all resolved (done OR failed) and which are still pending. */
+  /** Subtasks whose deps are all resolved (done/failed/stopped) and which are still pending. */
   ready(): BoardEntry[] {
+    const resolved = (s?: SubtaskStatus) => s === "done" || s === "failed" || s === "stopped";
     return this.all().filter(
       (e) =>
         e.status === "pending" &&
         e.dependsOn.every((d) => {
           const dep = this.entries.get(d);
-          return !dep || dep.status === "done" || dep.status === "failed";
+          return !dep || resolved(dep.status);
         })
     );
   }
@@ -492,11 +560,11 @@ export class Blackboard {
         parts.push(`\n### [${d.id}] ${d.title}\n${truncate(d.result, perDepChars)}`);
       }
     }
-    const failedDeps = deps.filter((d) => d.status === "failed");
+    const failedDeps = deps.filter((d) => d.status === "failed" || d.status === "stopped");
     if (failedDeps.length) {
       parts.push(
-        "\nNOTE — these dependencies FAILED, so their output is missing; compensate as best you can:\n" +
-          failedDeps.map((d) => `- [${d.id}] ${d.title}`).join("\n")
+        "\nNOTE — these dependencies did not finish, so their output is missing; compensate as best you can:\n" +
+          failedDeps.map((d) => `- [${d.id}] ${d.title} (${d.status})`).join("\n")
       );
     }
 
@@ -535,6 +603,8 @@ export interface CoordinateOptions {
   bareOpts?: BareExecutorOptions;
   /** Injectable executor (tests). Overrides execMode routing. */
   executor?: AgentExecutor;
+  /** Health-check the roster's API keys before running (default honors config). */
+  preflight?: boolean;
 }
 
 export class CoordinatedSwarm {
@@ -542,6 +612,8 @@ export class CoordinatedSwarm {
   private workers: SwarmWorker[];
   private lead: Provider;
   private maxTokens: number;
+  /** Per-pane abort controllers so a single agent can be stopped (Esc) mid-run. */
+  private paneControllers = new Map<number, AbortController>();
 
   constructor(
     private config: Config,
@@ -562,9 +634,52 @@ export class CoordinatedSwarm {
     return this.workers.map((w) => ({ label: w.label, model: w.model, backend: w.kind }));
   }
 
-  /** Run the full coordinated flow: plan → waves (with shared context) → synthesize. */
+  /** Stop a single agent's in-flight work (its stream aborts → subtask "stopped"). */
+  stopPane(pane: number): void {
+    this.paneControllers.get(pane)?.abort();
+  }
+
+  /**
+   * Health-check the roster's keys; emits preflight events and DROPS broken workers
+   * (keeping at least one if all fail, so the run can still surface the error).
+   * Returns the results. Safe to call before run().
+   */
+  async preflight(signal?: AbortSignal): Promise<PreflightResult[]> {
+    this.events.emit("preflightStart", { count: this.workers.length });
+    const results = await preflightWorkers(this.workers, (r) => this.events.emit("preflight", r));
+    const okIdx = new Set(results.filter((r) => r.ok).map((r) => r.pane));
+    if (okIdx.size > 0 && okIdx.size < this.workers.length) {
+      this.workers = this.workers.filter((_, i) => okIdx.has(i));
+    }
+    this.events.emit("preflightDone", {
+      ok: results.filter((r) => r.ok).length,
+      broken: results.filter((r) => !r.ok).length,
+    });
+    return results;
+  }
+
+  /** Run the full coordinated flow: preflight → plan → waves → synthesize. */
   async run(task: string, opts: CoordinateOptions = {}): Promise<SwarmRun> {
     const synth = opts.synthesize !== false;
+
+    // Validate each agent's API key/endpoint up front (drops broken workers).
+    const doPreflight = opts.preflight ?? this.config.swarm.preflight;
+    if (doPreflight) {
+      const pf = await this.preflight(opts.signal);
+      if (this.workers.length === 0 || pf.every((r) => !r.ok)) {
+        const detail = pf.map((r) => `${r.model}: ${r.detail ?? "unreachable"}`).join("; ");
+        const run: SwarmRun = { mode: "divide", results: [] };
+        this.events.emit("plan", {
+          task,
+          subtasks: [],
+          roster: this.roster(),
+          plannedBy: "(none)",
+          note: `all agents failed preflight — ${detail}`,
+        } as PlanEvent);
+        this.events.emit("done", run);
+        return run;
+      }
+    }
 
     // Planner candidates: roster order (primary first — fast models lead) with the
     // lead appended; a slow/timing-out lead then costs one attempt, not the plan.
@@ -712,6 +827,16 @@ export class CoordinatedSwarm {
       { role: "user", content: prompt },
     ];
 
+    // Per-pane abort controller so the user can stop THIS agent (Esc) without
+    // touching the others; it also trips when the whole run is aborted.
+    const ctrl = new AbortController();
+    const onGlobalAbort = () => ctrl.abort();
+    if (signal) {
+      if (signal.aborted) ctrl.abort();
+      else signal.addEventListener("abort", onGlobalAbort);
+    }
+    this.paneControllers.set(pane, ctrl);
+
     const start = Date.now();
     let text = "";
     const emitDelta = (delta: string) => {
@@ -719,7 +844,7 @@ export class CoordinatedSwarm {
       this.events.emit("delta", { pane, subtaskId: entry.id, delta } as DeltaEvent);
     };
     try {
-      const res = await this.agentLoop(worker, messages, emitDelta, signal, executor, pane, entry.id);
+      const res = await this.agentLoop(worker, messages, emitDelta, ctrl.signal, executor, pane, entry.id);
       const clean = cleanAgentText(res.text || text).trim();
       entry.status = "done";
       entry.result = clean;
@@ -747,8 +872,10 @@ export class CoordinatedSwarm {
       } as StatusEvent);
       this.events.emit("result", result);
     } catch (err) {
-      entry.status = "failed";
-      entry.error = (err as Error).message;
+      const msg = (err as Error).message;
+      const stopped = ctrl.signal.aborted || /__interrupted__/.test(msg);
+      entry.status = stopped ? "stopped" : "failed";
+      entry.error = stopped ? "stopped by user" : msg;
       entry.ms = Date.now() - start;
       const result: CoordinatedResult = {
         id: entry.id,
@@ -759,7 +886,7 @@ export class CoordinatedSwarm {
         backend: worker.kind,
         task: entry.detail,
         ok: false,
-        text: "",
+        text: stopped ? cleanAgentText(text).trim() : "",
         error: entry.error,
         ms: entry.ms,
       };
@@ -767,11 +894,14 @@ export class CoordinatedSwarm {
       this.events.emit("status", {
         pane,
         subtaskId: entry.id,
-        status: "failed",
+        status: entry.status,
         ms: entry.ms,
         error: entry.error,
       } as StatusEvent);
       this.events.emit("result", result);
+    } finally {
+      if (signal) signal.removeEventListener("abort", onGlobalAbort);
+      if (this.paneControllers.get(pane) === ctrl) this.paneControllers.delete(pane);
     }
   }
 
@@ -907,7 +1037,7 @@ export class CoordinatedSwarm {
 function unmet(board: Blackboard, e: BoardEntry): number {
   return e.dependsOn.filter((d) => {
     const dep = board.get(d);
-    return dep && dep.status !== "done" && dep.status !== "failed";
+    return dep && dep.status !== "done" && dep.status !== "failed" && dep.status !== "stopped";
   }).length;
 }
 
