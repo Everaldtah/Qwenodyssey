@@ -36,6 +36,16 @@ const BRACKET_OFF = "\x1b[?2004l";
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
+/**
+ * Number of EXTRA physical rows a line of `width` visible columns wraps onto in a
+ * terminal `cols` wide (0 if it fits on one row). Accounts for deferred-wrap: a
+ * line exactly `cols` wide stays on one row until one more char is written.
+ */
+export function wrapRows(width: number, cols: number): number {
+  if (width <= 0 || cols <= 0) return 0;
+  return Math.floor((width - 1) / cols);
+}
+
 /** Collapse a multi-line paste to a one-line chip: first line + "[+N lines]". */
 export function pasteChip(text: string): string {
   const nl = text.split("\n");
@@ -98,6 +108,11 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
       // what caused the runaway prompt-line flood on terminals without bracketed paste.
       let burstBuf = "";
       let burstTimer: ReturnType<typeof setTimeout> | null = null;
+      // Extra physical rows the input line wrapped onto in the LAST render. When
+      // the prompt + buffer is wider than the terminal it wraps over several rows;
+      // we must move the cursor back up to the first row before clearing, or the
+      // earlier wrapped rows survive and the prompt text stacks across the screen.
+      let prevRows = 0;
 
       stdin.setRawMode(true);
       stdin.resume();
@@ -113,8 +128,16 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
         const items = filter(buf);
         if (sel >= items.length) sel = Math.max(0, items.length - 1);
 
-        // Return to input-line column 0 and clear everything below.
-        let out = "\r\x1b[0J" + promptLabel + display(buf);
+        // Move up to the FIRST physical row the input occupied last time, then
+        // return to column 0 and clear everything below — this erases any rows the
+        // previous (possibly wrapped) input line spilled onto.
+        const cols = process.stdout.columns || 80;
+        let out = (prevRows > 0 ? `\x1b[${prevRows}A` : "") + "\r\x1b[0J" + promptLabel + display(buf);
+
+        // How many extra physical rows does the current input wrap onto?
+        const inputWidth = promptCols + visibleLen(display(buf));
+        const rows = wrapRows(inputWidth, cols);
+        prevRows = rows;
 
         if (items.length) {
           const pad = Math.max(...items.map((c) => label(c).length)) + 2;
@@ -137,7 +160,8 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
 
       const finish = (value: string) => {
         if (burstTimer) clearTimeout(burstTimer);
-        process.stdout.write("\r\x1b[0J" + promptLabel + display(buf) + "\n");
+        const up = prevRows > 0 ? `\x1b[${prevRows}A` : "";
+        process.stdout.write(up + "\r\x1b[0J" + promptLabel + display(buf) + "\n");
         process.stdout.write(BRACKET_OFF);
         stdin.setRawMode(false);
         stdin.removeListener("keypress", onKey);
