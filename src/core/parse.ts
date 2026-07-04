@@ -1,7 +1,10 @@
 /**
  * Tolerant JSON extraction for small-model output. 7B models often wrap JSON in
  * prose or ```json fences, or emit trailing commas — recover what we can.
+ * Falls back to core/repair.ts for the harder malformations (single quotes,
+ * unquoted keys, unterminated strings at the token limit).
  */
+import { repairJson } from "./repair";
 export function extractJson<T = any>(text: string): T | undefined {
   if (!text) return undefined;
 
@@ -20,6 +23,12 @@ export function extractJson<T = any>(text: string): T | undefined {
   for (const c of candidates) {
     const parsed = tryParse<T>(c);
     if (parsed !== undefined) return parsed;
+  }
+  // Escalate: deterministic repair of the harder malformations (single-quoted
+  // strings, bare keys, Python literals, unterminated trailing string).
+  for (const c of candidates) {
+    const r = repairJson<T>(c);
+    if (r.ok) return r.value;
   }
   return undefined;
 }
@@ -87,7 +96,13 @@ export function extractAllJson(text: string): any[] {
       i = start + 1;
       continue;
     }
-    const parsed = tryParse(span.text);
+    let parsed = tryParse(span.text);
+    if (parsed === undefined) {
+      // Near-valid span (single quotes, bare keys…) — try deterministic repair
+      // before giving up, so a malformed inline tool call still executes.
+      const r = repairJson(span.text);
+      if (r.ok) parsed = r.value;
+    }
     if (parsed !== undefined) out.push(parsed);
     i = span.end;
   }

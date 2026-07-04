@@ -533,3 +533,40 @@ export const CODE_NAV_TOOL_SPECS: ToolSpec[] = [
 export const CHAT_TOOL_NAMES = new Set(
   [...CHAT_TOOL_SPECS, ...CODE_NAV_TOOL_SPECS].map((t) => t.name)
 );
+
+/**
+ * Compact variants of tool specs for SMALL LOCAL MODELS. The full descriptions
+ * above are written for frontier models and run to whole paragraphs; with 35+
+ * tools they cost thousands of context tokens on EVERY request — a huge share
+ * of a 7B model's 8–16K window — and long specs measurably *hurt* small-model
+ * tool selection (they attend to the prose instead of the schema). This trims
+ * each description to its first 1–2 sentences (≤ maxChars) and drops parameter
+ * descriptions beyond a short cap, preserving names/types/required exactly so
+ * dispatch is unaffected. Usage guidance still reaches the model via the system
+ * prompt, which compaction never touches.
+ */
+export function compactToolSpecs(specs: ToolSpec[], maxChars = 180): ToolSpec[] {
+  const firstSentences = (text: string, cap: number): string => {
+    const t = (text || "").replace(/\s+/g, " ").trim();
+    if (t.length <= cap) return t;
+    // Cut at a sentence boundary inside the cap when one exists.
+    const slice = t.slice(0, cap);
+    const dot = slice.lastIndexOf(". ");
+    return (dot > 40 ? slice.slice(0, dot + 1) : slice.trimEnd() + "…");
+  };
+  return specs.map((s) => ({
+    ...s,
+    description: firstSentences(s.description, maxChars),
+    parameters: {
+      ...s.parameters,
+      properties: Object.fromEntries(
+        Object.entries((s.parameters?.properties ?? {}) as Record<string, any>).map(([k, v]) => [
+          k,
+          v && typeof v === "object" && typeof v.description === "string"
+            ? { ...v, description: firstSentences(v.description, 90) }
+            : v,
+        ])
+      ),
+    },
+  }));
+}

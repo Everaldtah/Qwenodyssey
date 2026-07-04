@@ -9,7 +9,7 @@ import { resolveInside } from "../../tools/fileTools";
 import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
-import { CHAT_TOOL_SPECS, CODE_NAV_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS, SWARM_TOOL_SPECS, GITHUB_TOOL_SPECS } from "../chatTools";
+import { CHAT_TOOL_SPECS, CODE_NAV_TOOL_SPECS, WEB_TOOL_SPECS, KNOWLEDGE_TOOL_SPECS, SWARM_TOOL_SPECS, GITHUB_TOOL_SPECS, compactToolSpecs } from "../chatTools";
 import { createSwarmTools } from "../../tools/swarmTools";
 import { createGithubTools } from "../../tools/githubTools";
 import { frontierWorkers } from "../../core/swarm";
@@ -33,7 +33,8 @@ import { SessionStore, deriveTitle, ChatSessionMeta } from "../../core/sessionSt
 import { compactHistory, historyTokens, shouldCompact } from "../../core/compactor";
 import { extractAllJson } from "../../core/parse";
 import { createPlanTool, renderPlan, PlanState } from "../../tools/planTool";
-import { prepareToolCall } from "../../tools/toolCallPrep";
+import { createThinkTool, THINK_TOOL_SPEC } from "../../tools/thinkTool";
+import { prepareToolCall, resolveToolName } from "../../tools/toolCallPrep";
 import { ShellSession } from "../../core/shellSession";
 import { createShellSessionTools, SHELL_SESSION_TOOL_SPECS } from "../../tools/shellSessionTools";
 import { createMcpTools } from "../../tools/mcpTools";
@@ -206,6 +207,18 @@ PLANNING — for any task that needs several steps or multiple tool calls, FIRST
 update_plan tool with the ordered list of steps, then UPDATE it (mark steps in_progress /
 done) as you go. This keeps you on track and lets the user see progress. Skip it for
 trivial one-step questions.`;
+
+/**
+ * Appended ONLY when agent.thinking_mode is on (the `think` tool exists then).
+ * Thinking turns are budgeted separately from tool steps in runAssistantTurn,
+ * so telling the model to think "generously" is safe.
+ */
+const THINK_SYSTEM = `
+THINKING — when a step is tricky (a surprising tool result, a choice between approaches,
+an error you must diagnose), call the think tool with your reasoning BEFORE acting. It
+runs nothing and costs you no tool steps — it's a private scratchpad that keeps your next
+action deliberate. Don't think about trivial steps, and never end on a thought: after
+thinking, make the real tool call or give your final answer.`;
 
 /** Teaches the model to use its long-term memory + the internet. */
 const MEMORY_SYSTEM = `
@@ -412,6 +425,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   // Base system prompt now; the PROJECT summary is appended once the repo scan
   // finishes in the background (so a slow scan doesn't delay the prompt).
   let sys = loadPrompt("system") + "\n" + CONVERSATION_GUARD + "\n" + TOOL_SYSTEM + "\n" + DEEP_THINK + "\n" + PLAN_SYSTEM;
+  if (s.config.agent.thinking_mode) sys += "\n" + THINK_SYSTEM;
   if (memoryEnabled || s.config.web.enabled) sys += "\n" + MEMORY_SYSTEM;
   if (s.config.tools.shell_session && s.config.tools.allow_shell) sys += "\n" + SHELL_SESSION_SYSTEM;
   if (swarmReady) sys += "\n" + SWARM_SYSTEM;
@@ -576,6 +590,14 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   const planState: PlanState = { items: [] };
   chatTools.register(createPlanTool(planState));
 
+  // Thinking mode: give the model a `think` scratchpad tool. Think calls spend
+  // the separate thinking budget (agent.max_thinking_turns), not tool steps —
+  // see runAssistantTurn.
+  if (s.config.agent.thinking_mode) {
+    chatTools.register(createThinkTool());
+    toolSpecs.push(THINK_TOOL_SPEC);
+  }
+
   // Persisted sessions: save after each turn so a conversation can be resumed
   // later with `--continue` / `--resume` / `/resume`.
   const store = new SessionStore();
@@ -726,7 +748,15 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     history.push({ role: "user", content: userContent });
 
     try {
-      const turnSpecs = smalltalk ? [] : toolSpecs;
+      // Small local models get COMPACT tool specs: full frontier-grade
+      // descriptions across 35+ tools cost thousands of tokens per request and
+      // demonstrably hurt 7B-class tool selection. Names/types/required are
+      // preserved, so dispatch (and prepareToolCall hardening) is unaffected.
+      const compactSpecs =
+        s.config.agent.small_model_mode && !isCloudProvider(s.provider.name)
+          ? compactToolSpecs(toolSpecs)
+          : toolSpecs;
+      const turnSpecs = smalltalk ? [] : compactSpecs;
       const signals = await runAssistantTurn(s, chatTools, turnSpecs, history, meter, ask);
       // Evolution: reflect on rough turns and bank a lesson for next time.
       if (evolution) {
@@ -948,6 +978,14 @@ async function runAssistantTurn(
   const stepBudget = Math.max(1, s.config.agent.max_tool_steps);
   const hardCap = stepBudget * 3;
   let productiveSteps = 0;
+  // Thinking mode: `think` calls spend this separate budget instead of tool
+  // steps, so deliberation never starves real work. Once exhausted, further
+  // think calls DO count as tool steps (and the model is told to act), and the
+  // hard iteration cap still bounds everything.
+  const knownNames = toolSpecs.map((t) => t.name);
+  const thinkingBudget = s.config.agent.thinking_mode ? Math.max(0, s.config.agent.max_thinking_turns) : 0;
+  let thinkingTurns = 0;
+  let thinkingNudged = false;
   try {
   for (let step = 0; productiveSteps < stepBudget && step < hardCap; step++) {
     // Inject any asides the user typed (/btw) since the last step.
@@ -1012,6 +1050,26 @@ async function runAssistantTurn(
         tool_calls: calls,
       });
       await runCalls(calls);
+      // A step that ONLY thought spends a thinking turn, not a tool step
+      // (resolve names first so an aliased "reflect"/"thought" call counts too).
+      const allThink =
+        calls.length > 0 &&
+        calls.every((c) => (resolveToolName(c.name, knownNames).name ?? c.name) === "think");
+      if (allThink) {
+        if (thinkingTurns < thinkingBudget) {
+          thinkingTurns++;
+          continue;
+        }
+        if (!thinkingNudged) {
+          thinkingNudged = true;
+          history.push({
+            role: "user",
+            content:
+              "[system] You've used all your thinking turns. Stop calling `think` — act now: " +
+              "make the tool call your plan needs, or give your final answer.",
+          });
+        }
+      }
       productiveSteps++;
       continue;
     }
@@ -1852,16 +1910,25 @@ function extractShellCommands(text: string): string[] {
  */
 function extractTextToolCalls(text: string, toolSpecs: ToolSpec[], step: number): ToolCall[] {
   if (!text) return [];
-  const known = new Set(toolSpecs.map((t) => t.name));
+  const knownNames = toolSpecs.map((t) => t.name);
+  const known = new Set(knownNames);
   const calls: ToolCall[] = [];
   const seen = new Set<string>();
 
   const consider = (raw: any) => {
     if (!raw || typeof raw !== "object") return;
-    const o = raw.tool_call ?? raw.function ?? raw;
-    const name = typeof o?.name === "string" ? o.name : undefined;
-    if (!name || !known.has(name)) return;
-    let args: any = o.arguments ?? o.parameters ?? o.args ?? {};
+    const o = raw.tool_call ?? raw.function ?? raw.tool ?? raw;
+    let name = typeof o?.name === "string" ? o.name : typeof o?.tool_name === "string" ? o.tool_name : undefined;
+    if (!name) return;
+    if (!known.has(name)) {
+      // A text-emitted call with a hallucinated name ("bash", "read", "cat")
+      // used to be dropped here — the raw JSON then printed as the "answer".
+      // Route it through the same alias/fuzzy resolver dispatched calls get.
+      const resolved = resolveToolName(name, knownNames);
+      if (!resolved.name) return; // genuinely unknown → leave as prose
+      name = resolved.name;
+    }
+    let args: any = o.arguments ?? o.parameters ?? o.args ?? o.input ?? {};
     if (typeof args === "string") {
       try {
         args = JSON.parse(args);
@@ -1881,6 +1948,31 @@ function extractTextToolCalls(text: string, toolSpecs: ToolSpec[], step: number)
     else consider(value);
   }
   return calls;
+}
+
+/**
+ * Char budget for ONE tool result fed back into history, scaled to the model's
+ * context window (~4 chars/token; tool output may take ~12% of the window per
+ * call). The old fixed 8000-char cap flooded a 4–8K-context model in two or
+ * three shell calls, evicting the system prompt's tool rules — a major driver
+ * of mid-conversation hallucination. Clamped to [2000, 8000].
+ */
+function toolResultBudget(s: Session): number {
+  const ctx = s.config.model.context_tokens || 16384;
+  return Math.max(2000, Math.min(8000, Math.floor(ctx * 4 * 0.12)));
+}
+
+/**
+ * Middle-out truncation: keep the head AND the tail. Tool output carries its
+ * verdict at the end (exit status, test summary, the actual error) — tail-only
+ * truncation used to cut exactly the part the model needed next.
+ */
+function truncateMiddle(out: string, budget: number): string {
+  if (out.length <= budget) return out;
+  const head = Math.floor(budget * 0.6);
+  const tail = budget - head;
+  const omitted = out.length - head - tail;
+  return out.slice(0, head) + `\n…[${omitted} chars omitted — middle of output]…\n` + out.slice(-tail);
 }
 
 /** Run a single tool call against the registry, with a confirm gate for shell. */
@@ -1927,8 +2019,11 @@ async function executeToolCall(
   if (shown.trim()) {
     console.log(chalk.gray(indent(shown)) + "\n");
   }
+  // Feed back head+tail within a context-scaled budget: small models keep the
+  // error/exit summary (usually at the END of output) without flooding their
+  // context window and evicting the system prompt.
   return {
-    content: out.slice(0, 8000) || (result.ok ? "(ok, no output)" : "(failed, no output)"),
+    content: truncateMiddle(out, toolResultBudget(s)) || (result.ok ? "(ok, no output)" : "(failed, no output)"),
     ok: result.ok,
   };
 }

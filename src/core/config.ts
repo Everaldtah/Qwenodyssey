@@ -69,6 +69,17 @@ const AgentConfig = z.object({
   // separate hard cap (3× this) so the model can't loop forever. Raised from the
   // old fixed 8 because research / multi-file shell work needs more headroom.
   max_tool_steps: z.number().default(16),
+  // Adaptive turn budget / "thinking" mode: allow the model to request extra
+  // reasoning turns before committing to a tool call or final answer. When
+  // enabled, the model can call the `think` tool to spend a "thinking turn"
+  // (separate from tool steps) to deliberate. Each thinking turn consumes 1
+  // from the thinking budget but does NOT count toward max_tool_steps.
+  // The total thinking budget per user turn is max_tool_steps (so a turn with
+  // 16 tool steps could have up to 16 thinking turns interleaved).
+  thinking_mode: z.boolean().default(true),
+  // Maximum thinking turns per user turn (independent of tool steps).
+  // Defaults to max_tool_steps so thinking capacity scales with complexity.
+  max_thinking_turns: z.number().default(16),
 });
 
 const ToolsConfig = z.object({
