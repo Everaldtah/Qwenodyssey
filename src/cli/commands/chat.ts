@@ -39,27 +39,14 @@ import { ShellSession } from "../../core/shellSession";
 import { createShellSessionTools, SHELL_SESSION_TOOL_SPECS } from "../../tools/shellSessionTools";
 import { createMcpTools } from "../../tools/mcpTools";
 import type { McpServerSpec } from "../../tools/mcpClient";
+import { MODEL_DEFAULTS } from "../../core/config";
+import { modelProfile, resolveThinking, samplingFor } from "../../core/modelProfile";
+import type { ModelProfile } from "../../core/modelProfile";
 import type { GenerateResult, Message, ModelInfo, ModelOptions, ToolCall, ToolContext, ToolSpec } from "../../types";
 import type { Session } from "../session";
 
 /** Tool turns run deterministically; temp 0 markedly improves tool adherence. */
 const TOOL_TEMP = 0;
-
-/** Reasoning models (R1/QwQ) need a little heat or they loop; ~0.6 is recommended. */
-const REASONING_TEMP = 0.6;
-
-/**
- * Models trained to deliberate with an internal chain-of-thought. These MUST run
- * with a little heat — at temperature 0 they collapse into repetition loops
- * ("the user wants to know... the user wants to know..."). Kimi K2/K2.6 are
- * thinking models and belong here.
- */
-function isReasoningModel(model: string): boolean {
-  return (
-    /(^|[-_/:.])(r1|qwq|o1|o3|thinking|reason|kimi|k2|nemotron)/i.test(model) ||
-    /deepseek-r1/i.test(model)
-  );
-}
 
 /** Cloud backends, where a hard 0 temperature risks repetition loops. */
 function isCloudProvider(name: string): boolean {
@@ -67,15 +54,33 @@ function isCloudProvider(name: string): boolean {
 }
 
 /**
- * Effective temperature for a turn:
- *  - reasoning/thinking models get heat (REASONING_TEMP) — they loop at 0;
- *  - local non-reasoning models run deterministic (TOOL_TEMP=0) for tool adherence;
- *  - cloud non-reasoning models get a small floor as anti-degeneration insurance,
- *    so a model the classifier doesn't recognize can't silently loop at 0.
+ * What the ACTIVE model is and whether it deliberates this turn. The family
+ * profile (core/modelProfile) knows which models have a chain-of-thought and
+ * which ones can have it switched off; `model.think` is the user's policy over
+ * the top of it. Recomputed per turn because the model can change mid-session
+ * (fallback chain / model picker).
  */
-function turnTemperature(s: Session, reasoning: boolean): number {
-  if (reasoning) return REASONING_TEMP;
-  return isCloudProvider(s.provider.name) ? Math.max(TOOL_TEMP, 0.2) : TOOL_TEMP;
+function turnProfile(s: Session): { profile: ModelProfile; thinking: boolean | undefined } {
+  const profile = modelProfile(s.provider.model);
+  return { profile, thinking: resolveThinking(profile, s.config.model.think) };
+}
+
+/**
+ * Effective temperature for a turn. Tool turns want determinism, so we start at
+ * TOOL_TEMP=0 and raise it only to the floors that matter:
+ *  - the model family's own floor (Qwen3/3.5 and R1/QwQ degenerate into
+ *    repetition loops at 0 — thinking mode needs ~0.6, non-thinking ~0.3;
+ *    qwen2.5-coder and friends are stable greedy, so their floor is 0);
+ *  - a small cloud floor as anti-degeneration insurance, so a hosted model the
+ *    profiler doesn't recognize can't silently loop at 0.
+ */
+function turnTemperature(
+  s: Session,
+  profile: ModelProfile,
+  thinking: boolean | undefined
+): number {
+  const cloudFloor = isCloudProvider(s.provider.name) ? 0.2 : 0;
+  return Math.max(TOOL_TEMP, samplingFor(profile, thinking).minTurnTemp, cloudFloor);
 }
 
 /**
@@ -854,7 +859,9 @@ async function runAssistantTurn(
   let nudged = false;
   let emptyNudges = 0;
   let toolAnswerNudges = 0;
-  const reasoning = isReasoningModel(s.provider.model);
+  // `thinkOn` = should the model deliberate this turn (undefined = it has no
+  // thinking mode). Named apart from the per-step `thinking` TEXT below.
+  const { profile, thinking: thinkOn } = turnProfile(s);
   const failures: string[] = [];
   const seenCalls = new Set<string>();
 
@@ -1003,9 +1010,9 @@ async function runAssistantTurn(
     aborter = new AbortController();
     try {
       res = await streamWithFallback(s, history, {
-        temperature: turnTemperature(s, reasoning),
+        temperature: turnTemperature(s, profile, thinkOn),
         tools: toolSpecs.length ? toolSpecs : undefined,
-        think: reasoning,
+        think: thinkOn,
         signal: aborter.signal,
       }, spinner);
     } catch (err) {
@@ -1710,10 +1717,26 @@ function renderCommandMenu(): string {
   ].join("\n");
 }
 
+/**
+ * How one optional sampling knob is actually resolved: an explicit config value,
+ * the model profile's recommendation, or off (left to the backend's default).
+ */
+function samplingKnob(
+  configured: number,
+  fallbackDefault: number,
+  fromProfile: number | undefined,
+  autoTune: boolean
+): string {
+  if (configured !== fallbackDefault) return String(configured);
+  if (autoTune && fromProfile) return `${fromProfile} (auto)`;
+  return "off";
+}
+
 /** Render the current model + runtime settings as an aligned table. */
 function renderSettings(s: Session, kb: KnowledgeBase, memoryEnabled: boolean): string {
   const m = s.config.model;
-  const reasoning = isReasoningModel(s.provider.model);
+  const { profile, thinking } = turnProfile(s);
+  const sampling = samplingFor(profile, thinking);
   const embed =
     kb.embeddingsActive() === true
       ? `semantic (${s.config.knowledge.embed_model})`
@@ -1729,10 +1752,40 @@ function renderSettings(s: Session, kb: KnowledgeBase, memoryEnabled: boolean): 
   const rows: [string, string][] = [
     ["model", `${s.provider.model}  (${s.provider.name} @ ${m.base_url})`],
     ["fallback chain", fbDisplay],
-    ["thinking", reasoning ? "deep · native reasoning model" : "step-by-step scaffold"],
-    ["temperature", `${turnTemperature(s, reasoning)} active · ${m.temperature} base`],
+    [
+      "model profile",
+      m.auto_tune ? `${profile.family} · auto-tuned` : `${profile.family} · auto-tune off`,
+    ],
+    [
+      "thinking",
+      !profile.reasoning
+        ? "step-by-step scaffold"
+        : thinking
+        ? `deep · native reasoning (${m.think})`
+        : `off for speed · scaffold only (${m.think}${profile.hybridThinking ? ", hybrid" : ""})`,
+    ],
+    [
+      "temperature",
+      `${turnTemperature(s, profile, thinking)} active · ${m.temperature} base` +
+        (m.auto_tune ? ` · profile ${sampling.temperature}` : ""),
+    ],
+    [
+      "sampling",
+      [
+        `top_p ${m.auto_tune && m.top_p === MODEL_DEFAULTS.top_p ? sampling.topP : m.top_p}`,
+        `top_k ${samplingKnob(m.top_k, MODEL_DEFAULTS.top_k, sampling.topK, m.auto_tune)}`,
+        `repeat ${samplingKnob(m.repeat_penalty, MODEL_DEFAULTS.repeat_penalty, sampling.repeatPenalty, m.auto_tune)}`,
+        `presence ${samplingKnob(m.presence_penalty, MODEL_DEFAULTS.presence_penalty, sampling.presencePenalty, m.auto_tune)}`,
+      ].join(" · "),
+    ],
     ["max output tokens", String(m.max_tokens)],
-    ["context budget", String(m.context_tokens)],
+    [
+      "context budget",
+      String(m.context_tokens) +
+        (m.context_tokens < profile.contextSuggestion
+          ? chalk.gray(`  (${profile.family} can use ${profile.contextSuggestion})`)
+          : ""),
+    ],
     ["gpu", gpuPolicy(s)],
     ["agent mode", s.mode],
     ["shell tools", s.config.tools.allow_shell ? "enabled" : "disabled"],

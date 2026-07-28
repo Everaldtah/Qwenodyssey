@@ -11,6 +11,7 @@ import type {
   Provider,
   ToolCall,
 } from "../types";
+import { modelProfile, resolveThinking, type ThinkMode } from "../core/modelProfile";
 
 export interface ProviderConfig {
   model: string;
@@ -18,6 +19,12 @@ export interface ProviderConfig {
   apiKey?: string;
   temperature: number;
   topP: number;
+  /** Optional small-model decoding knobs; omitted from the wire when unset/0. */
+  topK?: number;
+  repeatPenalty?: number;
+  presencePenalty?: number;
+  /** Chain-of-thought policy for thinking-capable models (config model.think). */
+  think?: ThinkMode;
   maxTokens: number;
   contextTokens?: number;
   gpuLayers?: number;
@@ -103,13 +110,64 @@ export abstract class OpenAICompatibleProvider implements Provider {
     });
   }
 
+  /**
+   * Whether the model should expose a chain-of-thought this turn. An explicit
+   * per-request option wins; otherwise the configured policy (model.think) is
+   * resolved against the model's family. `undefined` means the model has no
+   * thinking mode at all, so the flag stays off the wire entirely.
+   */
+  protected thinkingEnabled(options: ModelOptions): boolean | undefined {
+    if (typeof options.think === "boolean") return options.think;
+    return resolveThinking(modelProfile(this.cfg.model), this.cfg.think ?? "auto");
+  }
+
+  /**
+   * Decoding knobs that are only sent when actually set (0/undefined = leave the
+   * choice to the server). These are the levers that keep SMALL models from
+   * looping; big hosted models normally leave them unset.
+   */
+  protected samplingExtras(options: ModelOptions): Record<string, number> {
+    const out: Record<string, number> = {};
+    const topK = options.top_k ?? this.cfg.topK;
+    const presence = options.presence_penalty ?? this.cfg.presencePenalty;
+    const repeat = options.repeat_penalty ?? this.cfg.repeatPenalty;
+    if (topK && topK > 0) out.top_k = topK;
+    if (presence && presence > 0) out.presence_penalty = presence;
+    if (repeat && repeat > 0) out.repetition_penalty = repeat;
+    return out;
+  }
+
+  /**
+   * Qwen3/3.5's documented SOFT switch for turning thinking off on backends with
+   * no native toggle (LM Studio, vLLM, llama.cpp): a trailing `/no_think` on the
+   * last user message. Ollama overrides body() and uses its native `think` flag
+   * instead, so this only affects OpenAI-compatible servers.
+   */
+  protected applyThinkSoftSwitch(
+    wire: Record<string, unknown>[],
+    options: ModelOptions
+  ): Record<string, unknown>[] {
+    const profile = modelProfile(this.cfg.model);
+    if (!profile.hybridThinking) return wire;
+    if (this.thinkingEnabled(options) !== false) return wire;
+    for (let i = wire.length - 1; i >= 0; i--) {
+      const content = wire[i].content;
+      if (wire[i].role !== "user" || typeof content !== "string") continue;
+      if (/\/no_think\s*$/.test(content)) break;
+      wire[i] = { ...wire[i], content: `${content} /no_think` };
+      break;
+    }
+    return wire;
+  }
+
   protected body(messages: Message[], options: ModelOptions, stream: boolean) {
     const body: Record<string, unknown> = {
       model: this.cfg.model,
-      messages: this.wireMessages(messages),
+      messages: this.applyThinkSoftSwitch(this.wireMessages(messages), options),
       temperature: options.temperature ?? this.cfg.temperature,
       top_p: options.top_p ?? this.cfg.topP,
       max_tokens: options.max_tokens ?? this.cfg.maxTokens,
+      ...this.samplingExtras(options),
       stream,
     };
     if (options.stop) body.stop = options.stop;

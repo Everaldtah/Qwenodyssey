@@ -1,4 +1,5 @@
-import type { Config } from "../core/config";
+import { MODEL_DEFAULTS, type Config } from "../core/config";
+import { samplingForModel } from "../core/modelProfile";
 import type { Provider } from "../types";
 import type { ProviderConfig } from "./base";
 import { OllamaProvider } from "./ollama";
@@ -101,12 +102,49 @@ export function anthropicAuthAvailable(config: Config): boolean {
   return !!(authToken || apiKey);
 }
 
+/**
+ * Model-aware tuning for LOCAL backends: take the decoding parameters the model
+ * family's authors recommend (see core/modelProfile) and apply them wherever the
+ * user left [model] at its defaults. An explicitly configured value always wins,
+ * and `model.auto_tune = false` disables the whole mechanism.
+ *
+ * This is what makes a 9B-class local model behave: Qwen3/3.5 gets its
+ * anti-repetition sampling instead of degenerate greedy decoding, qwen2.5-coder
+ * keeps the near-greedy settings that maximise tool adherence, and gemma gets
+ * top_k 64 — without the user tuning anything by hand.
+ */
+export function tuneForModel(config: Config, model: string, cfg: ProviderConfig): ProviderConfig {
+  const m = config.model;
+  const out: ProviderConfig = { ...cfg, think: m.think };
+  if (!m.auto_tune) {
+    return {
+      ...out,
+      topK: m.top_k,
+      repeatPenalty: m.repeat_penalty,
+      presencePenalty: m.presence_penalty,
+    };
+  }
+  const s = samplingForModel(model, m.think);
+  return {
+    ...out,
+    temperature: m.temperature === MODEL_DEFAULTS.temperature ? s.temperature : m.temperature,
+    topP: m.top_p === MODEL_DEFAULTS.top_p ? s.topP : m.top_p,
+    topK: m.top_k === MODEL_DEFAULTS.top_k ? s.topK ?? 0 : m.top_k,
+    repeatPenalty:
+      m.repeat_penalty === MODEL_DEFAULTS.repeat_penalty ? s.repeatPenalty ?? 0 : m.repeat_penalty,
+    presencePenalty:
+      m.presence_penalty === MODEL_DEFAULTS.presence_penalty
+        ? s.presencePenalty ?? 0
+        : m.presence_penalty,
+  };
+}
+
 export function createProvider(config: Config): Provider {
   const m = config.model;
   if (m.provider === "nvidia") return createNvidiaProvider(config, m.model);
   if (m.provider === "openrouter") return createOpenRouterProvider(config, m.model);
   if (m.provider === "anthropic") return createAnthropicProvider(config, m.model);
-  const cfg: ProviderConfig = {
+  const cfg: ProviderConfig = tuneForModel(config, m.model, {
     model: m.model,
     baseUrl: m.base_url || DEFAULT_BASE[m.provider] || "http://localhost:11434",
     apiKey: m.api_key || process.env.QWENODYSSEY_API_KEY || "",
@@ -117,7 +155,7 @@ export function createProvider(config: Config): Provider {
     gpuLayers: m.gpu_layers,
     lowVram: m.low_vram,
     keepAlive: m.keep_alive,
-  };
+  });
   switch (m.provider) {
     case "ollama":
       return new OllamaProvider(cfg);
@@ -141,18 +179,21 @@ export function createProvider(config: Config): Provider {
  */
 export function createOllamaProvider(config: Config, model: string): Provider {
   const m = config.model;
-  return new OllamaProvider({
-    model,
-    baseUrl: m.base_url && config.model.provider === "ollama" ? m.base_url : "http://localhost:11434",
-    apiKey: "",
-    temperature: m.temperature,
-    topP: m.top_p,
-    maxTokens: m.max_tokens,
-    contextTokens: m.context_tokens,
-    gpuLayers: m.gpu_layers,
-    lowVram: m.low_vram,
-    keepAlive: m.keep_alive,
-  });
+  return new OllamaProvider(
+    tuneForModel(config, model, {
+      model,
+      baseUrl:
+        m.base_url && config.model.provider === "ollama" ? m.base_url : "http://localhost:11434",
+      apiKey: "",
+      temperature: m.temperature,
+      topP: m.top_p,
+      maxTokens: m.max_tokens,
+      contextTokens: m.context_tokens,
+      gpuLayers: m.gpu_layers,
+      lowVram: m.low_vram,
+      keepAlive: m.keep_alive,
+    })
+  );
 }
 
 /**
@@ -227,15 +268,17 @@ export function createAnthropicProvider(config: Config, model: string): Provider
  */
 export function createLmStudioProvider(config: Config, model: string): Provider {
   const m = config.model;
-  return new LMStudioProvider({
-    model,
-    baseUrl: config.lmstudio.base_url || "http://localhost:1234",
-    apiKey: config.lmstudio.api_key || "",
-    temperature: m.temperature,
-    topP: m.top_p,
-    maxTokens: m.max_tokens,
-    contextTokens: m.context_tokens,
-  });
+  return new LMStudioProvider(
+    tuneForModel(config, model, {
+      model,
+      baseUrl: config.lmstudio.base_url || "http://localhost:1234",
+      apiKey: config.lmstudio.api_key || "",
+      temperature: m.temperature,
+      topP: m.top_p,
+      maxTokens: m.max_tokens,
+      contextTokens: m.context_tokens,
+    })
+  );
 }
 
 export { OpenAICompatibleProvider } from "./base";

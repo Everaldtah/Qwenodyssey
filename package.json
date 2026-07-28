@@ -1,7 +1,7 @@
 {
   "name": "qwenodyssey",
-  "version": "0.3.0",
-  "description": "An Odyssey-class coding harness for Qwen 2.5 7B.",
+  "version": "0.4.0",
+  "description": "An Odyssey-class coding harness for Qwen 3.5 9B and smaller local models.",
   "license": "MIT",
   "type": "commonjs",
   "bin": {

@@ -32,13 +32,23 @@ export interface ToolSpec {
 export interface ModelOptions {
   temperature?: number;
   top_p?: number;
+  /** Nucleus-companion cut-off (Ollama/vLLM/llama.cpp). Omitted when undefined. */
+  top_k?: number;
+  /** Penalize tokens already present — Qwen3's recommended anti-repetition lever. */
+  presence_penalty?: number;
+  /** Ollama `repeat_penalty`; the main anti-loop lever for small local models. */
+  repeat_penalty?: number;
   max_tokens?: number;
   stop?: string[];
   /** Hint that the response should be valid JSON. */
   json?: boolean;
   /** Tools the model may call this turn. */
   tools?: ToolSpec[];
-  /** Ask the model to expose its chain-of-thought (reasoning models via Ollama). */
+  /**
+   * Ask the model to expose its chain-of-thought (reasoning models via Ollama).
+   * `true` requests thinking, `false` explicitly DISABLES it on hybrid models
+   * (Qwen3/3.5), and `undefined` leaves the flag off the wire entirely.
+   */
   think?: boolean;
   /** Abort the request mid-flight (Esc interrupt). Stops streaming immediately. */
   signal?: AbortSignal;

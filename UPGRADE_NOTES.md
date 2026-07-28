@@ -111,3 +111,72 @@ parsing tool calls — before showing anything. Live raw-delta echo would dump
 unprocessed `<think>` blocks and pondered commands to the screen. The live
 feedback during generation is the ticking token meter. True live text streaming
 is a deeper turn-state-machine change if wanted later.
+
+---
+
+# Model-aware decoding pass (v0.4.0)
+
+The harness had **one** global temperature/top_p for every backend and a regex
+that decided "is this a reasoning model?" — which did not recognise Qwen 3 / 3.5
+at all. On a Qwen 3.5 9B that meant greedy tool turns (the exact setting Qwen
+warns causes repetition loops) and no way to control thinking. This pass makes
+decoding a property of the MODEL, not of the config file.
+
+## 1. Model profiles (`src/core/modelProfile.ts`, new)
+
+Classifies the active model by name into a family — `qwen3` / `qwen3-coder`,
+`qwen2.5` / `qwen2.5-coder`, `deepseek-r1`, `qwq`, `gemma`, generic reasoning,
+generic — and returns:
+
+- `reasoning` / `hybridThinking` / `thinkByDefault` — what the model *is*, and
+  whether its chain-of-thought can be switched off at all;
+- separate `thinking` / `nonThinking` sampling profiles (temperature, top_p,
+  top_k, presence & repeat penalties) from each family's published guidance,
+  plus a `minTurnTemp` floor for agent tool turns;
+- a `contextSuggestion` used as a hint in `/model`.
+
+One classifier now serves the whole harness: `core/swarm.ts` re-exports
+`isReasoningModel` from here instead of keeping a second copy of the regex.
+
+## 2. Auto-tuning (`providers/index.ts` → `tuneForModel`)
+
+Local provider construction (primary, model picker, fallback chain) folds the
+profile's recommendations into the provider config **only where the user left
+`[model]` at its defaults** — an explicit setting always wins, and
+`model.auto_tune = false` turns the mechanism off entirely.
+
+## 3. Thinking control end to end
+
+New `model.think = "auto" | "always" | "never"`:
+
+- `auto` — hybrids (Qwen3/3.5) run with thinking **off** for fast, tool-shaped
+  coding/shell turns; pure reasoners (R1/QwQ) deliberate as before.
+- Ollama uses the native `think` flag (now able to send `think: false`, which
+  the provider previously could not express); OpenAI-compatible backends use
+  Qwen's `/no_think` soft switch on the last user message.
+- Models with no thinking mode never receive the flag, and `never` cannot
+  produce an unsupported request against a model that always thinks.
+
+## 4. Turn temperature
+
+`turnTemperature()` no longer branches on a boolean. It starts at 0 and lifts to
+the highest applicable floor: the family's (`0.6` thinking, `0.3` Qwen3
+non-thinking, `0` for greedy-stable coders) and the cloud anti-degeneration
+floor. Behaviour for previously-recognised models is unchanged.
+
+## 5. New sampling knobs
+
+`model.top_k`, `model.repeat_penalty`, `model.presence_penalty` (0 = unset, so
+nothing extra goes on the wire), `model.auto_tune`, `model.think`. Ollama maps
+them to `top_k` / `repeat_penalty` / `presence_penalty`; OpenAI-compatible
+servers get `top_k` / `repetition_penalty` / `presence_penalty`. The Ollama
+provider's duplicated generate/stream body construction collapsed into one
+`chatBody()` so the two paths cannot drift.
+
+## 6. Defaults
+
+Default model is now `qwen3.5:9b`, with `qwen2.5-coder:7b` added to the fallback
+chain. `/model` gained rows for the detected family, the resolved thinking
+state, the live sampling values, and a context-window hint.
+
+21 new tests (214 total), clean typecheck.

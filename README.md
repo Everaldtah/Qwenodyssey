@@ -4,12 +4,14 @@
 
 <img src="assets/banner.svg" alt="QWEN ODYSSEY" width="600" />
 
-**An Odyssey-class coding harness for Qwen 2.5 7B.**
+**An Odyssey-class coding harness for Qwen 3.5 9B and smaller local models.**
 
 Qwenodyssey is a local-first CLI coding agent that wraps a small/medium model
-(Qwen 2.5 7B / Qwen2.5-Coder-7B) in the scaffolding it needs to behave like a
-much stronger coding agent: explicit planning, constrained context, patch-based
-edits, self-review, a test→fix retry loop, and project memory.
+(Qwen 3.5 9B, Qwen2.5-Coder-7B, and anything else you run locally) in the
+scaffolding it needs to behave like a much stronger coding agent: explicit
+planning, constrained context, patch-based edits, self-review, a test→fix retry
+loop, project memory — and per-family decoding that keeps a 9B model from
+looping or fumbling its tool calls.
 
 It is a clean-room TypeScript evolution that combines:
 
@@ -21,12 +23,15 @@ It is a clean-room TypeScript evolution that combines:
 
 ---
 
-## Why a 7B model needs a harness
+## Why a 7–9B model needs a harness
 
-A 7B model is fast and private, but compared to frontier models it forgets,
+A 9B model is fast and private, but compared to frontier models it forgets,
 hallucinates APIs, and loses the thread on large tasks. Qwenodyssey compensates
 *structurally* instead of pretending the model is bigger than it is:
 
+- **Sample it correctly** — each model family gets the decoding its authors
+  recommend (Qwen3/3.5 never runs greedy; qwen2.5-coder always does), plus
+  per-family thinking control. Automatic; override any knob in config.
 - **Give it smaller tasks** — the planner decomposes work into 2–6 steps.
 - **Show it only relevant files** — the context engine packs a token budget by priority.
 - **Force plans & patches** — structured JSON output, unified diffs, not essays.

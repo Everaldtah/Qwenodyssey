@@ -13,7 +13,7 @@ const ModelConfig = z.object({
   provider: z
     .enum(["ollama", "lmstudio", "openai", "vllm", "llamacpp", "nvidia", "openrouter", "anthropic"])
     .default("ollama"),
-  model: z.string().default("qwen2.5:7b"),
+  model: z.string().default("qwen3.5:9b"),
   // Ordered fallback chain: tried in turn if `model` isn't installed at launch,
   // or when a request fails because the active model is unavailable. The first
   // installed/working one wins. Empty list disables fallback.
@@ -25,6 +25,7 @@ const ModelConfig = z.object({
     .default([
       "nvidia:deepseek-ai/deepseek-v4-pro",
       "nvidia:moonshotai/kimi-k2.6",
+      "qwen2.5-coder:7b",
       "deepseek-r1:7b",
       "igorls/gemma-4-12B-it-heretic-GGUF",
     ]),
@@ -32,6 +33,24 @@ const ModelConfig = z.object({
   api_key: z.string().default(""),
   temperature: z.number().default(0.2),
   top_p: z.number().default(0.9),
+  // Sampling knobs that matter most for SMALL local models. Left at 0 they are
+  // omitted from the request and the model-profile tuner fills in the values the
+  // model's authors recommend (see auto_tune below and src/core/modelProfile.ts).
+  // Set any of them explicitly to pin it and opt that knob out of auto-tuning.
+  top_k: z.number().default(0),
+  repeat_penalty: z.number().default(0),
+  presence_penalty: z.number().default(0),
+  // Model-aware tuning: detect the model family (qwen3/3.5, qwen2.5-coder,
+  // deepseek-r1, gemma…) and apply its recommended decoding parameters wherever
+  // the settings above are still at their defaults. Turn off to use the literal
+  // config values for every model.
+  auto_tune: z.boolean().default(true),
+  // Chain-of-thought policy for models that HAVE one:
+  //   auto   = per family — hybrids (Qwen3/3.5) run with thinking OFF for fast,
+  //            tool-shaped coding/shell turns; pure reasoners (R1, QwQ) think.
+  //   always = always deliberate (slower, better on hard one-shot problems)
+  //   never  = disable thinking wherever the model supports being turned off.
+  think: z.enum(["auto", "always", "never"]).default("auto"),
   // GPU acceleration (Ollama). -1 = AUTO: load as many layers onto the GPU as
   // fit in VRAM and run the overflow on CPU/RAM — i.e. automatic offload when
   // the model + context/KV cache is too large for VRAM. Set a positive number
@@ -48,6 +67,15 @@ const ModelConfig = z.object({
   // & gemma-12B ~128K) if you have the RAM/VRAM for the larger KV cache.
   context_tokens: z.number().default(16384),
 });
+
+export type ModelSettings = z.infer<typeof ModelConfig>;
+
+/**
+ * The built-in [model] defaults. Auto-tuning only fills in a knob that still
+ * equals its default, so anything a user (or `qwenodyssey config set`) writes
+ * explicitly always wins over the model profile.
+ */
+export const MODEL_DEFAULTS: ModelSettings = ModelConfig.parse({});
 
 const AgentConfig = z.object({
   max_retries: z.number().default(4),

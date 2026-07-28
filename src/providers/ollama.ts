@@ -1,4 +1,5 @@
 import { OpenAICompatibleProvider } from "./base";
+import { modelProfile } from "../core/modelProfile";
 import type { GenerateResult, Message, ModelOptions, ModelInfo, ToolCall } from "../types";
 
 /** Ollama serves an OpenAI-compatible API at {base}/v1 and native at {base}/api. */
@@ -10,13 +11,14 @@ export class OllamaProvider extends OpenAICompatibleProvider {
   }
 
   /**
-   * Generate via Ollama's NATIVE /api/chat instead of the OpenAI-compatible
-   * /v1 endpoint. The /v1 endpoint silently ignores num_ctx and caps context at
-   * ~4096 tokens, which truncates long conversations / file reads and makes the
-   * model return nothing. The native endpoint honours options.num_ctx, so we
-   * can use the model's real context window (config: model.context_tokens).
+   * Build the native /api/chat request. Shared by generate() and stream() so the
+   * sampling knobs, GPU policy, thinking flag and tools can never drift apart.
    */
-  async generate(messages: Message[], options: ModelOptions = {}): Promise<GenerateResult> {
+  private chatBody(
+    messages: Message[],
+    options: ModelOptions,
+    stream: boolean
+  ): Record<string, unknown> {
     const opts: Record<string, unknown> = {
       temperature: options.temperature ?? this.cfg.temperature,
       top_p: options.top_p ?? this.cfg.topP,
@@ -24,6 +26,14 @@ export class OllamaProvider extends OpenAICompatibleProvider {
       num_ctx: this.cfg.contextTokens ?? 8192,
       ...(options.stop ? { stop: options.stop } : {}),
     };
+    // Small-model decoding levers (top_k / repeat_penalty / presence_penalty).
+    // Only sent when set — 0 means "leave it to Ollama's own default".
+    const topK = options.top_k ?? this.cfg.topK;
+    const repeat = options.repeat_penalty ?? this.cfg.repeatPenalty;
+    const presence = options.presence_penalty ?? this.cfg.presencePenalty;
+    if (topK && topK > 0) opts.top_k = topK;
+    if (repeat && repeat > 0) opts.repeat_penalty = repeat;
+    if (presence && presence > 0) opts.presence_penalty = presence;
     // GPU acceleration: only pin num_gpu when the user forces a layer count.
     // Left unset (gpu_layers = -1), Ollama auto-loads as many layers as fit in
     // VRAM and runs the rest on CPU/RAM — automatic offload for large contexts.
@@ -35,20 +45,37 @@ export class OllamaProvider extends OpenAICompatibleProvider {
     const body: Record<string, unknown> = {
       model: this.cfg.model,
       messages: nativeMessages(messages),
-      stream: false,
+      stream,
       options: opts,
       ...(this.cfg.keepAlive ? { keep_alive: this.cfg.keepAlive } : {}),
     };
     if (options.json) body.format = "json";
-    // Reasoning models (R1/QwQ): Ollama returns the chain-of-thought in a
-    // separate `thinking` field when asked, instead of inline <think> tags.
-    if (options.think) body.think = true;
+    // Thinking control. Ollama returns a reasoning model's chain-of-thought in a
+    // separate `thinking` field when asked. Hybrids (Qwen3/3.5) also accept
+    // think:false, which skips deliberation entirely — faster, more tool-shaped
+    // turns for coding/shell work. Models with no thinking mode get no flag at
+    // all, since Ollama rejects `think` for them.
+    const think = this.thinkingEnabled(options);
+    if (think === true) body.think = true;
+    else if (think === false && modelProfile(this.cfg.model).hybridThinking) body.think = false;
     if (options.tools?.length) {
       body.tools = options.tools.map((t) => ({
         type: "function",
         function: { name: t.name, description: t.description, parameters: t.parameters },
       }));
     }
+    return body;
+  }
+
+  /**
+   * Generate via Ollama's NATIVE /api/chat instead of the OpenAI-compatible
+   * /v1 endpoint. The /v1 endpoint silently ignores num_ctx and caps context at
+   * ~4096 tokens, which truncates long conversations / file reads and makes the
+   * model return nothing. The native endpoint honours options.num_ctx, so we
+   * can use the model's real context window (config: model.context_tokens).
+   */
+  async generate(messages: Message[], options: ModelOptions = {}): Promise<GenerateResult> {
+    const body = this.chatBody(messages, options, false);
 
     const res = await fetch(`${this.root()}/api/chat`, {
       method: "POST",
@@ -87,33 +114,7 @@ export class OllamaProvider extends OpenAICompatibleProvider {
     onChunk: (delta: string) => void,
     options: ModelOptions = {}
   ): Promise<GenerateResult> {
-    const opts: Record<string, unknown> = {
-      temperature: options.temperature ?? this.cfg.temperature,
-      top_p: options.top_p ?? this.cfg.topP,
-      num_predict: options.max_tokens ?? this.cfg.maxTokens,
-      num_ctx: this.cfg.contextTokens ?? 8192,
-      ...(options.stop ? { stop: options.stop } : {}),
-    };
-    if (typeof this.cfg.gpuLayers === "number" && this.cfg.gpuLayers >= 0) {
-      opts.num_gpu = this.cfg.gpuLayers;
-    }
-    if (this.cfg.lowVram) opts.low_vram = true;
-
-    const body: Record<string, unknown> = {
-      model: this.cfg.model,
-      messages: nativeMessages(messages),
-      stream: true,
-      options: opts,
-      ...(this.cfg.keepAlive ? { keep_alive: this.cfg.keepAlive } : {}),
-    };
-    if (options.json) body.format = "json";
-    if (options.think) body.think = true;
-    if (options.tools?.length) {
-      body.tools = options.tools.map((t) => ({
-        type: "function",
-        function: { name: t.name, description: t.description, parameters: t.parameters },
-      }));
-    }
+    const body = this.chatBody(messages, options, true);
 
     const res = await fetch(`${this.root()}/api/chat`, {
       method: "POST",

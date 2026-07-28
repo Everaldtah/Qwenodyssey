@@ -20,10 +20,15 @@ import { miclevelCommand } from "./commands/miclevel";
 
 const program = new Command();
 
+// Single source of truth for the version/description: package.json, so `--version`
+// can't drift from the published package the way a hardcoded string did.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const pkg = require("../../package.json") as { version: string; description: string };
+
 program
   .name("qwenodyssey")
-  .description("An Odyssey-class coding harness for Qwen 2.5 7B.")
-  .version("0.2.0")
+  .description(pkg.description)
+  .version(pkg.version)
   .option("--cwd <dir>", "project directory (default: current)")
   .option("--verbose", "verbose debug output")
   .option("-y, --yes", "auto-confirm all prompts");

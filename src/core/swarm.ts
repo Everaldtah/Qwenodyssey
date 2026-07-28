@@ -93,13 +93,12 @@ export function shortLabel(model: string): string {
   return tail;
 }
 
-/** Reasoning/thinking models need heat — at temp 0 they loop. (Mirrors chat.ts.) */
-export function isReasoningModel(model: string): boolean {
-  return (
-    /(^|[-_/:.])(r1|qwq|o1|o3|thinking|reason|kimi|k2|nemotron)/i.test(model) ||
-    /deepseek-r1/i.test(model)
-  );
-}
+/**
+ * Reasoning/thinking models need heat — at temp 0 they loop. One classifier for
+ * the whole harness: the family profile in core/modelProfile.
+ */
+import { isReasoningModel } from "./modelProfile";
+export { isReasoningModel };
 
 function buildProvider(config: Config, kind: WorkerKind, model: string): Provider {
   switch (kind) {
