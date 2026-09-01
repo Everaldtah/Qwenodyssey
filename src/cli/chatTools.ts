@@ -62,12 +62,16 @@ export const CHAT_TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: "write_file",
-    description: "Create or overwrite a file with the given content.",
+    description:
+      "Create a file, or replace an existing file's ENTIRE contents. To change part of an existing " +
+      "file use apply_edit instead. Replacing a file you have not read this session is refused " +
+      "unless overwrite=true.",
     parameters: {
       type: "object",
       properties: {
         path: str("Path to the file, relative to the project root."),
         content: str("Full new contents of the file."),
+        overwrite: { type: "boolean", description: "Set true to replace an existing file you have not read." },
       },
       required: ["path", "content"],
     },

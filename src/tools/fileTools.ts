@@ -16,7 +16,44 @@ export function expandHome(p: string): string {
 }
 
 /** Resolve a path for WRITES/DELETES: must stay inside the project root. */
+/**
+ * Small models often address files as "<project folder>/file" because the tool
+ * output and PROJECT summary show the absolute cwd, e.g. `projA/calc.py` while
+ * already inside projA. When no such sub-folder exists, drop the redundant
+ * prefix so the call hits the file the model meant. Absolute and ~ paths, and
+ * genuine sub-folders of the same name, are left untouched.
+ */
+export function stripRedundantCwdPrefix(cwd: string, p: string): string {
+  if (!p || path.isAbsolute(p) || /^~/.test(p)) return p;
+  const base = path.basename(path.resolve(cwd));
+  if (!base) return p;
+  const norm = p.replace(/\\/g, "/").replace(/^\.\//, "");
+  const slash = norm.indexOf("/");
+  const head = slash === -1 ? norm : norm.slice(0, slash);
+  if (head.toLowerCase() !== base.toLowerCase()) return p;
+  if (fs.existsSync(path.resolve(cwd, head))) return p; // a real sub-folder with that name
+  const rest = slash === -1 ? "" : norm.slice(slash + 1);
+  return rest || ".";
+}
+
+/**
+ * Shell form of stripRedundantCwdPrefix: rewrite `projA/x`, `.\projA\x`, `projA\`
+ * tokens inside a command when cwd is `.../projA` and no `projA` sub-folder exists.
+ */
+export function stripRedundantCwdPrefixInCommand(cwd: string, cmd: string): string {
+  const base = path.basename(path.resolve(cwd));
+  if (!base || base.length < 2 || fs.existsSync(path.join(cwd, base))) return cmd;
+  const esc = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(^|[\\s"'=(])(?:\\.[\\\\/])?${esc}[\\\\/]`, "gi");
+  return cmd.replace(re, (m: string, pre: string, offset: number, whole: string) => {
+    // `cd projA/` with nothing after → stay put (`.`), otherwise drop the prefix.
+    const after = whole.slice(offset + m.length);
+    return pre + (after === "" || /^[\s"'|;&)]/.test(after) ? "." : "");
+  });
+}
+
 export function resolveInside(cwd: string, p: string): string {
+  p = stripRedundantCwdPrefix(cwd, p);
   const abs = path.resolve(cwd, p);
   const root = path.resolve(cwd);
   if (abs !== root && !abs.startsWith(root + path.sep)) {
@@ -33,7 +70,7 @@ export function resolveInside(cwd: string, p: string): string {
  */
 export function resolveReadable(cwd: string, p?: string): string {
   const raw = p && String(p).trim() ? String(p) : ".";
-  return path.resolve(cwd, expandHome(raw));
+  return path.resolve(cwd, expandHome(stripRedundantCwdPrefix(cwd, raw)));
 }
 
 /**
@@ -62,6 +99,7 @@ export function resolveReadableSmart(cwd: string, p?: string): string {
  * is rejected to avoid scribbling across the whole machine.
  */
 export function resolveWritable(ctx: ToolContext, p: string): string {
+  p = stripRedundantCwdPrefix(ctx.cwd, p);
   const abs = path.resolve(ctx.cwd, p);
   const roots = [path.resolve(ctx.cwd)];
   if (ctx.selfRoot) roots.push(path.resolve(ctx.selfRoot));
@@ -155,6 +193,7 @@ export const listFilesTool: Tool = {
     if (!fs.existsSync(base)) return { ok: false, output: `Directory not found: ${base}` };
     const pattern = String(args.pattern || "**/*");
     const files = await fg(pattern, {
+      suppressErrors: true, // protected dirs (e.g. %TEMP%\msdtadmin) must not abort the listing
       cwd: base,
       dot: false,
       ignore: IGNORE,
@@ -181,6 +220,7 @@ export const treeTool: Tool = {
       return { ok: false, output: `${base} is a file, not a directory — use read_file.` };
     const maxDepth = Number(args.depth ?? 2);
     const files = await fg("**/*", {
+      suppressErrors: true, // protected dirs (e.g. %TEMP%\msdtadmin) must not abort the listing
       cwd: base,
       ignore: IGNORE,
       onlyFiles: false,

@@ -45,7 +45,8 @@ export type MatchStrategy =
   | "anchored-fuzzy"
   | "reindented"
   | "created"
-  | "appended";
+  | "appended"
+  | "replaced-whole";
 
 export interface BlockApplyResult {
   path: string;
@@ -261,8 +262,15 @@ export function applyBlockToContent(
   content: string,
   block: EditBlock
 ): { ok: boolean; result?: string; strategy: MatchStrategy; confidence: number; error?: string } {
-  // Empty SEARCH ⇒ append (or full content if file is empty).
+  // Empty SEARCH ⇒ append (or full content if file is empty). Exception: when
+  // the replacement already CONTAINS the whole current file, the model meant
+  // "here is the complete new file" — appending would duplicate every existing
+  // definition (a 9B model did exactly that: two `def add`s). Replace instead.
   if (!block.search.trim()) {
+    const cur = content.trim();
+    if (cur && block.replace.includes(cur)) {
+      return { ok: true, result: block.replace, strategy: "replaced-whole", confidence: 1 };
+    }
     const sep = content && !content.endsWith("\n") ? "\n" : "";
     return {
       ok: true,

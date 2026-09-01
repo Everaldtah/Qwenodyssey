@@ -1,3 +1,4 @@
+import { adaptChainsForPowerShell } from "./psCompat";
 /**
  * Persistent, stateful shell session backed by a real pseudo-terminal (node-pty).
  *
@@ -124,7 +125,8 @@ export class ShellSession {
 
   /** Locate the sentinel RESULT line (token at line start, then the exit code). */
   private findMarker(raw: string, token: string): { index: number; code: number | null } | null {
-    const re = new RegExp(`(?:^|\\n)${token}:(-?\\d*)\\r?\\n`);
+    // A (blanked) prompt may be glued in front of the result line: "PS> QOD…:0".
+    const re = new RegExp(`(?:^|\\n)(?:PS[^>\\n]*>\\s?)?${token}:(-?\\d*)\\r?\\n`);
     const m = re.exec(raw);
     if (!m) return null;
     const code = m[1] === "" ? null : Number(m[1]);
@@ -180,11 +182,16 @@ export class ShellSession {
     const job = this.current;
     if (!job || job.done) return;
     job.raw += d;
-    const m = this.findMarker(job.raw, job.marker);
+    // conpty interleaves ANSI (e.g. "\x1b[m") between the newline and the marker,
+    // so match on the STRIPPED text — matching the raw bytes never saw the
+    // sentinel, every command "ran" until its timeout, and the session then
+    // reported "busy" for the rest of the chat.
+    const plain = stripAnsi(job.raw);
+    const m = this.findMarker(plain, job.marker);
     if (m) {
       job.done = true;
       job.exitCode = m.code;
-      job.raw = job.raw.slice(0, m.index);
+      job.raw = plain.slice(0, m.index);
       this.settle();
     }
   }
@@ -217,13 +224,15 @@ export class ShellSession {
   private cleanedOutput(job: Job): string {
     const text = stripAnsi(job.raw);
     const cmd = job.command.trim();
+    // The line actually sent to PowerShell may differ (bash-chain rewrite).
+    const wireCmd = process.platform === "win32" ? adaptChainsForPowerShell(cmd).trim() : cmd;
     const out: string[] = [];
     for (let line of text.split("\n")) {
       // Strip a leading PowerShell prompt ("PS C:\path> " or the blanked "PS> "),
       // which conpty often glues onto the echoed command line.
       line = line.replace(/^PS[^>\n]*>\s?/, "").replace(/\r$/, "");
       if (line.includes(job.marker)) continue; // echoed marker command / result line
-      if (line.trim() === cmd) continue; // the terminal-echoed input command
+      if (line.trim() === cmd || line.trim() === wireCmd) continue; // the terminal-echoed input command
       // Startup init echo can bleed into the first command's buffer (it's written
       // before any job exists) — drop it.
       if (/function prompt \{|^PS1=''/.test(line)) continue;
@@ -253,10 +262,12 @@ export class ShellSession {
       };
     }
     const token = "QOD" + Math.random().toString(36).slice(2, 10).toUpperCase();
+    // Windows PowerShell 5.1 has no `&&`/`||` — rewrite bash-style chains.
+    const wire = process.platform === "win32" ? adaptChainsForPowerShell(command) : command;
     this.current = { marker: token, command, raw: "", done: false, exitCode: null, cleanConsumed: 0, timer: null, waiter: null };
     // Single write of both lines — avoids an inter-write race where the marker
     // arrives while the shell is still echoing the command.
-    this.pty.write(command + "\r" + this.markerCmd(token) + "\r");
+    this.pty.write(wire + "\r" + this.markerCmd(token) + "\r");
     return this.waitForDelta(timeoutMs);
   }
 

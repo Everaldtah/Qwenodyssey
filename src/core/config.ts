@@ -114,6 +114,10 @@ const ToolsConfig = z.object({
   allow_shell: z.boolean().default(true),
   confirm_destructive: z.boolean().default(true),
   sandbox: z.boolean().default(true),
+  // Let the agent write into ITS OWN install/source tree (self-modification).
+  // Off by default: a 0.5B model once "added a function to calc.py" by writing
+  // C:/.../Qwenodyssey/src/calc.py, a path it hallucinated from the prompt.
+  allow_self_edit: z.boolean().default(false),
   // Regex patterns (case-insensitive). Commands matching allow_commands skip the
   // destructive-confirm prompt (handy for unattended/headless runs of known-safe
   // families like "^git (status|log|diff)" or "^npm (test|run)"). Commands
@@ -203,10 +207,11 @@ const NvidiaConfig = z.object({
   // deepseek-v4-pro can stall) fails over to the next model in the chain.
   request_timeout_ms: z.number().default(90000),
   // Nemotron reasoning models use chat_template_kwargs.enable_thinking (a
-  // different toggle than kimi/v4's `thinking`) + a reasoning_budget. When true,
-  // Qwenodyssey enables their reasoning and caps the thinking tokens below.
+  // different toggle than kimi/v4's `thinking`). When true, Qwenodyssey enables
+  // their reasoning. reasoning_budget caps the thinking tokens — 0 (default) sends
+  // nothing, because NIM's current runner rejects the parameter with HTTP 400.
   nemotron_thinking: z.boolean().default(true),
-  reasoning_budget: z.number().default(4096),
+  reasoning_budget: z.number().default(0),
 });
 
 /**

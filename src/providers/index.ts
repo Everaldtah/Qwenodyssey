@@ -144,6 +144,15 @@ export function createProvider(config: Config): Provider {
   if (m.provider === "nvidia") return createNvidiaProvider(config, m.model);
   if (m.provider === "openrouter") return createOpenRouterProvider(config, m.model);
   if (m.provider === "anthropic") return createAnthropicProvider(config, m.model);
+  // LM Studio as the PRIMARY backend must honour the [lmstudio] section (URL +
+  // API key), exactly like a runtime switch does. Before, it used [model].base_url
+  // — which defaults to Ollama's port — so an LM Studio-primary config died at
+  // startup with "Model backend not reachable". An explicit non-Ollama
+  // [model].base_url still wins for people who configured it that way.
+  if (m.provider === "lmstudio") {
+    const explicit = m.base_url && m.base_url !== MODEL_DEFAULTS.base_url ? m.base_url : undefined;
+    return createLmStudioProvider(config, m.model, explicit);
+  }
   const cfg: ProviderConfig = tuneForModel(config, m.model, {
     model: m.model,
     baseUrl: m.base_url || DEFAULT_BASE[m.provider] || "http://localhost:11434",
@@ -159,8 +168,6 @@ export function createProvider(config: Config): Provider {
   switch (m.provider) {
     case "ollama":
       return new OllamaProvider(cfg);
-    case "lmstudio":
-      return new LMStudioProvider(cfg);
     case "openai":
       return new OpenAICompatibleEndpointProvider(cfg);
     case "vllm":
@@ -266,13 +273,13 @@ export function createAnthropicProvider(config: Config, model: string): Provider
  * configured default provider — used to switch the active backend to LM Studio
  * at runtime (model picker / fallback).
  */
-export function createLmStudioProvider(config: Config, model: string): Provider {
+export function createLmStudioProvider(config: Config, model: string, baseUrl?: string): Provider {
   const m = config.model;
   return new LMStudioProvider(
     tuneForModel(config, model, {
       model,
-      baseUrl: config.lmstudio.base_url || "http://localhost:1234",
-      apiKey: config.lmstudio.api_key || "",
+      baseUrl: baseUrl || config.lmstudio.base_url || DEFAULT_BASE.lmstudio,
+      apiKey: config.lmstudio.api_key || m.api_key || "",
       temperature: m.temperature,
       topP: m.top_p,
       maxTokens: m.max_tokens,

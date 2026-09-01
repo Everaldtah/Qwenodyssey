@@ -11,6 +11,7 @@
 import type { Tool, ToolSpec } from "../types";
 import { ShellSession, RunResult } from "../core/shellSession";
 import { classifyCommand } from "./shellTools";
+import { stripRedundantCwdPrefixInCommand } from "./fileTools";
 
 const str = (description: string) => ({ type: "string", description });
 
@@ -49,8 +50,9 @@ export function createShellSessionTools(session: ShellSession): Tool[] {
     mutating: true,
     async run(args, ctx) {
       if (!ctx.allowShell) return { ok: false, output: "Shell execution is disabled (tools.allow_shell=false)." };
-      const command = String(args.command || "").trim();
-      if (!command) return { ok: false, output: "No command given" };
+      const rawCommand = String(args.command || "").trim();
+      if (!rawCommand) return { ok: false, output: "No command given" };
+      const command = stripRedundantCwdPrefixInCommand(ctx.cwd, rawCommand);
       const cls = classifyCommand(command, { allow: ctx.allowCommands, deny: ctx.denyCommands });
       if (cls === "blocked") {
         ctx.log({ tool: "shell_session", command, blocked: true });

@@ -1,5 +1,49 @@
 # Qwenodyssey — Upgrade Notes
 
+## 2026-09-01 — v0.4.1 bug-fix pass (small local models on LM Studio)
+
+Root causes found while running the 0.5B / 0.8B / 9B Qwen models through the CLI:
+
+- **Source tree recovered.** A `cargo init` run inside the repo on 2026-08-30 had
+  deleted all of `src/core` and `src/tools` (46 files) and left Rust stubs behind;
+  the CLI only still ran from the stale `dist/`. Restored from git; Rust files moved out.
+- **Manual `/model` switch was silently undone.** Background startup resolution
+  finished after the switch and moved the session to the first cloud fallback. The
+  user's pick is now pinned, LM Studio primaries are validated instead of assumed
+  missing, and `/model` waits for the LM Studio inventory before listing.
+- **Empty replies with `↓ 0`.** NIM delivered `503 overloaded` as a data frame in an
+  HTTP 200 stream; the parser skipped it. In-band errors now throw (→ fallback chain),
+  `reasoning_content` is kept as thinking, and `reasoning_budget` is no longer sent
+  (NIM rejects it with HTTP 400).
+- **LM Studio 4096 context.** Every tool turn failed with `n_keep >= n_ctx`. Models are
+  now loaded with `model.context_tokens` (VRAM-aware: too-big models get the capped
+  context + partial offload + TTL), using `lms load --exact <path>`, with unload-and-
+  reload when the loaded context is too small, and a reload-and-retry on overflow.
+- **`/no_think` confused Qwen 3.5** ("No, I'm not thinking…"). Thinking is toggled via
+  `chat_template_kwargs.enable_thinking` on OpenAI-compatible servers.
+- **LM Studio as primary provider** used the Ollama URL → "Model backend not reachable".
+- **Piped input** dropped every line after the first (readline lost lines arriving
+  while a turn ran). Lines are queued now, so scripted runs work.
+- **Small-model guard rails:** blind `write_file` over an unread file is refused (use
+  `apply_edit` / `read_file` first, or `overwrite: true`); a redundant `<project folder>/`
+  path prefix is stripped; bash `&&`/`||` are rewritten for Windows PowerShell 5.1; after
+  two repeated identical tool calls the turn finishes without tools; writes into the
+  agent's own source tree need `tools.allow_self_edit = true` (default false).
+- **Persistent shell (`shell_session`) never saw its completion marker** under conpty
+  (an ANSI reset sits between the newline and the sentinel), so every command "ran"
+  until the timeout and the session then reported "busy" for the rest of the chat.
+  The marker is matched on ANSI-stripped output; commands finish in milliseconds.
+- **Identity refresh clipped the system prompt.** `replaceSelfAwareness` matched the
+  word "SELF-AWARENESS" where system.md merely mentions it, so every `/model` switch or
+  fallback deleted all tool/plan/memory instructions (prompt fell from ~2.6k to ~440
+  tokens). It now anchors on the block header.
+- `apply_edit` with an empty `search` whose replacement already contains the whole
+  file now replaces the file instead of appending a duplicate copy.
+- `list_files`/`tree`/`grep` no longer abort on a permission-protected folder (EPERM).
+- Banner version read from package.json (was hardcoded 0.3.0); LM Studio fallback list
+  puts tool-capable models first.
+
+
 This pass fixes the live token counter and makes the harness more
 token-efficient and more accurate across both local and frontier backends.
 

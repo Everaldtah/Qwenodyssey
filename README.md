@@ -116,12 +116,17 @@ qwenodyssey config set model.model moonshotai/kimi-k2.6
 model in the chain.
 
 Notes on NIM models: NIM's catalog churns (models reach end-of-life and start
-returning HTTP 410), so verify before relying on one. **Reliable** picks as of
-2026-06: `moonshotai/kimi-k2.6`, `nvidia/nemotron-3-ultra-550b-a55b` (reasoning,
-tool-capable), and `meta/llama-3.3-70b-instruct`. Reasoning is handled per family:
-- **Nemotron** uses `chat_template_kwargs.enable_thinking` + `reasoning_budget`
-  (`[nvidia].nemotron_thinking` / `reasoning_budget`) and returns its chain-of-thought
-  in a separate `reasoning_content` field, which Qwenodyssey drops — answers stay clean.
+returning HTTP 410, or 404 "not found for account"), so verify before relying on
+one. Checked 2026-09-01: `nvidia/nemotron-3-ultra-550b-a55b` (reasoning,
+tool-capable) and `nvidia/nemotron-3.5-lightning-30b-a3b` answer; `moonshotai/kimi-k2.6`
+returns 404 for some accounts and `meta/llama-3.3-70b-instruct` reached end-of-life on
+2026-08-26. An in-band error (e.g. a `503 overloaded` frame inside an HTTP 200 stream)
+is treated as "unavailable" and triggers the fallback chain instead of an empty reply.
+Reasoning is handled per family:
+- **Nemotron** uses `chat_template_kwargs.enable_thinking` (`[nvidia].nemotron_thinking`);
+  its chain-of-thought arrives in a separate `reasoning_content` field, which is shown as
+  `qwen ⟂ thinking` and kept out of the answer. `[nvidia].reasoning_budget` is **off (0)**
+  by default because NIM's current runner rejects the parameter with HTTP 400.
 - **kimi-k2.6 / deepseek-v4 / *-r1** degenerate or leak raw CoT on NIM, so
   `[nvidia].disable_thinking` (default on) sends `chat_template_kwargs.thinking=false`.
 

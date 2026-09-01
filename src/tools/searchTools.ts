@@ -24,6 +24,7 @@ export const grepTool: Tool = {
       return { ok: false, output: `Invalid regex: ${(e as Error).message}` };
     }
     const files = await fg(glob, {
+      suppressErrors: true, // protected dirs (e.g. %TEMP%\msdtadmin) must not abort the listing
       cwd: base,
       ignore: IGNORE,
       onlyFiles: true,
@@ -58,6 +59,7 @@ export const searchDocsTool: Tool = {
   async run(args, ctx): Promise<ToolResult> {
     const q = String(args.query || "").toLowerCase();
     const files = await fg(["README*", "docs/**/*.md", "**/*.md"], {
+      suppressErrors: true, // protected dirs (e.g. %TEMP%\msdtadmin) must not abort the listing
       cwd: ctx.cwd,
       ignore: IGNORE,
       onlyFiles: true,

@@ -137,39 +137,26 @@ export abstract class OpenAICompatibleProvider implements Provider {
     return out;
   }
 
-  /**
-   * Qwen3/3.5's documented SOFT switch for turning thinking off on backends with
-   * no native toggle (LM Studio, vLLM, llama.cpp): a trailing `/no_think` on the
-   * last user message. Ollama overrides body() and uses its native `think` flag
-   * instead, so this only affects OpenAI-compatible servers.
-   */
-  protected applyThinkSoftSwitch(
-    wire: Record<string, unknown>[],
-    options: ModelOptions
-  ): Record<string, unknown>[] {
-    const profile = modelProfile(this.cfg.model);
-    if (!profile.hybridThinking) return wire;
-    if (this.thinkingEnabled(options) !== false) return wire;
-    for (let i = wire.length - 1; i >= 0; i--) {
-      const content = wire[i].content;
-      if (wire[i].role !== "user" || typeof content !== "string") continue;
-      if (/\/no_think\s*$/.test(content)) break;
-      wire[i] = { ...wire[i], content: `${content} /no_think` };
-      break;
-    }
-    return wire;
-  }
-
   protected body(messages: Message[], options: ModelOptions, stream: boolean) {
     const body: Record<string, unknown> = {
       model: this.cfg.model,
-      messages: this.applyThinkSoftSwitch(this.wireMessages(messages), options),
+      messages: this.wireMessages(messages),
       temperature: options.temperature ?? this.cfg.temperature,
       top_p: options.top_p ?? this.cfg.topP,
       max_tokens: options.max_tokens ?? this.cfg.maxTokens,
       ...this.samplingExtras(options),
       stream,
     };
+    // Hybrid thinking models (Qwen3 / Qwen3.5) are toggled through the chat
+    // template: `chat_template_kwargs.enable_thinking`, which LM Studio, vLLM and
+    // llama.cpp all honour. The old approach appended a literal " /no_think" to
+    // the user message — Qwen 3.5 no longer recognises that switch and small
+    // models answered the text itself ("No, I'm not thinking…") instead of the
+    // question. Provider-specific extraBody() below may still override this.
+    const think = this.thinkingEnabled(options);
+    if (typeof think === "boolean" && modelProfile(this.cfg.model).hybridThinking) {
+      body.chat_template_kwargs = { enable_thinking: think };
+    }
     if (options.stop) body.stop = options.stop;
     if (options.json) body.response_format = { type: "json_object" };
     if (options.tools?.length) {
@@ -226,12 +213,20 @@ export abstract class OpenAICompatibleProvider implements Provider {
       throw new Error(`${this.name} HTTP ${res.status}: ${detail}`);
     }
     const json: any = await res.json();
+    // Some gateways (NVIDIA NIM) answer HTTP 200 with an error envelope instead
+    // of a completion — surface it as a real error so the fallback chain runs.
+    if (json?.error) throw new Error(`${this.name} error: ${describeApiError(json.error)}`);
     const msg: any = json?.choices?.[0]?.message ?? {};
     const text: string = msg?.content ?? "";
     const toolCalls = parseToolCalls(msg?.tool_calls);
+    // Reasoning models return their chain-of-thought in a separate field
+    // (NIM/vLLM: reasoning_content, OpenRouter: reasoning). Keep it so the chat
+    // layer can show it and tell "thought but never answered" from "no response".
+    const reasoning = msg?.reasoning_content ?? msg?.reasoning;
     return {
       text,
       toolCalls,
+      thinking: typeof reasoning === "string" && reasoning.trim() ? reasoning : undefined,
       model: this.cfg.model,
       promptTokens: json?.usage?.prompt_tokens,
       completionTokens: json?.usage?.completion_tokens,
@@ -290,6 +285,7 @@ export abstract class OpenAICompatibleProvider implements Provider {
     const decoder = new TextDecoder();
     let buffer = "";
     let full = "";
+    let thinking = "";
     let promptTokens: number | undefined;
     let completionTokens: number | undefined;
     // Accumulate streamed tool-call fragments by index (OpenAI streams them as
@@ -306,31 +302,39 @@ export abstract class OpenAICompatibleProvider implements Provider {
           if (!trimmed.startsWith("data:")) continue;
           const payload = trimmed.slice(5).trim();
           if (payload === "[DONE]") continue;
+          let obj: any;
           try {
-            const obj = JSON.parse(payload);
-            if (obj?.usage) {
-              promptTokens = obj.usage.prompt_tokens ?? promptTokens;
-              completionTokens = obj.usage.completion_tokens ?? completionTokens;
-            }
-            const choice = obj?.choices?.[0];
-            const delta: string = choice?.delta?.content ?? "";
-            if (delta) {
-              full += delta;
-              onChunk(delta);
-            }
-            const tcs = choice?.delta?.tool_calls;
-            if (Array.isArray(tcs)) {
-              for (const tc of tcs) {
-                const idx = tc.index ?? 0;
-                const cur = toolAcc.get(idx) ?? { id: "", name: "", args: "" };
-                if (tc.id) cur.id = tc.id;
-                if (tc.function?.name) cur.name = tc.function.name;
-                if (tc.function?.arguments) cur.args += tc.function.arguments;
-                toolAcc.set(idx, cur);
-              }
-            }
+            obj = JSON.parse(payload);
           } catch {
-            /* ignore keep-alive / partial frames */
+            continue; /* keep-alive / partial frame */
+          }
+          // An in-band error frame (e.g. NIM "503 Service temporarily
+          // overloaded" delivered inside an HTTP 200 stream) used to be silently
+          // skipped, leaving an empty reply with 0 tokens. Fail loudly instead so
+          // the chat layer can fall back to another model.
+          if (obj?.error) throw new Error(`${this.name} stream error: ${describeApiError(obj.error)}`);
+          if (obj?.usage) {
+            promptTokens = obj.usage.prompt_tokens ?? promptTokens;
+            completionTokens = obj.usage.completion_tokens ?? completionTokens;
+          }
+          const choice = obj?.choices?.[0];
+          const delta: string = choice?.delta?.content ?? "";
+          if (delta) {
+            full += delta;
+            onChunk(delta);
+          }
+          const reason = choice?.delta?.reasoning_content ?? choice?.delta?.reasoning;
+          if (typeof reason === "string" && reason) thinking += reason;
+          const tcs = choice?.delta?.tool_calls;
+          if (Array.isArray(tcs)) {
+            for (const tc of tcs) {
+              const idx = tc.index ?? 0;
+              const cur = toolAcc.get(idx) ?? { id: "", name: "", args: "" };
+              if (tc.id) cur.id = tc.id;
+              if (tc.function?.name) cur.name = tc.function.name;
+              if (tc.function?.arguments) cur.args += tc.function.arguments;
+              toolAcc.set(idx, cur);
+            }
           }
         }
       }
@@ -347,6 +351,7 @@ export abstract class OpenAICompatibleProvider implements Provider {
     return {
       text: full,
       toolCalls,
+      thinking: thinking.trim() || undefined,
       model: this.cfg.model,
       promptTokens,
       completionTokens,
@@ -399,6 +404,14 @@ export abstract class OpenAICompatibleProvider implements Provider {
       return { ok: false, detail: (err as Error).message };
     }
   }
+}
+
+/** Human-readable text for an OpenAI-style `error` envelope (object or string). */
+export function describeApiError(err: unknown): string {
+  if (typeof err === "string") return err;
+  const e = err as { message?: unknown; code?: unknown; type?: unknown } | null;
+  const parts = [e?.code, e?.type, e?.message].filter((x) => x !== undefined && x !== null && x !== "");
+  return parts.length ? parts.map(String).join(" ") : JSON.stringify(err);
 }
 
 /**

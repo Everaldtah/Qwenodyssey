@@ -5,7 +5,7 @@ import { createSession, GlobalOpts } from "../session";
 import { loadPrompt } from "../../core/promptLoader";
 import { scanRepo, summarizeRepo } from "../../core/repoScanner";
 import { prewarmSymbolIndex } from "../../tools/codeTools";
-import { resolveInside } from "../../tools/fileTools";
+import { resolveInside, stripRedundantCwdPrefix, expandHome } from "../../tools/fileTools";
 import { classifyCommand } from "../../tools/shellTools";
 import { ToolRegistry } from "../../tools/registry";
 import { banner, hrule, Spinner, thinkingWord, formatTokens } from "../render";
@@ -44,6 +44,10 @@ import { modelProfile, resolveThinking, samplingFor } from "../../core/modelProf
 import type { ModelProfile } from "../../core/modelProfile";
 import type { GenerateResult, Message, ModelInfo, ModelOptions, ToolCall, ToolContext, ToolSpec } from "../../types";
 import type { Session } from "../session";
+
+// Version shown in the banner comes from package.json (was a hardcoded, stale string).
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const PKG_VERSION: string = (require("../../../package.json") as { version: string }).version;
 
 /** Tool turns run deterministically; temp 0 markedly improves tool adherence. */
 const TOOL_TEMP = 0;
@@ -287,6 +291,9 @@ command when one clearly fits.`;
  * from mistakes. Paths are real so it can answer "do you remember / where?"
  * truthfully and actually modify itself.
  */
+/** First words of the SELF-AWARENESS block; replaceSelfAwareness() anchors on it. */
+const SELF_AWARENESS_HEADER = 'SELF-AWARENESS — you are "Qwenodyssey"';
+
 function selfAwareness(
   s: Session,
   kb: KnowledgeBase,
@@ -305,7 +312,7 @@ function selfAwareness(
   };
   const where = backendLabel[s.provider.name] || `the ${s.provider.name} backend`;
   const lines = [
-    `SELF-AWARENESS — you are "Qwenodyssey", an AI coding agent running on the user's PC. ` +
+    `${SELF_AWARENESS_HEADER}, an AI coding agent running on the user's PC. ` +
       `RIGHT NOW you are powered by the model "${s.provider.model}" served through ${where} ` +
       `(provider id: ${s.provider.name}). That is your real identity — if the user asks what model ` +
       `or agent you are, answer DIRECTLY from this line in plain words and do NOT call any tool ` +
@@ -323,13 +330,18 @@ function selfAwareness(
         `answer truthfully and give this path.`
     );
   }
-  lines.push(
-    `• SOURCE CODE (you can modify yourself): your program lives at "${s.selfRoot}". Read it with ` +
-      `tree/read_file/grep and improve it with write_file (absolute paths under that root are allowed). ` +
-      `After editing your source, rebuild with run_shell: \`npm --prefix "${s.selfRoot}" run build\` ` +
-      `(and \`npm --prefix "${s.selfRoot}" test\`); changes take effect next launch. Edit yourself ` +
-      `carefully, keep changes small, and explain what you changed.`
-  );
+  if (s.config.tools.allow_self_edit) {
+    lines.push(
+      `• SOURCE CODE (you can modify yourself): your program lives at "${s.selfRoot}". Read it with ` +
+        `tree/read_file/grep and improve it with write_file (absolute paths under that root are allowed). ` +
+        `After editing your source, rebuild with run_shell: \`npm --prefix "${s.selfRoot}" run build\` ` +
+        `(and \`npm --prefix "${s.selfRoot}" test\`); changes take effect next launch. Edit yourself ` +
+        `carefully, keep changes small, and explain what you changed.`
+    );
+  }
+  // With self-editing off, the source path is deliberately NOT mentioned: small
+  // local models treat any path in the prompt as an invitation and wander off
+  // into the agent's own source tree instead of the user's project.
   if (evolutionOn) {
     lines.push(
       `• EVOLUTION (learn from mistakes): when a tool/command fails or you get something wrong, after ` +
@@ -350,7 +362,12 @@ function selfAwareness(
 export function replaceSelfAwareness(history: Message[], newText: string): void {
   const sys = history[0];
   if (!sys || sys.role !== "system") return;
-  const start = sys.content.indexOf("SELF-AWARENESS");
+  // Match the block HEADER, not the bare word: system.md mentions "the
+  // SELF-AWARENESS section below" near its top, and matching that used to wipe
+  // everything between it and the real block (tool rules, plan/memory/shell
+  // instructions) on every model switch or fallback.
+  let start = sys.content.indexOf(SELF_AWARENESS_HEADER);
+  if (start === -1) start = sys.content.lastIndexOf("SELF-AWARENESS");
   if (start === -1) {
     sys.content += "\n" + newText;
     return;
@@ -449,18 +466,29 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
   const ready = (async () => {
     const jobs: Promise<unknown>[] = [];
     if (s.config.lmstudio.enabled && s.lms.installed()) {
-      jobs.push(
-        (async () => {
-          try {
-            if (s.config.lmstudio.start_server) {
-              await s.lms.ensureServer(lmsPort(s.config.lmstudio.base_url), "0.0.0.0", s.config.lmstudio.base_url);
-            }
-            s.lmsModelKeys = (await s.lms.list()).map((m) => m.key);
-          } catch {
-            /* LM Studio optional */
+      const lmsJob = (async () => {
+        try {
+          if (s.config.lmstudio.start_server) {
+            await s.lms.ensureServer(lmsPort(s.config.lmstudio.base_url), "0.0.0.0", s.config.lmstudio.base_url);
           }
-        })()
-      );
+          // Tool-capable models first, then the rest, so a fallback lands on a
+          // model that can actually drive the tools (embedding models excluded).
+          const lmsList = (await s.lms.list()).filter((m) => !isEmbeddingModel(m.key));
+          lmsList.sort((a, b) => Number(b.toolUse) - Number(a.toolUse));
+          s.lmsModels = lmsList;
+          s.lmsModelKeys = lmsList.map((m) => m.key);
+          // LM Studio is the PRIMARY backend: load its model with the harness's
+          // context now, instead of letting the server JIT-load it at 4096 and
+          // fail the first tool turn.
+          if (s.provider.name === "lmstudio" && !s.modelPinned) await lmsSafeLoad(s, s.provider.model);
+        } catch {
+          /* LM Studio optional */
+        }
+      })();
+      // /model waits for this (not for the whole repo scan), so the picker never
+      // comes up without the LM Studio models while startup is still running.
+      s.lmsReady = lmsJob;
+      jobs.push(lmsJob);
     }
     jobs.push(
       scanRepo(s.cwd)
@@ -489,7 +517,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
 
   console.log(
     banner({
-      version: "0.3.0",
+      version: PKG_VERSION,
       model: s.provider.model,
       provider: s.provider.name,
       mode: s.mode,
@@ -522,7 +550,9 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     allowCommands: s.config.tools.allow_commands,
     denyCommands: s.config.tools.deny_commands,
     shellTimeoutMs: s.config.tools.shell_timeout_ms,
-    selfRoot: s.selfRoot,
+    // Writes outside the project are only allowed into the agent's own source
+    // when the user opted in (tools.allow_self_edit). Reads work regardless.
+    selfRoot: s.config.tools.allow_self_edit ? s.selfRoot : undefined,
     log: (entry) => s.logger.event(entry),
   };
   const chatTools = new ToolRegistry(toolCtx);
@@ -717,6 +747,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
       continue;
     }
     if (line === "/model" || line === "/models" || line.startsWith("/model ") || line.startsWith("/models ")) {
+      await s.lmsReady; // LM Studio inventory may still be loading right after launch
       lastModels = await handleModels(s, line, lastModels);
       continue;
     }
@@ -864,6 +895,11 @@ async function runAssistantTurn(
   const { profile, thinking: thinkOn } = turnProfile(s);
   const failures: string[] = [];
   const seenCalls = new Set<string>();
+  // Repeated-identical-call detections this turn. Small models that ignore the
+  // first "you already ran this" reminder rarely recover; after the second one
+  // the turn continues WITHOUT tools so the model has to answer in words.
+  let loopHits = 0;
+  let forceAnswer = false;
 
   // ── /btw side-channel ──────────────────────────────────────────────────────
   // Let the user type an aside WHILE the model is working. Each line is queued
@@ -962,14 +998,18 @@ async function runAssistantTurn(
       // Loop guard: an identical (resolved) call already ran — don't re-run it.
       if (seenCalls.has(sig)) {
         failures.push(`repeated identical call to ${prep.name} (loop)`);
+        loopHits++;
+        if (loopHits >= 2) forceAnswer = true;
         history.push({
           role: "tool",
           tool_call_id: call.id,
           name: prep.name,
-          content:
-            `You ALREADY called ${prep.name} with these arguments and its result is above. ` +
-            `Do NOT call it again. Take the NEXT step now: run the actual command with run_shell, ` +
-            `or give your final answer.`,
+          content: forceAnswer
+            ? `You called ${prep.name} with these same arguments again. Tools are now switched off for ` +
+              `this turn. Using the results already above, answer the user in plain words now.`
+            : `You ALREADY called ${prep.name} with these arguments and its result is above. ` +
+              `Do NOT call it again. Take the NEXT step now: run the actual command with run_shell, ` +
+              `or give your final answer.`,
         });
         continue;
       }
@@ -1011,7 +1051,7 @@ async function runAssistantTurn(
     try {
       res = await streamWithFallback(s, history, {
         temperature: turnTemperature(s, profile, thinkOn),
-        tools: toolSpecs.length ? toolSpecs : undefined,
+        tools: toolSpecs.length && !forceAnswer ? toolSpecs : undefined,
         think: thinkOn,
         signal: aborter.signal,
       }, spinner);
@@ -1250,22 +1290,7 @@ async function applyModelRef(s: Session, ref: string): Promise<void> {
     return;
   }
   if (kind === "lmstudio") {
-    if (s.config.lmstudio.safe_load) {
-      try {
-        const m = (await s.lms.list()).find((x) => x.key === model);
-        if (m) {
-          const r = await s.lms.safeLoad(m, {
-            bigParamsB: s.config.lmstudio.big_params_b,
-            bigSizeGB: s.config.lmstudio.big_size_gb,
-            bigContext: s.config.lmstudio.big_context,
-            ttlSeconds: s.config.lmstudio.ttl_seconds,
-          });
-          if (r.big) console.log(chalk.gray(`  (safe-loaded big model: capped context${m.sizeGB >= 18 ? " + partial GPU" : ""})`));
-        }
-      } catch {
-        /* loading is best-effort; the server may JIT-load on first request */
-      }
-    }
+    await lmsSafeLoad(s, model);
     s.provider = createLmStudioProvider(s.config, model);
   } else {
     // Always build a real Ollama provider here: the configured primary provider
@@ -1275,6 +1300,61 @@ async function applyModelRef(s: Session, ref: string): Promise<void> {
     else s.provider.setModel?.(model);
   }
   s.refreshIdentity?.();
+}
+
+/**
+ * Load an LM Studio model with the harness's context window (capped for big
+ * models) before pointing requests at it. Best-effort: if `lms` is missing or
+ * the load fails, the server will JIT-load on the first request instead.
+ * Returns true when a (re)load actually happened.
+ */
+async function lmsSafeLoad(s: Session, model: string, force = false): Promise<boolean> {
+  if (!s.config.lmstudio.safe_load || !s.lms.installed()) return false;
+  try {
+    const m = (s.lmsModels ?? (await s.lms.list())).find((x) => x.key === model);
+    if (!m) return false;
+    const r = await s.lms.safeLoad(m, {
+      bigParamsB: s.config.lmstudio.big_params_b,
+      bigSizeGB: s.config.lmstudio.big_size_gb,
+      bigContext: s.config.lmstudio.big_context,
+      ttlSeconds: s.config.lmstudio.ttl_seconds,
+      contextTokens: s.config.model.context_tokens,
+      force,
+    });
+    if (r.skipped) return false;
+    if (r.ok) {
+      const gpu = await s.lms.gpuMem();
+      const ctx = s.lms.contextFor(
+        m,
+        {
+          bigParamsB: s.config.lmstudio.big_params_b,
+          bigSizeGB: s.config.lmstudio.big_size_gb,
+          bigContext: s.config.lmstudio.big_context,
+          ttlSeconds: s.config.lmstudio.ttl_seconds,
+          contextTokens: s.config.model.context_tokens,
+        },
+        gpu
+      );
+      const how = r.big ? " (big for this GPU: capped context, partial offload, auto-unload)" : "";
+      console.log(chalk.gray(`  ✦ LM Studio: ${r.reloaded ? "reloaded" : "loaded"} ${model}${ctx ? ` with a ${formatTokens(ctx)}-token context` : ""}${how}`));
+    } else if (r.detail) {
+      console.log(chalk.gray(`  (LM Studio could not load ${model}: ${r.detail.split("\n").pop()})`));
+    }
+    return r.ok;
+  } catch {
+    return false; /* loading is best-effort; the server may JIT-load on first request */
+  }
+}
+
+/**
+ * LM Studio (llama.cpp) rejects a prompt longer than the context the model was
+ * loaded with: "n_keep: 6441 >= n_ctx: 4096 … load the model with a larger
+ * context length". Recoverable by reloading with the configured context.
+ */
+function looksContextOverflow(err: Error): boolean {
+  return /n_keep.*n_ctx|greater than the context length|larger context length|exceeds? the (model'?s? )?context/i.test(
+    err.message
+  );
 }
 
 /**
@@ -1324,6 +1404,17 @@ function fallbackChain(s: Session): string[] {
  * LM Studio model present). Best-effort.
  */
 async function resolveStartupModel(s: Session): Promise<void> {
+  // The user already chose a model by hand while startup was still running —
+  // their pick is authoritative. (Startup can take seconds: `lms ls`, repo scan.)
+  if (s.modelPinned) return;
+
+  // LM Studio primary: fine when the model is installed there. An empty key list
+  // means `lms` wasn't available to tell us — assume ok rather than guess wrong.
+  if (s.provider.name === "lmstudio") {
+    if (!s.lmsModelKeys.length || s.lmsModelKeys.includes(s.provider.model)) return;
+    console.log(chalk.yellow(`⚠ "${s.provider.model}" is not installed in LM Studio. Trying fallbacks.`));
+  }
+
   // NVIDIA cloud primary: usable as long as we have an API key (assume reachable).
   if (s.provider.name === "nvidia") {
     if (nvidiaKeyPresent(s)) return;
@@ -1384,8 +1475,11 @@ async function resolveStartupModel(s: Session): Promise<void> {
 
   const pick = chain.find(available);
   if (pick) {
+    const was = s.provider.model;
+    // Re-check: a /model switch may have landed while we were probing above.
+    if (s.modelPinned) return;
     await applyModelRef(s, pick);
-    console.log(chalk.yellow(`⚠ "${s.config.model.model}" not available — using fallback "${pick}".`));
+    console.log(chalk.yellow(`⚠ "${was}" not available — using fallback "${pick}".`));
   } else if (ollamaTags.length || s.provider.name !== "ollama") {
     console.log(
       chalk.yellow(`⚠ "${s.config.model.model}" and all fallbacks are unavailable. Pick one with /model.`)
@@ -1395,7 +1489,7 @@ async function resolveStartupModel(s: Session): Promise<void> {
 
 /** Heuristic: does this provider error mean the requested model is unavailable? */
 function looksUnavailable(err: Error): boolean {
-  return /not found|no such model|unknown model|failed to load|unable to load|cannot load|404|model .* does not exist|try pulling|connection refused|fetch failed|ECONNREFUSED|HTTP 50\d|out of memory|insufficient (memory|vram)|unsupported|no space|401|403|429|unauthorized|forbidden|invalid api key|api key|rate.?limit|quota|timed out|timeout|aborted/i.test(
+  return /not found|no such model|unknown model|failed to load|unable to load|cannot load|404|model .* does not exist|try pulling|connection refused|fetch failed|ECONNREFUSED|ECONNRESET|HTTP 50\d|\b50[234]\b|overloaded|service.?unavailable|out of memory|insufficient (memory|vram)|unsupported|no space|401|403|429|unauthorized|forbidden|invalid api key|api key|rate.?limit|quota|timed out|timeout|aborted/i.test(
     err.message
   );
 }
@@ -1524,6 +1618,17 @@ async function streamWithFallback(
     return await attempt();
   } catch (err) {
     if (isInterrupt(err)) throw err; // user interrupt — never fall back or retry
+    // Prompt outgrew the context LM Studio loaded the model with → reload it
+    // with the configured context and retry once, instead of failing the turn.
+    if (s.provider.name === "lmstudio" && looksContextOverflow(err as Error)) {
+      console.log(chalk.yellow(`\n⚠ "${s.provider.model}" was loaded with too small a context — reloading with ${formatTokens(s.config.model.context_tokens)} tokens.`));
+      if (await lmsSafeLoad(s, s.provider.model, true)) {
+        streamed = "";
+        lastCounted = 0;
+        sinceRecount = 0;
+        return attempt();
+      }
+    }
     if (!looksUnavailable(err as Error)) {
       // Streaming genuinely failed for a non-availability reason — fall back to
       // the blocking path so the turn still completes.
@@ -2066,7 +2171,40 @@ async function executeToolCall(
     console.log(chalk.gray(`  ⚙ ${call.name} ${summary}`));
   }
 
+  // Blind-overwrite guard: write_file replaces a file's ENTIRE contents. Small
+  // models routinely "add a function" by writing a file that contains only the
+  // new function (the 9B did exactly that to calc.py). If the target exists and
+  // the model has not read it this session, refuse and point at apply_edit /
+  // read_file, unless it explicitly passes overwrite=true.
+  const seen = (s.seenFiles ??= new Set<string>());
+  const seenKey = (p: unknown): string | null => {
+    if (typeof p !== "string" || !p.trim()) return null;
+    try {
+      return path.resolve(s.cwd, stripRedundantCwdPrefix(s.cwd, expandHome(p))).toLowerCase();
+    } catch {
+      return null;
+    }
+  };
+  if (call.name === "write_file" && args.overwrite !== true) {
+    const key = seenKey(args.path);
+    if (key && fs.existsSync(key) && fs.statSync(key).isFile() && !seen.has(key)) {
+      console.log(chalk.yellow(`  ⚠ refused: ${args.path} exists and hasn't been read — use apply_edit or read_file first\n`));
+      return {
+        ok: false,
+        content:
+          `Refused: "${args.path}" already exists and you have not read it this session, so replacing it ` +
+          `would destroy its current contents. Either (a) call apply_edit to change part of it, or (b) call ` +
+          `read_file first and then write_file with the COMPLETE new contents (existing code + your change). ` +
+          `Only if you truly mean to discard the current file, call write_file again with "overwrite": true.`,
+      };
+    }
+  }
+
   const result = await tools.run(call.name, args);
+  if (result.ok && /^(read_file|read_symbol|outline_file|apply_edit|write_file|edit_file)$/.test(call.name)) {
+    const key = seenKey(args.path);
+    if (key) seen.add(key);
+  }
   const out = (result.output ?? "").toString();
   const shown = out.length > 4000 ? out.slice(0, 4000) + "\n…(truncated)" : out;
   if (shown.trim()) {
@@ -2123,7 +2261,7 @@ async function gatherModelEntries(s: Session, cached: ModelInfo[]): Promise<Mode
   // LM Studio models (headless, tokenless list).
   if (s.config.lmstudio.enabled && s.lms.installed()) {
     try {
-      const lms = await s.lms.list();
+      const lms = s.lmsModels ?? (await s.lms.list());
       for (const m of lms) {
         entries.push({
           ref: `lmstudio:${m.key}`,
@@ -2228,6 +2366,7 @@ async function handleModels(s: Session, line: string, cached: ModelInfo[]): Prom
       if (picked < 0) console.log(chalk.gray("(model unchanged)\n"));
       else if (entries[picked].current) console.log(chalk.gray(`(already on ${entries[picked].label})\n`));
       else {
+        s.modelPinned = true; // manual choice beats background startup resolution
         await applyModelRef(s, entries[picked].ref);
         console.log(chalk.green(`✓ switched to ${s.provider.model}`) + chalk.gray(` (${s.provider.name})\n`));
       }
@@ -2257,6 +2396,7 @@ async function handleModels(s: Session, line: string, cached: ModelInfo[]): Prom
     console.log(chalk.red(`[no model matches "${arg}"]`) + chalk.gray(" — run /model to see the list.\n"));
     return ollamaList;
   }
+  s.modelPinned = true; // manual choice beats background startup resolution
   await applyModelRef(s, target.ref);
   console.log(chalk.green(`✓ switched to ${s.provider.model}`) + chalk.gray(` (${s.provider.name})\n`));
   return ollamaList;

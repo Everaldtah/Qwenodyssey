@@ -64,13 +64,35 @@ export function createPrompt(promptLabel: string, commands: SlashCommand[]): Pro
   // ── Non-TTY fallback (pipes / tests): simple line reader, no menu. ──
   if (!stdin.isTTY) {
     const rl = readline.createInterface({ input: stdin, output: process.stdout });
+    // Queue every line as it arrives. readline drops lines that show up while
+    // no question() is pending — which is exactly what happens with piped input
+    // (all lines land at once, the first turn takes seconds), so only the FIRST
+    // prompt of a script used to run and the rest silently vanished.
+    const pending: string[] = [];
+    let waiter: ((line: string) => void) | null = null;
     let closed = false;
-    rl.on("close", () => (closed = true));
+    rl.on("line", (line) => {
+      if (waiter) {
+        const w = waiter;
+        waiter = null;
+        w(line);
+      } else pending.push(line);
+    });
+    rl.on("close", () => {
+      closed = true;
+      if (waiter) {
+        const w = waiter;
+        waiter = null;
+        w("/exit");
+      }
+    });
     return {
       ask: () =>
         new Promise<string>((resolve) => {
+          if (pending.length) return resolve(pending.shift() as string);
           if (closed) return resolve("/exit");
-          rl.question(promptLabel, resolve);
+          process.stdout.write(promptLabel);
+          waiter = resolve;
         }),
       close: () => rl.close(),
     };

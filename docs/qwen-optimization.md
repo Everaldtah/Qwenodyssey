@@ -29,8 +29,16 @@ shell work the harness runs them with thinking **off** (`model.think = "auto"`)
 — faster turns, and far more reliable tool calls, since the harness already
 scaffolds reasoning itself (`DEEP_THINK` + the `think` tool). Set
 `think = "always"` for hard one-shot reasoning. On Ollama this uses the native
-`think` flag; on LM Studio / vLLM / llama.cpp it uses Qwen's documented
-`/no_think` soft switch. Models with no thinking mode never receive the flag.
+`think` flag; on LM Studio / vLLM / llama.cpp it sends
+`chat_template_kwargs.enable_thinking` (the `/no_think` text switch is gone —
+Qwen 3.5 no longer recognises it and small models answered the literal text
+instead of the question). Models with no thinking mode never receive the flag.
+
+**Context window.** LM Studio loads models with a 4096-token context by default,
+which is smaller than the agent's system prompt plus tool schemas. Qwenodyssey
+therefore loads (or reloads) the active LM Studio model with `model.context_tokens`
+(capped by what fits: models larger than the free GPU memory get `[lmstudio].big_context`,
+partial GPU offload and a TTL), and on an `n_keep >= n_ctx` error it reloads and retries.
 
 Everything here is overridable — see *Recommended settings* below.
 

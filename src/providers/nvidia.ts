@@ -45,10 +45,14 @@ export class NvidiaNimProvider extends OpenAICompatibleProvider {
    */
   protected extraBody(): Record<string, unknown> {
     if (this.isNemotron()) {
-      return {
+      const out: Record<string, unknown> = {
         chat_template_kwargs: { enable_thinking: this.cfg.nemotronThinking !== false },
-        reasoning_budget: this.cfg.reasoningBudget ?? 4096,
       };
+      // NIM's current Nemotron runner rejects the budget outright ("thinking_token_budget
+      // is not yet supported by the V2 model runner" → HTTP 400), so it is sent only
+      // when the user explicitly configures one.
+      if (this.cfg.reasoningBudget && this.cfg.reasoningBudget > 0) out.reasoning_budget = this.cfg.reasoningBudget;
+      return out;
     }
     if (this.cfg.disableThinking !== false && this.isThinkingModel()) {
       return { chat_template_kwargs: { thinking: false } };

@@ -5,6 +5,8 @@
 import execa from "execa";
 import prompts from "prompts";
 import type { Tool, ToolContext, ToolResult } from "../types";
+import { stripRedundantCwdPrefixInCommand } from "./fileTools";
+import { adaptChainsForPowerShell } from "../core/psCompat";
 
 /** Patterns that are NEVER run, regardless of confirmation. */
 const HARD_BLOCK: RegExp[] = [
@@ -121,11 +123,13 @@ async function execute(cmd: string, ctx: ToolContext, timeoutMs: number): Promis
   // base64-encoded commands are flagged/stalled by some antivirus products.
   // `-InputFormat None` + ignoring stdin stops PowerShell hanging when launched
   // without a console.
+  // PowerShell 5.1 has no `&&`/`||` — rewrite bash-style chains (see psCompat).
+  const psCmd = process.platform === "win32" ? adaptChainsForPowerShell(cmd) : cmd;
   const result =
     process.platform === "win32"
       ? await execa(
           "powershell.exe",
-          ["-NoProfile", "-NonInteractive", "-InputFormat", "None", "-ExecutionPolicy", "Bypass", "-Command", PS_PREAMBLE + cmd],
+          ["-NoProfile", "-NonInteractive", "-InputFormat", "None", "-ExecutionPolicy", "Bypass", "-Command", PS_PREAMBLE + psCmd],
           { ...common, stdin: "ignore", windowsVerbatimArguments: false }
         )
       : await execa(cmd, { ...common, shell: true });
@@ -156,11 +160,14 @@ export const runShellTool: Tool = {
   description: "Run a shell command in the project directory.",
   mutating: true,
   async run(args, ctx): Promise<ToolResult> {
-    const cmd = String(args.command || "").trim();
-    if (!cmd) return { ok: false, output: "No command given" };
+    const raw = String(args.command || "").trim();
+    if (!raw) return { ok: false, output: "No command given" };
     if (!ctx.allowShell) {
       return { ok: false, output: "Shell execution is disabled (tools.allow_shell=false)" };
     }
+    // "tree projA/" while already inside projA → "tree ." (small-model habit).
+    const cmd = stripRedundantCwdPrefixInCommand(ctx.cwd, raw);
+    if (cmd !== raw) ctx.log({ tool: "run_shell", command: raw, rewritten: cmd });
 
     const cls = classifyCommand(cmd, { allow: ctx.allowCommands, deny: ctx.denyCommands });
     if (cls === "blocked") {

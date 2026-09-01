@@ -213,22 +213,32 @@ describe("OpenAI-compatible request shaping", () => {
     vi.restoreAllMocks();
   });
 
-  it("uses Qwen's /no_think soft switch when the backend has no native toggle", async () => {
+  it("turns Qwen3.5 thinking off via chat_template_kwargs, never by editing the prompt", async () => {
     const cap = captureBody();
     const p = new LMStudioProvider(pcfg("qwen3.5-9b", { baseUrl: "http://localhost:1234", think: "never" }));
     await p.generate([
       { role: "system", content: "sys" },
       { role: "user", content: "list the files" },
     ]);
-    const msgs = cap.get().messages;
-    expect(msgs[msgs.length - 1].content).toBe("list the files /no_think");
+    const body = cap.get();
+    const msgs = body.messages;
+    expect(msgs[msgs.length - 1].content).toBe("list the files"); // no " /no_think" suffix
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
   });
 
-  it("leaves the prompt untouched when the model is thinking", async () => {
+  it("turns thinking on via chat_template_kwargs when asked to think", async () => {
     const cap = captureBody();
     const p = new LMStudioProvider(pcfg("qwen3.5-9b", { baseUrl: "http://localhost:1234", think: "always" }));
     await p.generate([{ role: "user", content: "list the files" }]);
     expect(cap.get().messages[0].content).toBe("list the files");
+    expect(cap.get().chat_template_kwargs).toEqual({ enable_thinking: true });
+  });
+
+  it("sends no chat_template_kwargs for models without a thinking mode", async () => {
+    const cap = captureBody();
+    const p = new LMStudioProvider(pcfg("qwen2.5-coder-7b", { baseUrl: "http://localhost:1234", think: "never" }));
+    await p.generate([{ role: "user", content: "hi" }]);
+    expect(cap.get()).not.toHaveProperty("chat_template_kwargs");
   });
 
   it("leaves non-hybrid models untouched", async () => {

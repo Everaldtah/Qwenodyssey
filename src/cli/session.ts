@@ -8,6 +8,7 @@ import { Logger } from "../core/logger";
 import { ToolRegistry } from "../tools/registry";
 import { createProvider } from "../providers";
 import { LmStudioControl } from "../providers/lmstudioControl";
+import type { LmsModel } from "../providers/lmstudioControl";
 import { MemoryStore } from "../agents/memory";
 
 export interface GlobalOpts {
@@ -36,6 +37,10 @@ export interface Session {
   lms: LmStudioControl;
   /** Cached LM Studio model keys (populated at chat startup), for fallback. */
   lmsModelKeys: string[];
+  /** Full LM Studio inventory from the same startup `lms ls` (saves re-running it). */
+  lmsModels?: LmsModel[];
+  /** Resolves once the startup LM Studio inventory is in (never rejects). */
+  lmsReady?: Promise<void>;
   /**
    * Rebuild the dynamic SELF-AWARENESS block in the chat system prompt so it
    * matches the currently active provider/model. Installed by the chat command
@@ -44,6 +49,15 @@ export interface Session {
    * claiming to still be the configured cloud primary).
    */
   refreshIdentity?: () => void;
+  /**
+   * Set once the user picks a model by hand (/model, /models). Background
+   * startup resolution must then leave the choice alone — previously a slow
+   * startup could finish AFTER a manual switch and silently move the session
+   * to the first cloud fallback.
+   */
+  modelPinned?: boolean;
+  /** Absolute paths the model has read (or written) this session — see the write_file guard. */
+  seenFiles?: Set<string>;
 }
 
 /** This package's root: dist/cli/session.js → ../.. ; src/cli/session.ts → ../.. */
