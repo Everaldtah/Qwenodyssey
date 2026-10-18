@@ -77,11 +77,18 @@ export class OllamaProvider extends OpenAICompatibleProvider {
   async generate(messages: Message[], options: ModelOptions = {}): Promise<GenerateResult> {
     const body = this.chatBody(messages, options, false);
 
-    const res = await fetch(`${this.root()}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.root()}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: options.signal, // Esc-interrupt aborts the blocking request too
+      });
+    } catch (err) {
+      if (options.signal?.aborted) throw new Error("__interrupted__");
+      throw err;
+    }
     if (!res.ok) {
       let detail = "";
       try {

@@ -101,13 +101,26 @@ export class AnthropicProvider extends OpenAICompatibleProvider {
     return false;
   }
 
+  protected probeRequest(): { url: string; body: unknown } {
+    return {
+      url: `${this.apiBase()}/messages`,
+      body: this.anthropicBody([{ role: "user", content: "ping" }], { max_tokens: 16 }, true),
+    };
+  }
+
+  /** probe(): an expired OAuth token (401) is refreshed and the probe retried once. */
+  protected recoverFromError(status: number, detail: string, options: ModelOptions): ModelOptions | null {
+    if (status === 401 && this.tryRefresh()) return options;
+    return super.recoverFromError(status, detail, options);
+  }
+
   async generate(messages: Message[], options: ModelOptions = {}): Promise<GenerateResult> {
     const send = () =>
       this.fetchWithTimeout(`${this.apiBase()}/messages`, {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify(this.anthropicBody(messages, options, false)),
-      });
+      }, options.signal);
     let res = await send();
     if (res.status === 401 && this.tryRefresh()) res = await send(); // OAuth token expired → refresh once
     if (!res.ok) {

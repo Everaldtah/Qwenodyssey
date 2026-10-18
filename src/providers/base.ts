@@ -181,35 +181,99 @@ export abstract class OpenAICompatibleProvider implements Provider {
    * fetch with an optional request timeout (cfg.requestTimeoutMs). A hung/slow
    * endpoint then fails fast with a clear "timed out" error instead of blocking
    * the whole turn — which the chat layer treats as "unavailable" and falls back.
+   * `signal` is the caller's Esc-interrupt: aborting it surfaces "__interrupted__"
+   * (the non-streaming path used to ignore Esc, so a hung fallback request could
+   * hold the terminal for the full timeout).
    */
-  protected async fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  protected async fetchWithTimeout(url: string, init: RequestInit, signal?: AbortSignal): Promise<Response> {
     const ms = this.cfg.requestTimeoutMs;
-    if (!ms || ms <= 0) return fetch(url, init);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), ms);
+    const onExt = () => ctrl.abort();
+    if (signal) {
+      if (signal.aborted) throw new Error("__interrupted__");
+      signal.addEventListener("abort", onExt);
+    }
+    const timer = ms && ms > 0 ? setTimeout(() => ctrl.abort(), ms) : null;
     try {
       return await fetch(url, { ...init, signal: ctrl.signal });
     } catch (err) {
+      if (signal?.aborted) throw new Error("__interrupted__");
       if ((err as any)?.name === "AbortError") {
         throw new Error(`${this.name} request timed out after ${ms}ms`);
       }
       throw err;
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", onExt);
     }
+  }
+
+  /**
+   * Decide whether a failed request can be retried with adjusted options.
+   * Returns the options to retry with, or null to surface the error. Base rule:
+   * OpenRouter's HTTP 402 "You requested up to 8192 tokens, but can only afford
+   * 3436" — retry once within the affordable budget instead of failing the turn.
+   */
+  protected recoverFromError(status: number, detail: string, options: ModelOptions): ModelOptions | null {
+    const afford = status === 402 ? detail.match(/can only afford (\d+)/i) : null;
+    if (afford) {
+      const max = Number(afford[1]) - 64;
+      if (max >= 256) return { ...options, max_tokens: max };
+    }
+    return null;
+  }
+
+  /** URL + body of the tiny streaming request probe() sends. */
+  protected probeRequest(): { url: string; body: unknown } {
+    return {
+      url: `${this.apiBase()}/chat/completions`,
+      body: this.body([{ role: "user", content: "ping" }], { max_tokens: 16 }, true),
+    };
+  }
+
+  /**
+   * Resolve as soon as the server answers a tiny streaming request with HTTP
+   * 200; the body is dropped unread. Only the response start is awaited on
+   * purpose: a model that accepts the request and then never sends a byte
+   * (seen on NVIDIA NIM) is exactly the failure this catches, while reasoning
+   * models that need many tokens to finish still pass quickly.
+   */
+  async probe(signal: AbortSignal, retried = false): Promise<void> {
+    const { url, body } = this.probeRequest();
+    let res: Response;
+    try {
+      res = await fetch(url, { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
+    } catch (err) {
+      if (signal.aborted) throw new Error("__interrupted__");
+      throw err;
+    }
+    if (res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return;
+    }
+    const detail = await safeText(res);
+    if (!retried && this.recoverFromError(res.status, detail, {})) return this.probe(signal, true);
+    throw new Error(`${this.name} HTTP ${res.status}: ${detail}`);
   }
 
   async generate(
     messages: Message[],
-    options: ModelOptions = {}
+    options: ModelOptions = {},
+    retried = false
   ): Promise<GenerateResult> {
-    const res = await this.fetchWithTimeout(`${this.apiBase()}/chat/completions`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify(this.body(messages, options, false)),
-    });
+    const res = await this.fetchWithTimeout(
+      `${this.apiBase()}/chat/completions`,
+      {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify(this.body(messages, options, false)),
+      },
+      options.signal
+    );
     if (!res.ok) {
       const detail = await safeText(res);
+      const retry = retried ? null : this.recoverFromError(res.status, detail, options);
+      if (retry) return this.generate(messages, retry, true);
       throw new Error(`${this.name} HTTP ${res.status}: ${detail}`);
     }
     const json: any = await res.json();
@@ -236,7 +300,8 @@ export abstract class OpenAICompatibleProvider implements Provider {
   async stream(
     messages: Message[],
     onChunk: (delta: string) => void,
-    options: ModelOptions = {}
+    options: ModelOptions = {},
+    retried = false
   ): Promise<GenerateResult> {
     // Interruptible stream: a local controller is aborted either by the request
     // timeout (until headers arrive) or by the caller's Esc-interrupt signal
@@ -280,8 +345,23 @@ export abstract class OpenAICompatibleProvider implements Provider {
     if (!res.ok || !res.body) {
       if (ext) ext.removeEventListener("abort", onExt);
       const detail = await safeText(res);
+      const retry = retried ? null : this.recoverFromError(res.status, detail, options);
+      if (retry) return this.stream(messages, onChunk, retry, true);
       throw new Error(`${this.name} HTTP ${res.status}: ${detail}`);
     }
+    // Stall watchdog: headers arrived but the body can still go silent (an
+    // overloaded gateway holding the socket open). Abort when no bytes arrive
+    // for the request timeout, so the turn fails over instead of spinning forever.
+    let stalled = false;
+    const armStall = () => {
+      if (!ms || ms <= 0) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        stalled = true;
+        ctrl.abort();
+      }, ms);
+    };
+    armStall();
     const decoder = new TextDecoder();
     let buffer = "";
     let full = "";
@@ -294,6 +374,7 @@ export abstract class OpenAICompatibleProvider implements Provider {
     // Node 18+ fetch body is an async-iterable web stream.
     try {
       for await (const chunk of res.body as any) {
+        armStall();
         buffer += decoder.decode(chunk as Uint8Array, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
@@ -340,8 +421,10 @@ export abstract class OpenAICompatibleProvider implements Provider {
       }
     } catch (err) {
       if (ext?.aborted) throw new Error("__interrupted__");
+      if (stalled) throw new Error(`${this.name} stream stalled — no data for ${ms}ms (timed out)`);
       throw err;
     } finally {
+      if (timer) clearTimeout(timer);
       if (ext) ext.removeEventListener("abort", onExt);
     }
     // If the server never sent a usage frame, fall back to a heuristic count so

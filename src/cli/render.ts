@@ -81,7 +81,8 @@ export class Spinner {
   private static FRAMES = ["·", "∘", "○", "◌", "○", "∘"];
   private static MIN_REDRAW_MS = 60; // immediate-redraw throttle for token ticks
 
-  constructor(private word: string, private upTokens: number) {}
+  /** `hint` is a trailing key reminder, e.g. "esc to interrupt". */
+  constructor(private word: string, private upTokens: number, private hint = "") {}
 
   begin(): void {
     if (!process.stdout.isTTY) return;
@@ -159,6 +160,7 @@ export class Spinner {
       `↑ ${formatTokens(this.upTokens)}` + (this.outTokens > 0 ? ` ↓ ${formatTokens(this.outTokens)}` : "") + " tokens",
     ];
     if (r > 0) parts.push(`${r >= 10 ? Math.round(r) : r.toFixed(1)} tok/s`);
+    if (this.hint) parts.push(this.hint);
     const line =
       chalk.magenta(glyph) +
       " " +

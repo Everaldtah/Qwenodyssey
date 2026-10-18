@@ -748,7 +748,7 @@ export async function chatCommand(opts: GlobalOpts): Promise<void> {
     }
     if (line === "/model" || line === "/models" || line.startsWith("/model ") || line.startsWith("/models ")) {
       await s.lmsReady; // LM Studio inventory may still be loading right after launch
-      lastModels = await handleModels(s, line, lastModels);
+      lastModels = await handleModels(s, line, lastModels, ask);
       continue;
     }
 
@@ -1039,7 +1039,9 @@ async function runAssistantTurn(
     if (pending.length) drainPending();
     // Live status: elapsed time + the session's cumulative input tokens so far
     // (real usage; starts at 0 and climbs as the conversation grows).
-    const spinner = new Spinner(thinkingWord(), meter.sessionIn);
+    // The hint matters: a slow or dead backend otherwise looks like a frozen
+    // terminal (typed text goes to the "btw ›" side-channel, not the prompt).
+    const spinner = new Spinner(thinkingWord(), meter.sessionIn, interject ? "esc to interrupt" : "");
     currentSpinner = spinner;
     spinner.begin();
     let res: GenerateResult;
@@ -1264,6 +1266,82 @@ function openRouterKeyPresent(s: Session): boolean {
 /** Is an Anthropic credential available (OAuth subscription token or API key)? */
 function anthropicAuthPresent(s: Session): boolean {
   return anthropicAuthAvailable(s.config);
+}
+
+/** Backends reached over the internet; local ones load models on demand, so they are not probed. */
+const PROBED_KINDS = new Set<ModelKind>(["nvidia", "openrouter", "anthropic"]);
+const PROBE_TIMEOUT_MS = 15_000;
+
+/**
+ * One tiny request to see whether the active model answers at
+ * all. Some hosted models accept a request and then never send a byte (seen on
+ * NVIDIA NIM), which made the first turn after a /model switch look like a
+ * frozen terminal. Esc skips the check.
+ */
+async function probeModel(s: Session): Promise<{ ok: boolean; ms: number; skipped: boolean; detail?: string }> {
+  const ctrl = new AbortController();
+  let skipped = false;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, PROBE_TIMEOUT_MS);
+  const esc = captureInterjections({
+    label: "",
+    onSubmit: () => {},
+    onInterrupt: () => {
+      skipped = true;
+      ctrl.abort();
+    },
+  });
+  const spinner = new Spinner(`checking ${s.provider.model}`, 0, "esc to skip");
+  spinner.begin();
+  const t0 = Date.now();
+  try {
+    if (s.provider.probe) await s.provider.probe(ctrl.signal);
+    return { ok: true, ms: Date.now() - t0, skipped: !s.provider.probe };
+  } catch (err) {
+    const msg = (err as Error).message;
+    if (skipped) return { ok: true, ms: Date.now() - t0, skipped: true };
+    const detail = timedOut ? `no reply within ${PROBE_TIMEOUT_MS / 1000}s` : msg.replace(/\s+/g, " ").slice(0, 160);
+    return { ok: false, ms: Date.now() - t0, skipped: false, detail };
+  } finally {
+    clearTimeout(timer);
+    spinner.stop();
+    esc?.stop();
+  }
+}
+
+/**
+ * Manual model switch (/model, /models picker). Cloud models get a quick
+ * liveness probe first; if the model doesn't answer, the user decides whether
+ * to keep it, instead of discovering it as a "stuck" first turn.
+ */
+async function switchModel(s: Session, ref: string, ask: () => Promise<string>): Promise<void> {
+  const prev = s.provider;
+  s.modelPinned = true; // manual choice beats background startup resolution
+  await applyModelRef(s, ref);
+  const switched = () => chalk.green(`✓ switched to ${s.provider.model}`) + chalk.gray(` (${s.provider.name})`);
+  if (!PROBED_KINDS.has(parseModelRef(ref).kind) || !process.stdin.isTTY) {
+    console.log(switched() + "\n");
+    return;
+  }
+  const p = await probeModel(s);
+  if (p.ok) {
+    const note = p.skipped ? "check skipped" : `answered in ${(p.ms / 1000).toFixed(1)}s`;
+    console.log(switched() + chalk.gray(` · ${note}\n`));
+    return;
+  }
+  console.log(chalk.yellow(`⚠ ${s.provider.model} is not answering: ${p.detail}`));
+  console.log(chalk.gray(`  Keep it anyway? Type y to keep, anything else to stay on ${prev.model}.`));
+  const answer = (await ask()).trim().toLowerCase();
+  if (answer === "y" || answer === "yes") {
+    console.log(switched() + chalk.gray(" · kept although it did not answer; Esc interrupts a stuck turn\n"));
+    return;
+  }
+  s.provider = prev;
+  s.refreshIdentity?.();
+  console.log(chalk.gray(`(stayed on ${prev.model})\n`));
 }
 
 /**
@@ -1533,23 +1611,44 @@ async function tryGenerate(
 async function generateWithFallback(
   s: Session,
   history: Message[],
-  options: ModelOptions
+  options: ModelOptions,
+  tried: Set<string> = new Set()
 ): Promise<GenerateResult> {
   try {
     return await tryGenerate(s, history, options);
   } catch (err) {
-    if (!looksUnavailable(err as Error)) throw err;
+    if (isInterrupt(err) || !looksUnavailable(err as Error)) throw err;
+    let last = err as Error;
+    tried.add(activeRef(s));
     for (const fb of fallbackChain(s)) {
-      console.log(chalk.yellow(`\n⚠ "${s.provider.model}" unavailable — falling back to "${fb}".`));
+      if (tried.has(fb)) continue; // already failed this turn — never retry it
+      if (options.signal?.aborted) throw new Error("__interrupted__");
+      tried.add(fb);
+      console.log(fallbackNotice(s, fb, last));
       await applyModelRef(s, fb);
       try {
         return await tryGenerate(s, history, options);
       } catch (e2) {
-        if (!looksUnavailable(e2 as Error)) throw e2;
+        if (isInterrupt(e2) || !looksUnavailable(e2 as Error)) throw e2;
+        last = e2 as Error;
       }
     }
     throw err; // nothing in the chain worked
   }
+}
+
+/** The fallback-chain ref ("nvidia:<model>", bare Ollama tag, …) of the active model. */
+function activeRef(s: Session): string {
+  return s.provider.name === "ollama" ? s.provider.model : `${s.provider.name}:${s.provider.model}`;
+}
+
+/** "⚠ X unavailable — falling back to Y." plus the reason, so a cascade stays legible. */
+function fallbackNotice(s: Session, next: string, err: Error): string {
+  const why = err.message.replace(/\s+/g, " ").slice(0, 110);
+  return (
+    chalk.yellow(`\n⚠ "${s.provider.model}" unavailable — falling back to "${next}".`) +
+    chalk.gray(`\n  (${why})`)
+  );
 }
 
 /**
@@ -1629,13 +1728,22 @@ async function streamWithFallback(
         return attempt();
       }
     }
+    // Models that already failed this turn are never retried: the old code
+    // re-walked the whole chain from the blocking path, so one dead backend
+    // could hold the terminal for several request timeouts in a row.
+    const tried = new Set<string>();
     if (!looksUnavailable(err as Error)) {
       // Streaming genuinely failed for a non-availability reason — fall back to
       // the blocking path so the turn still completes.
-      return generateWithFallback(s, history, options);
+      return generateWithFallback(s, history, options, tried);
     }
+    let last = err as Error;
+    tried.add(activeRef(s));
     for (const fb of fallbackChain(s)) {
-      console.log(chalk.yellow(`\n⚠ "${s.provider.model}" unavailable — falling back to "${fb}".`));
+      if (tried.has(fb)) continue;
+      if (options.signal?.aborted) throw new Error("__interrupted__");
+      tried.add(fb);
+      console.log(fallbackNotice(s, fb, last));
       await applyModelRef(s, fb);
       streamed = "";
       lastCounted = 0;
@@ -1643,9 +1751,13 @@ async function streamWithFallback(
       try {
         return await attempt();
       } catch (e2) {
+        // Esc during a fallback stream used to drop into the blocking path,
+        // which ignored Esc — the terminal then sat frozen for the full timeout.
+        if (isInterrupt(e2)) throw e2;
         if (!looksUnavailable(e2 as Error)) {
-          return generateWithFallback(s, history, options);
+          return generateWithFallback(s, history, options, tried);
         }
+        last = e2 as Error;
       }
     }
     throw err;
@@ -2347,7 +2459,12 @@ async function gatherModelEntries(s: Session, cached: ModelInfo[]): Promise<Mode
  * <name|#>` switches directly. Switching to an LM Studio model safe-loads it
  * and points the backend at LM Studio. Returns the Ollama list for index reuse.
  */
-async function handleModels(s: Session, line: string, cached: ModelInfo[]): Promise<ModelInfo[]> {
+async function handleModels(
+  s: Session,
+  line: string,
+  cached: ModelInfo[],
+  ask: () => Promise<string>
+): Promise<ModelInfo[]> {
   const arg = line.split(/\s+/).slice(1).join(" ").trim();
   const entries = await gatherModelEntries(s, cached);
   const ollamaList = entries.filter((e) => !e.ref.startsWith("lmstudio:")).map((e) => ({ name: e.ref }));
@@ -2365,11 +2482,7 @@ async function handleModels(s: Session, line: string, cached: ModelInfo[]): Prom
       const picked = await selectFromList(`Select a model  (● = current)`, items, currentIdx);
       if (picked < 0) console.log(chalk.gray("(model unchanged)\n"));
       else if (entries[picked].current) console.log(chalk.gray(`(already on ${entries[picked].label})\n`));
-      else {
-        s.modelPinned = true; // manual choice beats background startup resolution
-        await applyModelRef(s, entries[picked].ref);
-        console.log(chalk.green(`✓ switched to ${s.provider.model}`) + chalk.gray(` (${s.provider.name})\n`));
-      }
+      else await switchModel(s, entries[picked].ref, ask);
       return ollamaList;
     }
     console.log(chalk.bold("Models (Ollama + LM Studio):"));
@@ -2396,9 +2509,7 @@ async function handleModels(s: Session, line: string, cached: ModelInfo[]): Prom
     console.log(chalk.red(`[no model matches "${arg}"]`) + chalk.gray(" — run /model to see the list.\n"));
     return ollamaList;
   }
-  s.modelPinned = true; // manual choice beats background startup resolution
-  await applyModelRef(s, target.ref);
-  console.log(chalk.green(`✓ switched to ${s.provider.model}`) + chalk.gray(` (${s.provider.name})\n`));
+  await switchModel(s, target.ref, ask);
   return ollamaList;
 }
 

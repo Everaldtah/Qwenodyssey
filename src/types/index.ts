@@ -90,6 +90,11 @@ export interface Provider {
   listModels?(): Promise<ModelInfo[]>;
   /** Switch the active model for the rest of the session. */
   setModel?(model: string): void;
+  /**
+   * Liveness check: resolve once the backend starts answering a tiny request
+   * (HTTP 200), throw with its error otherwise. Used after a manual /model switch.
+   */
+  probe?(signal: AbortSignal): Promise<void>;
 }
 
 /* ── Agent pipeline ── */

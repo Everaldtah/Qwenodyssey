@@ -1,4 +1,5 @@
 import { OpenAICompatibleProvider } from "./base";
+import type { ModelOptions } from "../types";
 
 /**
  * NVIDIA NIM cloud endpoint — OpenAI-compatible chat/completions hosted at
@@ -9,6 +10,21 @@ import { OpenAICompatibleProvider } from "./base";
  */
 export class NvidiaNimProvider extends OpenAICompatibleProvider {
   readonly name = "nvidia";
+  /** Set once NIM rejects reasoning_budget; the budget is then left off the wire. */
+  private budgetRejected = false;
+
+  protected recoverFromError(status: number, detail: string, options: ModelOptions): ModelOptions | null {
+    if (
+      status === 400 &&
+      !this.budgetRejected &&
+      this.isNemotron() &&
+      /thinking_token_budget|reasoning_budget/i.test(detail)
+    ) {
+      this.budgetRejected = true;
+      return options;
+    }
+    return super.recoverFromError(status, detail, options);
+  }
 
   /**
    * Kimi K2/K2.6 on NVIDIA NIM degenerates into repetition (NIM reports
@@ -50,8 +66,11 @@ export class NvidiaNimProvider extends OpenAICompatibleProvider {
       };
       // NIM's current Nemotron runner rejects the budget outright ("thinking_token_budget
       // is not yet supported by the V2 model runner" → HTTP 400), so it is sent only
-      // when the user explicitly configures one.
-      if (this.cfg.reasoningBudget && this.cfg.reasoningBudget > 0) out.reasoning_budget = this.cfg.reasoningBudget;
+      // when the user explicitly configures one — and dropped for the rest of the
+      // session once NIM rejects it (see recoverFromError).
+      if (!this.budgetRejected && this.cfg.reasoningBudget && this.cfg.reasoningBudget > 0) {
+        out.reasoning_budget = this.cfg.reasoningBudget;
+      }
       return out;
     }
     if (this.cfg.disableThinking !== false && this.isThinkingModel()) {
